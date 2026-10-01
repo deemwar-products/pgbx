@@ -1,0 +1,129 @@
+---
+title: Install
+description: One-line install of the pgbx extension, CLI and agent skill; then pgbx setup and one restart.
+sidebar: { order: 1 }
+---
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+<Tabs syncKey="os">
+<TabItem label="Linux / macOS">
+
+```sh
+curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh
+sudo pgbx setup            # S3 settings; prints the ONE restart command, e.g. sudo systemctl restart postgresql@16-main
+pgbx doctor                # after that restart
+```
+
+</TabItem>
+<TabItem label="Windows (CLI only)">
+
+PowerShell:
+
+```powershell
+powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"
+```
+
+cmd.exe:
+
+```bat
+curl -fsSL https://deemwar-products.github.io/pgbx/install.cmd -o install.cmd && install.cmd
+```
+
+The extension runs on the Linux database server; on Windows you get `pgbx.exe` (in
+`%LOCALAPPDATA%\pgbx\bin`, added to your user PATH) and the agent skill. Point it at the server:
+`pgbx status --host db.example.com --user postgres`.
+
+</TabItem>
+</Tabs>
+
+## Requirements
+
+| | supported |
+|---|---|
+| PostgreSQL (extension) | 13, 14, 15, 16, 17, 18 |
+| Linux | Debian / Ubuntu / RHEL-family (Rocky, Alma, Fedora), amd64 and arm64 |
+| pgbx CLI | Linux amd64/arm64 (static), macOS arm64, Windows amd64/arm64 |
+
+On a machine without a local PostgreSQL 13–18 server the installer puts only the `pgbx` CLI in place and
+says so (`pgbx's extension supports PostgreSQL 13–18; found N`).
+
+## What the installer does
+
+1. Downloads from the latest GitHub Release (`https://github.com/deemwar-products/pgbx/releases/latest/download/…`,
+   no GitHub API call) or the release given with `--version`, and checks every file against the release's
+   `SHA256SUMS`. A mismatch stops the install before anything is copied.
+2. Installs `pgbx` to `/usr/local/bin` (with `sudo` when needed), or `~/.local/bin` when there is no sudo.
+3. Linux: finds every local PostgreSQL (`pg_config` on PATH, `/usr/lib/postgresql/*/bin`, `/usr/pgsql-*/bin`)
+   and, for each 13–18 (or only `--pg-version N`), copies the library to `pg_config --pkglibdir` and the
+   control + SQL files (including upgrade scripts) to `pg_config --sharedir`/extension.
+4. Asks `Install the pgbx agent skill for Claude Code / Codex? [Y/n]` (Enter = yes). With no terminal it
+   installs it; as root it skips it (run `pgbx skill install` as your user). Remove with `pgbx skill uninstall`.
+5. Never edits `postgresql.conf` and never restarts anything.
+
+`sudo pgbx setup` then writes **one** drop-in, `<config dir>/conf.d/pgbx.conf`, with `shared_preload_libraries`
+**merged** with what the server already loads, and the `pgbx.s3_*` / `server_name` / `credentials_file`
+settings; and the S3 credentials file (`/etc/pgbx/s3.credentials`, mode 0600, owned by `postgres`). Keys are
+read from environment variables (default `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or name others with
+`--access-key-env` / `--secret-key-env`) or typed at a hidden prompt, and are never printed. Without `--yes`
+it only shows the plan. If `postgresql.conf` does not include `conf.d`, `--yes` adds one
+`include_dir = 'conf.d'` line and says so. It prints the one restart command; after the restart the worker
+creates the extension in every database within seconds.
+
+```sh
+sudo AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… pgbx setup --yes \
+  --s3-endpoint https://s3.eu-central-1.amazonaws.com --s3-bucket my-backups --s3-region eu-central-1 \
+  --server-name db-prod-1
+```
+
+## Installer flags
+
+| install.sh | install.ps1 / install.cmd | |
+|---|---|---|
+| `--version v0.5.0` | `-Version v0.5.0` | pin a release (default: latest) |
+| `--pg-version 16` | | extension only for this PostgreSQL |
+| `--prefix DIR` | `-InstallDir DIR` | where `pgbx` goes |
+| `--skill` / `--no-skill` | `-Skill` / `-NoSkill` | install / skip the agent skill without asking |
+| `--no-extension` | | CLI only |
+| `--base-url URL` | `-BaseUrl URL` | download from a mirror (must hold `SHA256SUMS`) |
+
+Flags with the one-liner: `curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh -s -- --pg-version 16 --no-skill`.
+
+## Manual install
+
+Download from [GitHub Releases](https://github.com/deemwar-products/pgbx/releases) the files for your machine and
+`SHA256SUMS`, then:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf pgbx-ext-pg16-linux-amd64.tar.gz
+sudo install -m 755 pgbx-ext-pg16-linux-amd64/lib/*.so "$(pg_config --pkglibdir)/"
+sudo install -m 644 pgbx-ext-pg16-linux-amd64/extension/* "$(pg_config --sharedir)/extension/"
+tar xzf pgbx-linux-amd64.tar.gz && sudo install -m 755 pgbx-linux-amd64/pgbx /usr/local/bin/
+```
+
+Or configure by hand instead of `pgbx setup`: a credentials file readable by `postgres` only
+(`access_key_id=…` and `secret_access_key=…` lines), and in `postgresql.conf` or a `conf.d` file:
+
+```ini
+shared_preload_libraries = 'pgbx'          # add to any existing list; needs one restart
+pgbx.s3_endpoint      = 'https://hel1.your-objectstorage.com'
+pgbx.s3_bucket        = 'my-backups'
+pgbx.s3_region        = 'hel1'
+pgbx.server_name      = 'db-prod-1'        # folder for this server in the bucket
+pgbx.credentials_file = '/etc/pgbx/s3.credentials'
+```
+
+All settings: [Settings reference](../../reference/settings/). Build from source:
+`cargo pgrx package` (extension) and `cargo build --release --manifest-path cli/Cargo.toml` (CLI).
+
+## Uninstall
+
+```sh
+pgbx skill uninstall                                   # as each user that installed the skill
+sudo rm /etc/postgresql/*/main/conf.d/pgbx.conf        # then restart Postgres once
+# in each database, if you want the schema gone:  DROP EXTENSION pgbx;
+sudo rm "$(pg_config --pkglibdir)/pgbx.so" "$(pg_config --sharedir)"/extension/pgbx[.-]*
+sudo rm /usr/local/bin/pgbx /etc/pgbx/s3.credentials
+```
+
+Windows: `pgbx skill uninstall`, then delete `%LOCALAPPDATA%\pgbx` and remove it from your user PATH.

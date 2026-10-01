@@ -1,0 +1,135 @@
+<activation-routing skill="pgbx-skill" version="1.0">
+
+  <defaults>
+    <rule>Always run step-00-preflight.md first — verifies `pgbx` is on PATH and runs `pgbx doctor --json`. No mutation may run before this.</rule>
+    <rule>Use this file as the intent router. Family files (status.md, backup.md, …) hold recipes; step files hold cross-cutting flows.</rule>
+    <rule>Always pass `--json`. With SQL fallback use `psql -XAtq` and single-row statements.</rule>
+    <rule>Safety tiers in workflow.md decide whether you act, ask, or require explicit approval. Destructive gates are enforced in code; never bypass them.</rule>
+    <rule>TIE-BREAK: when more than one route matches, the route whose matched phrase is LONGEST wins — "backup before deploy" (backup-before-deploy) beats "backup" (backup). Only if two matched phrases are the same length, ask the user which they meant.</rule>
+  </defaults>
+
+  <flow-control>
+    <rule>If preflight fails (pgbx missing and no psql access), surface the install text and STOP.</rule>
+    <rule>After every recipe response, stop and wait. Do not auto-chain into the next intent.</rule>
+  </flow-control>
+
+  <routes>
+
+    <route id="status" mode="read-only">
+      <when>is postgres backed up, is it backed up, backup status, are backups working, last backup, list backups, show backups, when was the last backup, pgbx status, pgbx list</when>
+      <goal>Answer "are we backed up?" in one line per database, from status JSON.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="status.md">STAT recipes.</step>
+      </steps>
+    </route>
+
+    <route id="backup" mode="safe-mutation">
+      <when>take a backup, backup now, back up the database, backup the server, snapshot the database, pgbx now</when>
+      <goal>Queue a backup, wait for it, return the backup id and S3 key.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="backup.md">BKP recipes.</step>
+      </steps>
+    </route>
+
+    <route id="backup-before-deploy" mode="safe-mutation">
+      <when>backup before deploy, backup before migration, safe to deploy, pre-deploy backup, before i run the migration</when>
+      <goal>Health → backup → wait → verify → report id, before a risky change.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="steps/step-01-backup-before-deploy.md">The five-step flow.</step>
+        <step ref="backup.md">BKP recipes.</step>
+        <step ref="verify.md">VFY recipes.</step>
+      </steps>
+    </route>
+
+    <route id="restore-db" mode="safe-mutation">
+      <when>restore the db, restore the database, recover deleted rows, undo the migration, restore into a new database, get yesterday's data back, pgbx db-restore</when>
+      <goal>Restore one database into a NEW database; the live one is untouched.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="steps/step-02-restore-one-database.md">Decision tree + per-db flow.</step>
+        <step ref="restore.md">RST recipes.</step>
+      </steps>
+    </route>
+
+    <route id="disaster-restore" mode="safe-mutation">
+      <when>restore on a new server, restore to a new server, server is gone, lost the server, restore from s3, restore the server from backup, restore the whole server, pgbx backups --from-s3, db-restore --from-s3</when>
+      <goal>Old server lost: list dumps in S3 and restore each database into a NEW database on the new server (no extension needed there).</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx (S3 commands need no running extension).</step>
+        <step ref="steps/step-03-disaster-restore.md">New-server per-database flow.</step>
+        <step ref="restore.md">RST-R-3 / RST-R-4 recipes.</step>
+      </steps>
+      <rule>Never read or print the credentials file. Renaming a restored database over a live one is destructive and needs explicit approval.</rule>
+    </route>
+
+    <route id="diagnose" mode="read-only">
+      <when>postgres is down, postgres won't start, postgres crashed, database is down, disk full, disk is full, no space left on device, wal growing, pg_wal is huge, pg_wal growing, wal backlog, out of memory, oom killed, too many connections, server is corrupted, pgbx diagnose</when>
+      <goal>Name why Postgres is down or WAL/disk is growing, then walk the printed steps by safety tier. Diagnose first; restore only if the diagnosis says so.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx (doctor works with Postgres down and embeds the diagnosis).</step>
+        <step ref="steps/step-04-postgres-down.md">Diagnose → tiered steps flow.</step>
+        <step ref="diagnose.md">DIAG recipes.</step>
+      </steps>
+      <rule>pgbx never runs a remedy. Never delete files in pg_wal/, base/, global/ or pg_xact/. Destructive steps need explicit human approval of that exact step.</rule>
+    </route>
+
+    <route id="verify" mode="safe-mutation">
+      <when>verify the backup, restore test, can we actually restore, is the backup good, verification failed, pgbx verify</when>
+      <goal>Prove the newest backup restores; explain any failure.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="verify.md">VFY recipes.</step>
+      </steps>
+    </route>
+
+    <route id="policy" mode="higher-risk">
+      <when>change backup schedule, backup every hour, retention, keep backups for, pause backups, resume backups, stop backups for now</when>
+      <goal>Change schedule, retention, pause/resume; ask first when protection shrinks.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="policy.md">POL recipes.</step>
+      </steps>
+    </route>
+
+    <route id="data-scope" mode="higher-risk">
+      <when>exclude table from backup, skip rows, data scope, backup only some tables, which tables are backed up without rows</when>
+      <goal>Decide whose rows are kept; table definitions are always backed up.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="policy.md">POL data-scope recipes.</step>
+      </steps>
+    </route>
+
+    <route id="download-link" mode="safe-mutation">
+      <when>download the backup, download link, give me the dump file, presigned url, who can run backups, grant backup access</when>
+      <goal>Time-limited link to one backup, or role grants.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="access.md">ACC recipes.</step>
+      </steps>
+    </route>
+
+    <route id="audit-ui" mode="read-only">
+      <when>audit ui, audit trail, audit log, backup dashboard, backup web ui, open the ui, who did what, who changed the backups, who paused backups, who downloaded the backup, backup timeline, pgbx ui</when>
+      <goal>Start the read-only audit UI as a viewer login (or answer from its JSON), never with an admin/superuser role.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="status.md">STAT-R-6 audit UI recipe.</step>
+      </steps>
+      <rule>The UI is read-only; creating the viewer login role and exposing it beyond 127.0.0.1 are the human's call.</rule>
+    </route>
+
+    <route id="troubleshoot" mode="read-only">
+      <when>backup failing, backups are failing, why did the backup fail, pgbx doctor, pgbx logs, backup error, queued forever</when>
+      <goal>Name the cause and the plain-language fix from doctor and logs.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
+        <step ref="status.md">STAT doctor + logs recipes.</step>
+      </steps>
+    </route>
+
+  </routes>
+</activation-routing>

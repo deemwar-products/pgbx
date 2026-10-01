@@ -1,0 +1,53 @@
+---
+title: pgbx
+description: Zero-touch Postgres backups to S3. Create a database. It's backed up.
+template: splash
+hero:
+  tagline: "Create a database. It's backed up."
+  actions:
+    - text: Get started
+      link: getting-started/install/
+      icon: right-arrow
+    - text: SQL reference
+      link: reference/sql/
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <Card title="Zero touch" icon="rocket">
+    The extension lives in `template1`. Every new database gets a schema, a default schedule
+    (daily at 02:00, keep 14 backups, max 90 days) and a first backup within a minute.
+  </Card>
+  <Card title="Restore into a new name" icon="random">
+    Restore one database into a new name with SQL. Server gone? `pgbx db-restore --from-s3`
+    restores straight from S3 onto a fresh server, no extension needed.
+  </Card>
+  <Card title="Works when Postgres is down" icon="setting">
+    `pgbx` is a standalone CLI. It restores from S3 directly, diagnoses why Postgres will not start,
+    and speaks `--json` for scripts and AI agents.
+  </Card>
+</CardGrid>
+
+## Quick start
+
+```ini
+# postgresql.conf (one restart)
+shared_preload_libraries     = 'pgbx'
+pgbx.s3_endpoint      = 'https://hel1.your-objectstorage.com'
+pgbx.s3_bucket        = 'my-backups'
+pgbx.s3_region        = 'hel1'
+pgbx.server_name      = 'db-prod-1'
+pgbx.credentials_file = '/etc/pgbx/s3.credentials'
+```
+
+```sql
+CREATE DATABASE myapp;                          -- backed up within a minute
+\c myapp
+SELECT * FROM pgbx.status();             -- state, schedule, last + next backup
+SELECT pgbx.backup_now();                -- returns a job id
+SELECT pgbx.restore(into_db => 'myapp_restored', at => '2026-10-01 09:00');
+```
+
+Next: [install the extension](getting-started/install/), then [take your first backup](getting-started/first-backup/).

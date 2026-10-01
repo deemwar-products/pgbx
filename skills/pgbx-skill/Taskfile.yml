@@ -1,0 +1,28 @@
+version: '3'
+
+# Local dev tasks for pgbx-skill.
+#
+# The install symlinks ~/.claude/skills/pgbx-skill (and ~/.agents/skills
+# if codex is on PATH) to this directory, so edits to references/*.md and
+# router.xml are picked up live — no reinstall needed.
+
+tasks:
+  default:
+    desc: "List available tasks."
+    cmds:
+      - task -l
+
+  local:install:
+    desc: "Symlink this working tree into ~/.claude/skills (and ~/.agents/skills if codex is present). Live-reload edits."
+    cmds:
+      - sh install.sh
+
+  local:uninstall:
+    desc: "Remove the symlinks created by local:install. Leaves npm-installed copies alone."
+    cmds:
+      - sh uninstall.sh
+
+  validate:
+    desc: "Run skill self-checks (recipe format + router + install-test)."
+    cmds:
+      - sh tests/all.sh

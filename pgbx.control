@@ -1,0 +1,7 @@
+comment = 'pgbx: zero-touch per-database Postgres backups to S3, controlled from SQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pgbx'
+relocatable = false
+superuser = true
+trusted = false
+schema = pgbx

@@ -1,0 +1,35 @@
+{
+  "name": "@deemwarhq/pgbx-skill",
+  "version": "0.5.0",
+  "description": "Claude Code / Codex agent skill for zero-touch PostgreSQL backups to S3 via pgbx: status, backup, restore, verify, policy.",
+  "license": "MIT",
+  "author": "Deemwar",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "agent-skill",
+    "postgresql",
+    "backup",
+    "s3",
+    "pg_dump"
+  ],
+  "bin": {
+    "pgbx-skill": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "references/",
+    "scripts/",
+    "assets/",
+    "SKILL.md",
+    "install.sh",
+    "uninstall.sh",
+    "tests/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

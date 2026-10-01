@@ -1,0 +1,14 @@
+# Dev/test image: PostgreSQL (PG_MAJOR, 13-18; default 16) + Rust/pgrx toolchain initialised for that major.
+ARG PG_MAJOR=16
+FROM postgres:${PG_MAJOR}-bookworm
+ARG PG_MAJOR
+ARG PGRX_VERSION=0.19.3
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      build-essential pkg-config libclang-dev clang curl ca-certificates git \
+      postgresql-server-dev-${PG_MAJOR} >/dev/null && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal && \
+    cargo install --locked cargo-pgrx --version ${PGRX_VERSION} -q && \
+    cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config && \
+    chmod -R a+rwX /opt/cargo /opt/rustup
+WORKDIR /src

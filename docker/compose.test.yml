@@ -1,0 +1,33 @@
+# Test bench: Postgres ${PG_MAJOR:-16} + pgbx, backing up to a TEST path of an S3 bucket.
+# The extension's whole config is these -c flags (in production: postgresql.conf).
+name: pgbx-test
+services:
+  db:
+    build: { context: .., dockerfile: docker/Dockerfile, args: { PG_MAJOR: "${PG_MAJOR:-16}", DEV_IMAGE: "${DEV_IMAGE:-pgbx-dev}" } }
+    image: pgbx:test
+    environment:
+      POSTGRES_PASSWORD: test-only-not-secret
+      PGDATA: /var/lib/postgresql/data   # postgres:18+ images default elsewhere; one layout for 13-18
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pgbx
+      - -c
+      - pgbx.s3_endpoint=${S3_ENDPOINT}
+      - -c
+      - pgbx.s3_bucket=${S3_BUCKET}
+      - -c
+      - pgbx.s3_region=${S3_REGION}
+      - -c
+      - pgbx.server_name=${PGBX_SERVER:-pgbx-test}
+      - -c
+      - pgbx.credentials_file=/etc/pgbx/s3.credentials
+      - -c
+      - pgbx.poll_seconds=3
+      - -c
+      - pgbx.alert_command=cat >> /var/lib/postgresql/alerts.log
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./test.credentials:/etc/pgbx/s3.credentials:ro
+    ports: ["127.0.0.1:55439:5432"]
+volumes: { pgdata: {} }

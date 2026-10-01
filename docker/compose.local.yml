@@ -1,0 +1,40 @@
+# Local speed + chaos bench: Postgres 16 + pgbx + a local S3 (RustFS) on the same Docker network.
+name: pgbx-local
+services:
+  s3:
+    image: rustfs/rustfs
+    env_file: local.env
+    volumes: [s3data:/data]
+  make-bucket:
+    image: amazon/aws-cli
+    env_file: local.env
+    entrypoint: ["sh", "-c", "for i in $$(seq 30); do aws --endpoint-url http://s3:9000 s3 mb s3://pgbx-local 2>&1 | grep -qE 'make_bucket|BucketAlready' && echo bucket-ready && exit 0; sleep 1; done; exit 1"]
+    depends_on: [s3]
+  db:
+    image: pgbx:test
+    environment:
+      POSTGRES_PASSWORD: test-only-not-secret
+      PGDATA: /var/lib/postgresql/data   # postgres:18+ images default elsewhere; one layout for 13-18
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pgbx
+      - -c
+      - pgbx.s3_endpoint=http://s3:9000
+      - -c
+      - pgbx.s3_bucket=pgbx-local
+      - -c
+      - pgbx.server_name=local
+      - -c
+      - pgbx.credentials_file=/etc/pgbx/s3.credentials
+      - -c
+      - pgbx.poll_seconds=2
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_wal_size=4GB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./local.credentials:/etc/pgbx/s3.credentials:ro
+    depends_on: [make-bucket]
+volumes: { s3data: {}, pgdata: {} }
