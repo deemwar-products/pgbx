@@ -155,6 +155,18 @@ echo "  $(P -d scoped -c "SELECT pgbx.set_data_scope()")"
 check "reset: every row is back" "$(scoped_round r3)" "100/500/50/30"
 check "admin may set the scope" "$(AS admin_user -d scoped -c "SELECT left(pgbx.set_data_scope(), 22)")" "backups keep every tab"
 
+echo "## 17. bandwidth caps (token bucket): pgbx.upload_kbps / download_kbps = 2048 (2 MiB/s)"
+P -c "ALTER SYSTEM SET pgbx.upload_kbps = 2048" -c "ALTER SYSTEM SET pgbx.download_kbps = 2048" -c "SELECT pg_reload_conf()" >/dev/null
+P -c "DROP DATABASE IF EXISTS big_capped WITH (FORCE)"
+capped() { # id -> "<state> <MiB/s>" once finished
+  for _ in $(seq 240); do r=$(P -d big -c "SELECT state||' '||coalesce(round(bytes / extract(epoch FROM finished - started) / 1048576, 2)::text, '-') FROM pgbx.history WHERE id=$1");
+    case "$r" in done*|failed*) break;; esac; sleep 1; done; echo "$r"; }
+within() { awk -v r="${1#* }" -v s="${1%% *}" 'BEGIN { print (s == "done" && r >= 1.8 && r <= 2.2) ? "yes" : "no (" s ", " r " MiB/s)" }'; }
+r=$(capped "$(P -d big -c "SELECT pgbx.backup_now()")"); echo "  backup: $r MiB/s"; check "upload at 2 MiB/s ±10%" "$(within "$r")" yes
+r=$(capped "$(P -d big -c "SELECT pgbx.restore(into_db => 'big_capped')")"); echo "  restore: $r MiB/s"; check "download at 2 MiB/s ±10%" "$(within "$r")" yes
+check "capped restore is complete" "$(P -d big_capped -c 'SELECT count(*) FROM blob')" 1000000
+P -c "ALTER SYSTEM RESET pgbx.upload_kbps" -c "ALTER SYSTEM RESET pgbx.download_kbps" -c "SELECT pg_reload_conf()" >/dev/null
+
 echo "## status()"; P -d shop -x -c "SELECT * FROM pgbx.status()" | sed 's/^/  /'
 echo "## backups"; P -d shop -c "SELECT id, taken_at::timestamp(0), trigger, size, s3_key FROM pgbx.backups" | sed 's/^/  /'
 echo "## history of shop"; P -d shop -c "SELECT id, kind, trigger, state, coalesce(s3_key,'-') FROM pgbx.history ORDER BY id" | sed 's/^/  /'

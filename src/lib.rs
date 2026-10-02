@@ -53,6 +53,9 @@ pub static ALERT_COMMAND: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 pub static DUMP_COMPRESSION: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"auto"));
 pub static AUDIT_DAYS: GucSetting<i32> = GucSetting::<i32>::new(30);
 pub static ADMIN_DB: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"postgres"));
+// bandwidth caps per job (ADR 0001 §3)
+pub static UPLOAD_KBPS: GucSetting<i32> = GucSetting::<i32>::new(0);
+pub static DOWNLOAD_KBPS: GucSetting<i32> = GucSetting::<i32>::new(0);
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.s3_endpoint", c"S3 endpoint URL", c"e.g. https://hel1.your-objectstorage.com", &S3_ENDPOINT, GucContext::Sighup, GucFlags::default());
@@ -67,6 +70,8 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.admin_db", c"Database that holds the server-wide overview and doctor()", c"", &ADMIN_DB, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.audit_days", c"Days of history (audit trail) kept per database", c"older rows are pruned, except kept backups, open incidents/gaps and the newest row of each kind", &AUDIT_DAYS, 1, 36500, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.poll_seconds", c"How often the worker looks for new databases and due/queued jobs", c"", &POLL_SECONDS, 1, 3600, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.upload_kbps", c"Upload bandwidth cap per job in KiB/s", c"0 = unlimited", &UPLOAD_KBPS, 0, 10_000_000, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.download_kbps", c"Download (restore) bandwidth cap per job in KiB/s", c"0 = unlimited", &DOWNLOAD_KBPS, 0, 10_000_000, GucContext::Sighup, GucFlags::default());
 
     // Only register the worker when loaded at server start (shared_preload_libraries),
     // not when a backend loads the library for CREATE EXTENSION.
