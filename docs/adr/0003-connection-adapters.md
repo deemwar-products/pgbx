@@ -1,7 +1,6 @@
 # ADR 0003: Connection adapters and profiles (and a marketplace note)
 
-Status: **Accepted in principle (owner decisions, 2026-10-02, including "no connection code in the core"); build
-after the current merges.**
+Status: **Accepted, final shape (owner decisions, 2026-10-02). Build after the current merges.**
 Builds on ADR 0002 (profiles, SSH tunnels, read queries).
 
 ## Context
@@ -14,88 +13,74 @@ accounts, GCP projects and environments.
 
 ## Decision
 
-### Profiles are the core
+pgbx contains **no connection code** and **stores no secrets**. A connection is either a plain connection
+string or an **adapter**: an external command, in any language, that hands pgbx a connection string.
 
-- Full management for many profiles: `pgbx profile add | edit | remove | list | show | use`.
-- A profile holds **either**:
-  - a **connection string**, `url = "postgres://ops@db.example.com:5432/shop"`. It's stored **without a
-    password**; the password comes from `~/.pgpass`, `PGPASSWORD` or the user's own tooling, so pgbx still saves
-    no secret (see Q2); **or**
-  - an **adapter command**: any executable plus args, e.g. `["node", "adapter.js", "--project", "acme"]` or
-    `["/usr/local/bin/corp-pg"]`.
-  plus non-secret pgbx settings (db, user name, s3 bucket location, ...).
-- Without a profile: `--url postgres://...` (or `PGBX_URL`) for that run, used in memory and never saved.
-
-### Adapters: no connection code in pgbx
-
-pgbx itself contains **no connection code**: no SSH, AWS, GCP or Azure logic. Every way of reaching a server is
-either a connection string or an **adapter command**. pgbx runs the command, reads its stdout and carries on.
-**pgbx does not care what language the adapter is in.** It stays a single Rust binary, and Node (or any
-runtime) is never a pgbx dependency.
+### Config: adapters and profiles are separate
 
 ```toml
-[additional_adapters]
-# defaults shipped in the repo under adapters/ (copied by the installer; enable by uncommenting)
-# ssh   = ["node", "~/.pgbx/adapters/ssh/ssh-connector.js"]
-# aws   = ["node", "~/.pgbx/adapters/aws/aws-connector.js"]
-# gcp   = ["node", "~/.pgbx/adapters/gcp/gcp-connector.js"]
-# azure = ["node", "~/.pgbx/adapters/azure/azure-connector.js"]
-corp-vpn = ["/usr/local/bin/corp-pg", "--env", "prod"]   # any executable works the same way
+[adapters]                        # defined once: name -> command (any executable; the defaults are examples)
+ssh = "node ~/.pgbx/adapters/ssh/ssh-adapter.js"
+aws = "node ~/.pgbx/adapters/aws/aws-adapter.js"
+corp = "/usr/local/bin/corp-pg"
+
+[profiles.prod-eu]                # an adapter + whatever config THAT adapter wants (free-form)
+adapter  = "aws"
+account  = "acme-prod"
+region   = "eu-west-1"
+instance = "shop-db"
+url_user = "$PGUSER"
+
+[profiles.dev]                    # or just a plain connection string
+url = "postgres://$PGUSER:$PGPASSWORD@localhost:5432/shop"
 ```
 
-**Contract (v1): the adapter is a child that lives as long as pgbx needs it.** Line-delimited JSON both ways
-(one JSON object per line; stdout carries only protocol lines, and logs go to stderr):
+- **Profiles are the core:** `pgbx profile add | edit | remove | list | show | use`, for many profiles (several
+  AWS accounts, GCP projects, environments). Without a profile: `--url ...` / `PGBX_URL` for that run.
+- **Credentials belong to the user.** A connection string naturally carries the user and password. pgbx expands
+  `$VAR` / `${VAR}` references **anywhere in a profile or connection string** from the environment **at run time**
+  (`$$` is a literal `$`). A missing variable is an error that names the variable, never a value. pgbx writes
+  nothing secret to disk: profiles hold the references, not the values. A secret store is **later, not now**.
+- Expanded values and URLs are used in memory only. They never appear in logs or output (`postgres://user:***@...`),
+  and child tools get the password through their environment, never their argv.
 
-1. pgbx starts `<command> connect <name> [profile args...]` with no shell, in its own process group (`setsid` on
-   Unix, a Job Object on Windows), with stdin and stdout as pipes.
-2. The adapter connects (any caching is its own business, done internally) and prints:
+### Adapter protocol (v1)
+
+1. pgbx starts the adapter's command (no shell; its own process group: `setsid` on Unix, a Job Object on
+   Windows), with stdin and stdout as pipes.
+2. pgbx writes **one line on stdin**: `{"action":"start","name":"prod-eu","config":{...}}`. The `config` is that
+   profile's settings with `$VAR`s expanded; the adapter decides what it needs.
+3. The adapter connects (caching, retries and keeping its tunnel or proxy up are **its own job**) and prints
+   **exactly one line on stdout**, its result:
    ```json
-   {"type": "ready", "url": "postgres://user:pass@127.0.0.1:54321/shop?sslmode=require", "state": "ready", "name": "prod-eu"}
+   {"url": "postgres://ops:secret@127.0.0.1:54321/shop?sslmode=require", "state": "ready", "name": "prod-eu"}
    ```
-   It may print `{"type":"state","state":"reconnecting"}` / `{"type":"state","state":"error: tunnel lost"}` later;
-   pgbx shows these.
-3. The adapter then **blocks reading stdin**, keeping its tunnel or proxy up.
-4. When pgbx is done, it writes `{"type":"stop"}` on stdin. The adapter cleans up (closes its tunnel or proxy) and
-   exits.
+   `state` other than `ready` means failure, and pgbx shows it. `name` must match the profile name.
+   **stdout carries only this result.** All of the adapter's logs go to its own log (stderr or a file).
+4. pgbx reads that one line, connects with the URL, and **does not talk to or restart the adapter after that**.
+5. When pgbx is done (a one-off command finishes; `pgbx serve` shuts down), it writes `{"action":"stop"}` on
+   stdin. **stdin closing also means stop**, so if pgbx dies the adapter exits too. The adapter cleans up and exits.
 
-| Field | Meaning |
-|---|---|
-| `url` | full connection string, password included if needed. pgbx uses it **in memory only** and saves it nowhere (not in profiles, state, memories or logs). Output redacts it to `postgres://user:***@...`. Child tools get the password through their environment, never their argv. |
-| `state` | shown as is. On `ready` the URL is usable; an error state before ready means failure. |
-| `name` | the connection's name. It must match the profile name (a mismatch is an error). With an ad-hoc adapter it names the memory folder (`~/pgbx/<name>/<db>/`). |
+**Timeouts:** no result line within `ready_timeout` (default 30 s) means failure, and pgbx shows the adapter's
+stderr (redacted). After `stop`, a grace period (default 5 s), then pgbx kills the adapter's process group
+(SIGTERM, then SIGKILL; on Windows it terminates the Job Object).
 
-**Safety and timeouts:**
-- **stdin EOF means stop.** If pgbx dies, its end of the pipe closes and the adapter exits, so there are no
-  orphans.
-- **Start timeout:** no `ready` within `ready_timeout` (default 30 s) means failure. pgbx shows the adapter's stderr
-  (redacted) and kills its process group.
-- **Stop grace:** after `{"type":"stop"}` (or EOF), pgbx waits a grace period (default 5 s), then kills the adapter's
-  **process group** (SIGTERM, then SIGKILL; on Windows it terminates the Job Object).
-
-**Lifetime:**
-- A **one-off CLI command** (`pgbx query`, `status`, `db-restore --from-s3`, ...) starts its adapter, uses it and
-  stops it.
-- **`pgbx serve` keeps one adapter alive per connection for its whole lifetime**, and stops it on shutdown.
-- No detached tunnels, no idle expiry, no state files, and no separate `stop` verb: `{"type":"stop"}` on stdin
-  replaces them. pgbx's built-in tunnel reuse (`cli/src/tunnel.rs`) is removed.
-
-**pgbx does nothing with secrets.** Credentials belong to the adapter, the vendor CLI or the user.
+**Lifetime:** a one-off CLI command starts its adapter and stops it when done; `pgbx serve` keeps one adapter alive
+per connection for its whole run. No detached tunnels, idle expiry or state files in pgbx. pgbx's built-in
+SSH tunnel and reuse (`cli/src/tunnel.rs`) are removed and become the `ssh` example adapter.
 
 ### Default adapters: examples, in the repo, not in the binary
 
-`adapters/ssh`, `adapters/aws`, `adapters/gcp` and `adapters/azure`. Each has its own README (prerequisites, profile
-args) and its own tests. They wrap the user's existing tooling and credentials:
+`adapters/ssh`, `adapters/aws`, `adapters/gcp` and `adapters/azure`, each with its own README (prerequisites, the
+profile config keys it reads) and tests. They're **example commands** users can enable, copy or replace, in any
+language. Node is never a pgbx dependency.
 
 | Adapter | Wraps |
 |---|---|
-| `ssh` | system `ssh` (keys, agent, `~/.ssh/config`, ProxyJump) running `ssh -N -L 127.0.0.1:<free>:<pg>` as its own child for as long as pgbx needs it |
+| `ssh` | system `ssh` (keys, agent, `~/.ssh/config`, ProxyJump), running `ssh -N -L 127.0.0.1:<free>:<pg>` as its child until stop |
 | `aws` | `aws ssm start-session` port forwarding to RDS or EC2, plus `aws rds generate-db-auth-token` for IAM auth when asked |
 | `gcp` | `cloud-sql-proxy` (and `gcloud` for the instance name / IAM) |
 | `azure` | `az` (Bastion tunnel and Entra ID token for Azure Database for PostgreSQL) |
-
-They are **example commands** users can enable, copy or replace with their own, in any language. No sh or
-PowerShell variants are planned (owner, 2026-10-02). Custom adapters follow exactly the same contract, and we
-embed none of their code.
 
 ### Safety
 
@@ -116,19 +101,18 @@ embed none of their code.
 
 ## Consequences
 
-- The core gets smaller: `cli/src/tunnel.rs` (its SSH spawn, detached helper, state files, lock and 10-minute
-  reuse) moves out into `adapters/ssh`. The client is profiles, a line-JSON child-process protocol and
-  process-group handling.
-- One rule for every connection, built-in or custom, and no background processes outliving pgbx.
-- Each one-off command pays its adapter's start-up (seconds for SSM or cloud-sql-proxy). `pgbx serve` pays it
-  once. An adapter may cache credentials internally to make start-up faster.
-- A default adapter written in Node needs Node only on the machine that enables it. pgbx itself never needs it.
-- **Host-side commands** (`doctor`, `logs`, `setup server`, `diagnose`) ran on the server over pgbx's own SSH;
-  with no SSH in the core they need another route (Q1).
+- The core gets smaller: profiles, `$VAR` expansion, a two-message stdin protocol, one stdout line, and
+  process-group handling. `cli/src/tunnel.rs` moves out into `adapters/ssh`.
+- One rule for every connection, and nothing outlives pgbx.
+- Each one-off command pays its adapter's start-up (seconds for SSM or cloud-sql-proxy). `pgbx serve` pays it once.
+  Adapters may cache internally.
+- **Host-side commands** (`doctor`, `logs`, `setup server`, `diagnose`) ran over pgbx's own SSH. With no SSH in the core,
+  in v1 they run on the host itself (the user runs `pgbx doctor` there). See Q1.
 - Tests:
-  - pgbx: a fake adapter that becomes ready; emits state updates; never becomes ready (start timeout, stderr
-    shown); ignores `stop` (the group is killed after the grace period); exits early (error shown); and pgbx
-    killed mid-run (the adapter sees EOF and exits). The URL must never appear on disk or in output.
+  - pgbx: a fake adapter that answers ready; answers an error state; never answers (timeout, stderr shown);
+    prints logs on stdout before the result (protocol error, clearly reported); ignores `stop` (the group is
+    killed after the grace period); and pgbx killed mid-run (stdin closes, the adapter exits). `$VAR` expansion,
+    a missing variable, `$$`. No secret on disk or in output.
   - Each default adapter: its own tests.
 
 ## Marketplace (long term)
@@ -157,14 +141,9 @@ and list the container first (it covers the most buyers), with the AMI as an eas
 
 ## Open questions for the owner
 
-1. **Host-side commands without SSH in the core.** `doctor`, `logs`, `setup server` and `diagnose` need to run on the
-   database host. Proposal: an optional message `{"type":"exec","id":1,"argv":["pgbx","doctor","--json"]}` on
-   stdin. The adapter runs it on the host and answers `{"type":"exec_result","id":1,"exit":0,"stdout":"..."}`; an
-   adapter without it answers `{"type":"exec_result","id":1,"unsupported":true}`. The ssh adapter implements
-   it; the cloud ones may (SSM `send-command`). The CEO recommends yes.
-2. **Password in a profile's URL.** The CEO recommends allowing it, with a warning when the profiles file
-   permissions are looser than 0600, and never printed or exported (`pgbx profile show` redacts it; profiles
-   are never in `memories export`). The alternative is keeping profile URLs password-free.
+1. **Host-side commands** (`doctor`, `logs`, `setup server`, `diagnose`) over an adapter: an optional `exec` action
+   is undecided and **out of v1**.
+2. Secret store: later (not v1). Which one, if any (`sec`, OS keychain, 1Password/Vault CLIs via adapters)?
 3. Licence: MIT, or a one-time fee? This also decides the marketplace pricing model.
 4. Marketplace target: managed Postgres (needs a new runner mode) or self-managed (an AMI with today's extension)?
 5. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?
