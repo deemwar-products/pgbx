@@ -158,6 +158,20 @@ Every job gets an estimate the moment it is created, from data pgbx already has:
   already in `pgbx.history`). No history yet → server-wide median for that kind → `pgbx.eta_default_mbps`
   (default **20 MB/s**, deliberately slow so first estimates err long). Dump bytes vs DB size: per-DB compression
   ratio from past backups, else 0.3.
+- **Machine capacity.** A dump is limited by the slowest of four pipes, so the estimate uses
+  `speed = min(cpu, disk, network, cap) × load_factor`, each measured cheaply and stored in
+  `pgbx.server_capacity` (admin DB, one row, refreshed daily and after `SIGHUP`):
+  - **cpu:** single-core compression rate for the configured codec, measured once per day by compressing 64 MiB of
+    a real table's pages at the job's nice level (~1 s of one core; `pgbx.eta_calibrate`, default on). Cores
+    (`available_parallelism()`) are shown but don't speed a single-stream dump, and the ADR keeps it single-core.
+  - **disk:** `pg_stat_io` read throughput (PG 16+) or `blk_read_time` when `track_io_timing` is on; else unknown.
+  - **network:** S3 upload/download throughput of the last 20 multipart parts (timed in `transfer.rs`, no extra
+    traffic); first ever job uses the cpu number alone.
+  - **cap:** `pgbx.upload_kbps` / `download_kbps` when set.
+  - **load_factor:** from the gate's last sample (`/proc/loadavg` ÷ cores, active backends): a busy box makes a
+    niced dump slower, so the estimate stretches (×1 idle … ×3 saturated) and says so ("slower: server busy").
+  The NOTICE names the bottleneck: "~18 min, limited by upload (35 MB/s)". History-based speed (above) wins once
+  there are ≥ 3 own samples; capacity is the prior and the sanity bound. `pgbx doctor` shows the capacity row.
 - **Start.** Queue position (§0 pick order) + sum of estimates of the jobs ahead + remaining time of the running
   job; if the gate is `on` and the last sample was busy, add the current backoff, capped at the deadline.
 - **Confidence.** `high` (≥ 3 own samples, low variance), `medium` (server-wide data), `low` (default speed).
@@ -216,6 +230,7 @@ the server value is a ceiling where noted.
 | `pgbx.dump_lock_timeout_forced` | 60s | 0-10min | no | at the deadline, try harder then alert |
 | `pgbx.restore_synchronous_commit` | off | on/off | no | restore target is a NEW db, safe to redo |
 | `pgbx.eta_default_mbps` | 20 | 1-10000 | no | first estimates err long, not short |
+| `pgbx.eta_calibrate` | on | on/off | no | ~1 s of one niced core per day |
 | `pgbx.eta_samples` | 5 | 1-50 | no | recent jobs only, adapts to growth |
 | `pgbx.doctor_long_job` | 1h | 0-24h | no | |
 
