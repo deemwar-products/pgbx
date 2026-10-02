@@ -162,7 +162,7 @@ for _ in $(seq 120); do st=$(P -d locked -c "SELECT state FROM pgbx.history WHER
 P -d locked -c "CREATE TABLE t AS SELECT g AS id FROM generate_series(1,1000) g"
 # a migration holds ACCESS EXCLUSIVE on t for 25 s
 docker compose -f compose.test.yml exec -T db psql -U postgres -d locked -qAt -c "BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(25); COMMIT;" >/dev/null 2>&1 & holder=$!
-sleep 2; id=$(P -d locked -c "SELECT pgbx.backup_now()")
+sleep 2; since=$(date -u +%Y-%m-%dT%H:%M:%SZ); id=$(P -d locked -c "SELECT pgbx.backup_now()")
 # the pg_dump waiting for its lock: nice / IO class as set between fork and exec (/proc: the image has no ps)
 caps=$(docker compose -f compose.test.yml exec -T db sh -c 'for _ in $(seq 150); do for p in /proc/[0-9]*; do
   [ "$(cat $p/comm 2>/dev/null)" = pg_dump ] && { echo "$(cut -d" " -f19 $p/stat)|$(ionice -p ${p#/proc/})"; exit 0; }; done; sleep 0.1; done')
@@ -172,7 +172,7 @@ check "its connection is tagged pgbx_dump" "$(P -c "SELECT count(*) FROM pg_stat
 sleep 3; check "doctor(): long_running_job sees it" "$(P -c "SELECT ok||' '||(detail LIKE '%pgbx_dump in locked%') FROM pgbx.doctor() WHERE name='long_running_job'")" "false true"
 for _ in $(seq 30); do r=$(P -d locked -c "SELECT state||' '||coalesce(params->>'lock_timeouts','-')||' '||(params ? 'deferred_until') FROM pgbx.history WHERE id=$id"); [ "$r" = "queued 1 true" ] && break; sleep 1; done
 check "lock timeout re-queues the backup (not failed)" "$r" "queued 1 true"
-check "logged once" "$(docker compose -f compose.test.yml logs db 2>&1 | grep -c "locked: backup #$id could not get its table locks")" 1
+check "logged once" "$(docker compose -f compose.test.yml logs --since "$since" db 2>&1 | grep -c "locked: backup #$id could not get its table locks")" 1
 wait $holder
 for _ in $(seq 120); do r=$(P -d locked -c "SELECT state FROM pgbx.history WHERE id=$id"); case "$r" in done|failed) break;; esac; sleep 1; done
 check "runs after the lock is released" "$r" done
@@ -198,7 +198,14 @@ capped() { # id -> "<state> <MiB/s>" once finished
     case "$r" in done*|failed*) break;; esac; sleep 1; done; echo "$r"; }
 within() { awk -v r="${1#* }" -v s="${1%% *}" 'BEGIN { print (s == "done" && r >= 1.8 && r <= 2.2) ? "yes" : "no (" s ", " r " MiB/s)" }'; }
 r=$(capped "$(P -d big -c "SELECT pgbx.backup_now()")"); echo "  backup: $r MiB/s"; check "upload at 2 MiB/s ±10%" "$(within "$r")" yes
-r=$(capped "$(P -d big -c "SELECT pgbx.restore(into_db => 'big_capped')")"); echo "  restore: $r MiB/s"; check "download at 2 MiB/s ±10%" "$(within "$r")" yes
+id=$(P -d big -c "SELECT pgbx.restore(into_db => 'big_capped')")
+# the pg_restore: nice / IO class / synchronous_commit=off (its env) / connection tag
+caps=$(docker compose -f compose.test.yml exec -T db sh -c 'for _ in $(seq 300); do for p in /proc/[0-9]*; do
+  [ "$(cat $p/comm 2>/dev/null)" = pg_restore ] && { echo "$(cut -d" " -f19 $p/stat)|$(ionice -p ${p#/proc/})|$(tr "\0" "\n" < $p/environ | grep ^PGOPTIONS=)"; exit 0; }; done; sleep 0.1; done')
+check "pg_restore runs at nice 10, best-effort 7, synchronous_commit=off" "$caps" "10|best-effort: prio 7|PGOPTIONS=-c synchronous_commit=off"
+for _ in $(seq 20); do n=$(P -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='pgbx_restore' AND datname='big_capped'"); [ "$n" = 1 ] && break; sleep 0.5; done
+check "its connection is tagged pgbx_restore" "$n" 1
+r=$(capped "$id"); echo "  restore: $r MiB/s"; check "download at 2 MiB/s ±10%" "$(within "$r")" yes
 check "capped restore is complete" "$(P -d big_capped -c 'SELECT count(*) FROM blob')" 1000000
 P -c "ALTER SYSTEM RESET pgbx.upload_kbps" -c "ALTER SYSTEM RESET pgbx.download_kbps" -c "SELECT pg_reload_conf()" >/dev/null
 
