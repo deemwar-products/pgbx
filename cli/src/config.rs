@@ -153,7 +153,7 @@ impl Config {
         if s.trim().is_empty() {
             return Ok(Config::default());
         }
-        let v: Value = serde_yaml::from_str(s).map_err(|e| format!("not valid YAML: {e}"))?;
+        let v: Value = serde_norway::from_str(s).map_err(|e| format!("not valid YAML: {e}"))?;
         let v = match v {
             Value::Null => return Ok(Config::default()),
             Value::Object(m) => m,
@@ -193,7 +193,7 @@ impl Config {
         m.insert("secrets".into(), self.secrets.clone().unwrap_or(json!("env")));
         m.insert("adapters".into(), Value::Object(self.adapters.clone()));
         m.insert("profiles".into(), Value::Object(self.profiles.clone()));
-        let body = serde_yaml::to_string(&Value::Object(m)).unwrap_or_default();
+        let body = serde_norway::to_string(&Value::Object(m)).unwrap_or_default();
         format!("# pgbx config (ADR 0003). Profiles hold $VAR references, never values. Mode 0600: it names commands pgbx runs.\n{body}")
     }
 

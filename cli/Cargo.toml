@@ -23,9 +23,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 tokio-postgres-rustls = "0.14"
 webpki-roots = "1"
 rustls-native-certs = "0.8"
-# config.yaml (ADR 0003). serde_yaml 0.9 is feature-complete and final ("+deprecated" = unmaintained, not broken):
-# it reads and writes straight into serde_json::Value, so pgbx needs no serde derive and no YAML code of its own.
-serde_yaml = "0.9"
+# config.yaml (ADR 0003). serde_norway is the maintained fork of serde_yaml 0.9 (deprecated), same API: it reads and
+# writes straight into serde_json::Value, so pgbx needs no serde derive and no YAML code of its own.
+serde_norway = "0.9"
 
 # adapter process groups and Ctrl-C (ADR 0003): both crates are already in the tree (socket2, mio), so no new code
 [target.'cfg(unix)'.dependencies]
