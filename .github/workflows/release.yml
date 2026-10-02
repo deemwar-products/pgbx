@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag vX.Y.Z -> builds every artifact below and publishes a GitHub Release with SHA256SUMS.
+# Manual only: Actions -> Release -> Run workflow with an existing tag vX.Y.Z -> builds every artifact below and publishes a GitHub Release with SHA256SUMS.
 #   pgbx-ext-pg<N>-linux-<arch>.tar.gz   extension: lib/<name>.so + extension/<name>.control + all sql (incl. upgrades)
 #   pgbx-linux-<arch>.tar.gz             CLI, static musl binary
 #   pgbx-darwin-arm64.tar.gz             CLI only (the extension is Linux-only)
@@ -9,8 +9,6 @@ name: Release
 #   https://github.com/deemwar-products/pgbx/releases/latest/download/<asset>   (no API call, no rate limit)
 # and a pinned release is .../releases/download/<tag>/<asset>. Each archive holds a VERSION file.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
