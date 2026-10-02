@@ -245,8 +245,8 @@ the server value is a ceiling where noted.
 
 ## Rollout
 
-1. **0.x+1 — off:** ship caps (§3, nice/ionice/lock_timeout on by default — they only reduce impact), sampling
-   and `suggest_window()`; gate code present, `load_gate=off`.
-2. **0.x+2 — shadow default:** collect `would_defer` across our own servers for two weeks; tune default thresholds
-   from real data.
-3. **0.x+3 — on default**, with `max_defer=4h`. `load_gate=off` stays available.
+1. **Release 1:** resource caps on (they only reduce impact), server-wide queue with `overrun_policy=skip`,
+   activity sampling and `suggest_window()`.
+2. **Release 2:** load gate with default `shadow`: clients see `would_defer` in `pgbx status` / `pgbx load` / UI and
+   turn it `on` per database or server-wide. Defaults for thresholds are retuned from shadow data on our servers.
+3. Default `on` only by a later ADR, if shadow data shows deferrals help and deadlines are rarely hit.
