@@ -72,6 +72,16 @@ function BackupsOff({ o }: { o: Overview }) {
   );
 }
 
+/** 'ok: restored 4 tables from X.dump' -> a short badge plus the detail */
+function Verify({ text }: { text: string }) {
+  const [head, ...rest] = text.split(':');
+  return (
+    <span>
+      <Badge t={tone(head)}>{head}</Badge> {rest.length > 0 && <span className="mute small">{rest.join(':').trim()}</span>}
+    </span>
+  );
+}
+
 function stateOf(r: OverviewDb): string {
   return r.state || 'unknown';
 }
@@ -102,7 +112,7 @@ function Databases({ dbs }: { dbs: OverviewDb[] }) {
     },
     { h: 'next run', c: (r) => (r.next_backup_at ? <span title={ts(r.next_backup_at)}>{ago(r.next_backup_at)}</span> : <span className="mute">—</span>) },
     { h: 'kept', c: (r) => r.backups_kept ?? '—' },
-    { h: 'restore test', c: (r) => (r.last_verify ? <Badge>{r.last_verify}</Badge> : <span className="mute">not yet</span>) },
+    { h: 'restore test', wide: true, c: (r) => (r.last_verify ? <Verify text={r.last_verify} /> : <span className="mute">not yet</span>) },
     { h: 'schedule', c: (r) => <span className="mute">{r.schedule}</span> },
     {
       h: 'problem',

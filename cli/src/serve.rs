@@ -572,7 +572,8 @@ pub fn run(cx: &mut Ctx) -> Result<Value, String> {
         // with --allow-safe the role is meant to run backups; without it, say so like pgbx ui does
         Ok((_, Some(w))) if !allow_safe => warnings.push(w.replace("pgbx ui --user", "pgbx serve --user")),
         Ok(_) => {}
-        Err(e) => warnings.push(format!("cannot read the connection yet: {e}")),
+        // not a lasting warning: the page reconnects on every call and shows the error where it happens
+        Err(e) => eprintln!("pgbx serve: cannot read the connection yet: {e}"),
     }
     warnings.extend(bind_warning(&addr));
     let listener = TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;

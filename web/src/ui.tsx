@@ -25,6 +25,7 @@ export type Tone = 'ok' | 'warn' | 'bad' | 'info' | 'mute';
 export function tone(state: string | null | undefined): Tone {
   const s = String(state || '').toLowerCase();
   if (/fail|error|overdue|missing|broken|unreachable/.test(s)) return 'bad';
+  if (/^(ok|done|passed|healthy)\b/.test(s)) return 'ok';
   if (/cancel/.test(s)) return 'mute';
   if (/paus|wait|defer|queued|never|expired|first/.test(s)) return 'warn';
   if (/run|restor|verif.*progress/.test(s)) return 'info';
