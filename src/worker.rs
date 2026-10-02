@@ -120,6 +120,7 @@ pub extern "C-unwind" fn pgbx_worker_main(_arg: pg_sys::Datum) {
         if BackgroundWorker::sighup_received() {
             unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
             log("settings reloaded");
+            s.reprobe = true;
         }
         drain_logs();
         // a job that ended frees its slot: look for the next one at once
@@ -283,6 +284,10 @@ struct Running {
 struct Sched {
     running: Vec<Running>,
     last_start: HashMap<String, Instant>, // round-robin: the database that waited longest goes first on ties
+    speeds: HashMap<String, Vec<f64>>,     // recent job speeds server-wide per kind (dump bytes/s), for estimates
+    cap_written: HashMap<String, String>,  // what server_capacity holds in each database
+    last_probe: Option<Instant>,
+    reprobe: bool,
 }
 
 /// A queued job of some database, as found this poll.
@@ -362,11 +367,12 @@ fn tick(s: &mut Sched) -> Result<(), String> {
         .collect();
     let (mut cands, mut deferred) = (Vec::new(), Vec::new());
     let mut conns: HashMap<String, Client> = HashMap::new();
+    s.speeds.clear();
     for db in &dbs {
         if owned.contains(db) {
             continue; // a restore is still writing it: it is not a live database yet
         }
-        match scan_db(&c, &mut admin, db, s) {
+        match scan_db(&c, &mut admin, db, &mut *s) {
             Ok((cl, mut found, mut later)) => {
                 cands.append(&mut found);
                 deferred.append(&mut later);
@@ -385,6 +391,7 @@ fn tick(s: &mut Sched) -> Result<(), String> {
     let _ = admin.execute("DELETE FROM pgbx.server_overview WHERE NOT (database::text = ANY($1))", &[&dbs]);
     let waiting = start_jobs(&c, &admin_db, s, cands, &mut conns);
     publish_queue(&mut admin, s, &waiting, &deferred, &mut conns);
+    maybe_probe(s, &c, &mut admin);
     Ok(())
 }
 
@@ -555,7 +562,7 @@ fn queue_scheduled_backup(cl: &mut Client, db: &str, schedule: &str) -> Result<(
 /// Per database, every poll: keep the extension current, recover jobs a restart cut off, pass on cancel requests,
 /// queue due jobs, publish the overview row; returns the connection, this database's queued jobs that may start now,
 /// and the deferred ones (with the reason).
-fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &Sched) -> Result<(Client, Vec<Cand>, Vec<(Cand, String)>), String> {
+fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<(Client, Vec<Cand>, Vec<(Cand, String)>), String> {
     let mut cl = connect(c, db)?;
     cl.batch_execute("CREATE EXTENSION IF NOT EXISTS pgbx;").map_err(pe)?;
     update_extension(&mut cl, db)?;
@@ -641,6 +648,20 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &Sched) -> Result<(Client, 
             None => found.push(cand),
         }
     }
+    // recent job speeds, for the server-wide fallback of the time estimates
+    for r in cl
+        .query(
+            "SELECT kind, bytes::float8 / extract(epoch FROM finished - started)::float8 FROM (
+                 SELECT kind, bytes, started, finished, row_number() OVER (PARTITION BY kind ORDER BY id DESC) AS n
+                   FROM pgbx.history WHERE kind IN ('backup', 'restore', 'verify') AND state IN ('done', 'expired')
+                    AND bytes > 0 AND finished > started) x
+              WHERE n <= $1",
+            &[&(ETA_SAMPLES.get() as i64)],
+        )
+        .map_err(pe)?
+    {
+        s.speeds.entry(r.get::<_, String>(0)).or_default().push(r.get(1));
+    }
     prune_audit(&mut cl, db);
     publish_overview(admin, &mut cl, db, &schedule)?;
     Ok((cl, found, deferred))
@@ -689,12 +710,17 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
         let deadline = defer_deadline(j.requested, j.trigger == "first", &j.schedule, &cfg);
         let forced = j.kind == "backup" && p.contains_key("deferrals") && Utc::now() >= deadline;
         // a cancel() between the scan and now wins: only a row still queued starts
+        // what it is expected to take is recorded now: progress is measured against it, accuracy judged by it
         let n = cl.execute(
-            "UPDATE pgbx.history SET state='running', started=now(),
-                    params = (params - 'queue_position' - 'wait_reason')
+            "UPDATE pgbx.history h SET state='running', started=now(),
+                    params = (h.params - 'queue_position' - 'wait_reason' - 'eta_start')
                              || CASE WHEN $2 THEN '{\"forced\":true}'::jsonb ELSE '{}'::jsonb END
-              WHERE id=$1 AND state='queued'",
-            &[&j.id, &forced],
+                             || jsonb_build_object('est_bytes', e.est_bytes, 'eta_sec', round(e.est_secs::numeric), 'eta_basis', e.basis)
+                             || CASE WHEN h.kind = 'backup' THEN jsonb_build_object('db_size', pg_database_size(current_database()))
+                                     ELSE '{}'::jsonb END
+               FROM pgbx._estimate($3) e
+              WHERE h.id=$1 AND h.state='queued'",
+            &[&j.id, &forced, &j.kind],
         );
         if !matches!(n, Ok(1)) {
             continue;
@@ -755,9 +781,10 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
     waiting
 }
 
-/// Mirror the server-wide queue into the admin database (pgbx.server_queue, `pgbx jobs`) and tell each waiting job
-/// why it waits (history.params queue_position / wait_reason, shown by status()). Rows only change when it changed.
-fn publish_queue(admin: &mut Client, s: &Sched, waiting: &[(Cand, String)], deferred: &[(Cand, String)], conns: &mut HashMap<String, Client>) {
+/// Mirror the server-wide queue into the admin database (pgbx.server_queue, `pgbx jobs`) with time estimates, tell
+/// each waiting job why it waits and when it should start (history.params, shown by status() / job_eta()), and copy
+/// the server's capacity row into every database. Per-database rows are only written when they changed.
+fn publish_queue(admin: &mut Client, s: &mut Sched, waiting: &[(Cand, String)], deferred: &[(Cand, String)], conns: &mut HashMap<String, Client>) {
     struct Row<'a> {
         db: &'a str,
         id: i64,
@@ -769,10 +796,26 @@ fn publish_queue(admin: &mut Client, s: &Sched, waiting: &[(Cand, String)], defe
         requested: SystemTime,
         started: Option<SystemTime>,
         detail: String,
+        eta_start: Option<SystemTime>,
+        eta_finish: Option<SystemTime>,
+        est_bytes: Option<i64>,
+        done_bytes: Option<i64>,
+        progress: Option<String>,
     }
+    let now = Utc::now();
+    let secs_to = |t: Option<SystemTime>| t.map(|t| (DateTime::<Utc>::from(t) - now).num_milliseconds() as f64 / 1000.0);
+    let mut sim = QueueSim::new(MAX_CONCURRENT_JOBS.get().clamp(1, 8), RESTORE_LANE.get());
     let mut rows: Vec<Row> = Vec::new();
     for r in &s.running {
         let cancelling = r.ctl.cancelled.load(Ordering::Relaxed);
+        let eta = conns.get_mut(&r.db).and_then(|cl| {
+            cl.query_opt("SELECT eta_start, eta_finish, est_bytes, done_bytes, progress FROM pgbx.job_eta($1)", &[&r.id]).ok().flatten()
+        });
+        let (es, ef, eb, db_, pr): (Option<SystemTime>, Option<SystemTime>, Option<i64>, Option<i64>, Option<String>) = match &eta {
+            Some(x) => (x.get(0), x.get(1), x.get(2), x.get(3), x.get(4)),
+            None => (None, None, None, None, None),
+        };
+        sim.busy(r.slot, secs_to(ef).unwrap_or(0.0));
         rows.push(Row {
             db: &r.db,
             id: r.id,
@@ -790,18 +833,32 @@ fn publish_queue(admin: &mut Client, s: &Sched, waiting: &[(Cand, String)], defe
             } else {
                 format!("running in job slot {}", r.slot)
             },
+            eta_start: es,
+            eta_finish: ef,
+            est_bytes: eb,
+            done_bytes: db_,
+            progress: pr,
         });
     }
     for (i, (j, why)) in waiting.iter().enumerate() {
+        let est = conns.get_mut(&j.db).and_then(|cl| cl.query_opt("SELECT est_bytes, est_secs FROM pgbx._estimate($1)", &[&j.kind]).ok().flatten());
+        let (eb, secs): (Option<i64>, f64) = est.map(|x| (x.get(0), x.get::<_, f64>(1))).unwrap_or((None, 0.0));
+        let start = sim.place(j.kind == "restore", secs);
+        let at = now + chrono::Duration::milliseconds((start * 1000.0) as i64);
+        let fin = at + chrono::Duration::milliseconds((secs * 1000.0) as i64);
+        let when = if start < 60.0 { "now".to_string() } else { at.format("%H:%M UTC").to_string() };
         rows.push(Row {
             db: &j.db, id: j.id, kind: &j.kind, trigger: &j.trigger, state: "queued", position: Some(i as i32 + 1), slot: None,
-            requested: j.requested.into(), started: None, detail: why.clone(),
+            requested: j.requested.into(), started: None, detail: why.clone(), eta_start: Some(at.into()), eta_finish: Some(fin.into()),
+            est_bytes: eb, done_bytes: None,
+            progress: Some(format!("queued, #{} in line: starts ~{when}, takes ~{}", i + 1, dur(secs))),
         });
     }
     for (j, why) in deferred {
         rows.push(Row {
             db: &j.db, id: j.id, kind: &j.kind, trigger: &j.trigger, state: "deferred", position: None, slot: None,
-            requested: j.requested.into(), started: None, detail: why.clone(),
+            requested: j.requested.into(), started: None, detail: why.clone(), eta_start: None, eta_finish: None, est_bytes: None,
+            done_bytes: None, progress: None,
         });
     }
     let r = (|| -> Result<(), postgres::Error> {
@@ -809,9 +866,11 @@ fn publish_queue(admin: &mut Client, s: &Sched, waiting: &[(Cand, String)], defe
         tx.execute("DELETE FROM pgbx.server_queue", &[])?;
         for q in &rows {
             tx.execute(
-                "INSERT INTO pgbx.server_queue (database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-                &[&q.db, &q.id, &q.kind, &q.trigger, &q.state, &q.position, &q.slot, &q.requested, &q.started, &q.detail],
+                "INSERT INTO pgbx.server_queue (database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail,
+                                                eta_start, eta_finish, est_bytes, done_bytes, progress)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+                &[&q.db, &q.id, &q.kind, &q.trigger, &q.state, &q.position, &q.slot, &q.requested, &q.started, &q.detail,
+                  &q.eta_start, &q.eta_finish, &q.est_bytes, &q.done_bytes, &q.progress],
             )?;
         }
         tx.commit()
@@ -819,15 +878,230 @@ fn publish_queue(admin: &mut Client, s: &Sched, waiting: &[(Cand, String)], defe
     if let Err(e) = r {
         log(&format!("server_queue: {}", pe(e)));
     }
-    for q in rows.iter().filter(|q| q.state != "running" && q.state != "cancelling") {
+    for q in rows.iter().filter(|q| q.state == "queued" || q.state == "deferred") {
         if let Some(cl) = conns.get_mut(q.db) {
+            // eta_start only moves the stored value when it shifts by a minute or more (no churn every poll)
             let _ = cl.execute(
-                "UPDATE pgbx.history SET params = params || jsonb_build_object('queue_position', $2::int, 'wait_reason', $3::text)
+                "UPDATE pgbx.history SET params = params || jsonb_build_object('queue_position', $2::int, 'wait_reason', $3::text,
+                                                                               'eta_start', $4::timestamptz)
                   WHERE id=$1 AND state='queued'
-                    AND (params->'queue_position' IS DISTINCT FROM to_jsonb($2::int) OR params->>'wait_reason' IS DISTINCT FROM $3::text)",
-                &[&q.id, &q.position, &q.detail],
+                    AND (params->'queue_position' IS DISTINCT FROM to_jsonb($2::int) OR params->>'wait_reason' IS DISTINCT FROM $3::text
+                         OR abs(extract(epoch FROM coalesce((params->>'eta_start')::timestamptz, '-infinity') - coalesce($4::timestamptz, '-infinity'))) >= 60
+                         OR ((params->>'eta_start') IS NULL) <> ($4::timestamptz IS NULL))",
+                &[&q.id, &q.position, &q.detail, &q.eta_start],
             );
         }
+    }
+    publish_capacity(admin, s, conns, (s.running.len() + waiting.len()) as i32, sim.wait_for_new());
+}
+
+/// Where queued jobs would start, given when each job slot frees up (seconds from now).
+pub(crate) struct QueueSim {
+    free: Vec<(i32, f64)>, // (slot, free in secs); slot 0 = the restore lane
+}
+
+impl QueueSim {
+    pub(crate) fn new(max: i32, lane: bool) -> Self {
+        let mut free: Vec<(i32, f64)> = (1..=max).map(|n| (n, 0.0)).collect();
+        if lane {
+            free.push((0, 0.0));
+        }
+        QueueSim { free }
+    }
+    /// A running job holds `slot` for `secs` more.
+    pub(crate) fn busy(&mut self, slot: i32, secs: f64) {
+        if let Some(f) = self.free.iter_mut().find(|f| f.0 == slot) {
+            f.1 = f.1.max(secs.max(0.0));
+        }
+    }
+    /// The next waiting job (restores may use the lane) takes the earliest slot: returns its start in secs.
+    pub(crate) fn place(&mut self, restore: bool, secs: f64) -> f64 {
+        let Some(f) = self.free.iter_mut().filter(|f| f.0 > 0 || restore).min_by(|a, b| a.1.total_cmp(&b.1)) else { return 0.0 };
+        let start = f.1;
+        f.1 += secs.max(0.0);
+        start
+    }
+    /// How long a backup queued now would wait.
+    pub(crate) fn wait_for_new(&self) -> f64 {
+        self.free.iter().filter(|f| f.0 > 0).map(|f| f.1).fold(f64::INFINITY, f64::min).max(0.0)
+    }
+}
+
+/// Same as pgbx._dur() in SQL.
+pub(crate) fn dur(secs: f64) -> String {
+    if secs < 90.0 {
+        format!("{} s", secs.round())
+    } else if secs < 5400.0 {
+        format!("{} min", (secs / 60.0).round())
+    } else if secs < 172_800.0 {
+        format!("{:.1} h", secs / 3600.0)
+    } else {
+        format!("{:.1} d", secs / 86_400.0)
+    }
+}
+
+/// pgbx.server_capacity in every database (only where it changed): cpu probe, disk, network, load, server-wide
+/// job speeds and the queue summary that the NOTICE on job create uses.
+fn publish_capacity(admin: &mut Client, s: &mut Sched, conns: &mut HashMap<String, Client>, queue_jobs: i32, wait_secs: f64) {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let lf = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|t| t.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|l| load_factor(l, cores))
+        .unwrap_or(1.0);
+    let disk: Option<f64> = admin
+        .query_one(
+            "SELECT sum(blks_read) * current_setting('block_size')::float8 / nullif(sum(blk_read_time) / 1000, 0) FROM pg_stat_database",
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.get(0));
+    let (up, down) = transfer::network_rates();
+    let probe = PROBE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let speeds: Vec<Option<f64>> = ["backup", "restore", "verify"].iter().map(|k| transfer::median(s.speeds.get(*k).map(|v| v.as_slice()).unwrap_or(&[]))).collect();
+    let r2 = |x: Option<f64>| x.map(|v| (v / 1e4).round() * 1e4); // 10 kB/s steps: no rewrite for noise
+    let wait_min = if wait_secs.is_finite() { (wait_secs / 60.0).round() * 60.0 } else { 0.0 };
+    let vals = (
+        cores as i32,
+        r2(probe.as_ref().map(|p| p.0)),
+        probe.as_ref().map(|p| p.1.clone()),
+        r2(disk),
+        r2(up),
+        r2(down),
+        (lf * 10.0).round() / 10.0,
+        r2(speeds[0]),
+        r2(speeds[1]),
+        r2(speeds[2]),
+        queue_jobs,
+        wait_min,
+        probe.as_ref().map(|p| SystemTime::from(p.2)),
+    );
+    let key = format!("{:?} {:?}", (vals.0, vals.1, &vals.2, vals.3, vals.4, vals.5, vals.6), (vals.7, vals.8, vals.9, vals.10, vals.11, vals.12));
+    for (db, cl) in conns.iter_mut() {
+        if s.cap_written.get(db) == Some(&key) {
+            continue;
+        }
+        let r = cl.execute(
+            "INSERT INTO pgbx.server_capacity AS c (id, cores, cpu_bps, cpu_codec, disk_bps, upload_bps, download_bps, load_factor,
+                     backup_bps, restore_bps, verify_bps, queue_jobs, wait_secs, measured_at, updated_at)
+             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+             ON CONFLICT (id) DO UPDATE SET cores=$1, cpu_bps=$2, cpu_codec=$3, disk_bps=$4, upload_bps=$5, download_bps=$6,
+                 load_factor=$7, backup_bps=$8, restore_bps=$9, verify_bps=$10, queue_jobs=$11, wait_secs=$12, measured_at=$13, updated_at=now()",
+            &[&vals.0, &vals.1, &vals.2, &vals.3, &vals.4, &vals.5, &vals.6, &vals.7, &vals.8, &vals.9, &vals.10, &vals.11, &vals.12],
+        );
+        match r {
+            Ok(_) => {
+                s.cap_written.insert(db.clone(), key.clone());
+            }
+            Err(e) => log(&format!("{db}: server_capacity: {}", pe(e))),
+        }
+    }
+}
+
+/// /proc/loadavg per core -> how much slower a niced dump runs: x1 below 0.7 per core, x3 from 2.0, linear between.
+pub(crate) fn load_factor(load1: f64, cores: usize) -> f64 {
+    let l = load1 / cores.max(1) as f64;
+    (1.0 + (l - 0.7) * 2.0 / 1.3).clamp(1.0, 3.0)
+}
+
+/// Last cpu probe: (bytes/s of one core, codec, when).
+static PROBE: Mutex<Option<(f64, String, DateTime<Utc>)>> = Mutex::new(None);
+static PROBING: AtomicBool = AtomicBool::new(false);
+
+/// pgbx.dump_compression -> (deflate level to time, how much faster the real codec is than that deflate level).
+/// None: no compression, so cpu never limits. zstd 1-3 runs ~2.5x deflate level 1; lz4 ~4x.
+pub(crate) fn probe_level(codec: &str) -> Option<(u8, f64)> {
+    let c = codec.trim().to_ascii_lowercase();
+    if matches!(c.as_str(), "none" | "0" | "gzip:0") {
+        return None;
+    }
+    if c.starts_with("zstd") {
+        return Some((1, 2.5));
+    }
+    if c.starts_with("lz4") {
+        return Some((1, 4.0));
+    }
+    let n = c.trim_start_matches("gzip").trim_start_matches(':').parse::<u8>().unwrap_or(6);
+    Some((n.clamp(1, 9), 1.0))
+}
+
+/// Once a day (and after a reload), with no job running: time one niced core compressing up to 64 MiB of the
+/// largest table's pages (pgbx.eta_calibrate). Runs on its own thread; about a second of one core.
+fn maybe_probe(s: &mut Sched, c: &Ctx, admin: &mut Client) {
+    if !ETA_CALIBRATE.get() || !s.running.is_empty() || PROBING.load(Ordering::Relaxed) {
+        return;
+    }
+    if !s.reprobe && s.last_probe.is_some_and(|t| t.elapsed() < Duration::from_secs(86_400)) {
+        return;
+    }
+    s.reprobe = false;
+    s.last_probe = Some(Instant::now());
+    let codec = compression(setting(&DUMP_COMPRESSION).as_deref(), client_tool(c, "pg_dump").1);
+    let Some((level, factor)) = probe_level(&codec) else {
+        *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return;
+    };
+    let file: Option<String> = (|| {
+        let big: String = admin
+            .query_opt("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY pg_database_size(oid) DESC LIMIT 1", &[])
+            .ok()??
+            .get(0);
+        let mut cl = connect(c, &big).ok()?;
+        cl.query_opt(
+            "SELECT current_setting('data_directory') || '/' || pg_relation_filepath(c.oid) FROM pg_class c
+              WHERE c.relkind IN ('r', 'm', 't') AND c.relpersistence = 'p' ORDER BY pg_relation_size(c.oid) DESC LIMIT 1",
+            &[],
+        )
+        .ok()??
+        .get(0)
+    })();
+    let nice = JOB_NICE.get().clamp(0, 19);
+    PROBING.store(true, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new().name("pgbx probe".into()).spawn(move || {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            if nice > libc::getpriority(libc::PRIO_PROCESS, tid) {
+                libc::setpriority(libc::PRIO_PROCESS, tid, nice);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = nice;
+        let mut data = Vec::new();
+        if let Some(f) = &file {
+            use std::io::Read;
+            if let Ok(fh) = std::fs::File::open(f) {
+                let _ = fh.take(64 << 20).read_to_end(&mut data);
+            }
+        }
+        if data.len() < (1 << 20) {
+            // an empty server: hex text, about as compressible as typical rows
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            data = (0..(16 << 20))
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    b"0123456789abcdef"[(x & 15) as usize]
+                })
+                .collect();
+        }
+        let t0 = Instant::now();
+        let mut done = 0usize;
+        for chunk in data.chunks(1 << 20) {
+            let _ = miniz_oxide::deflate::compress_to_vec(chunk, level);
+            done += chunk.len();
+            if t0.elapsed() > Duration::from_millis(1500) {
+                break;
+            }
+        }
+        let rate = done as f64 / t0.elapsed().as_secs_f64().max(1e-3) * factor;
+        log(&format!("capacity: one core compresses {:.0} MB/s ({codec}, measured as deflate level {level} x{factor})", rate / 1e6));
+        *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some((rate, codec, Utc::now()));
+        PROBING.store(false, Ordering::Relaxed);
+    });
+    if spawned.is_err() {
+        PROBING.store(false, Ordering::Relaxed);
     }
 }
 
@@ -879,18 +1153,33 @@ fn run_job(j: Job, _slot: Client) {
     log(&format!("{}: {} #{}: could not record the result ({last}); it is marked failed at the next start", j.db, j.kind, j.id));
 }
 
+/// Live progress: the bytes moved so far go into the job's history row (history.bytes) as they happen.
+fn progress_writer(c: &Ctx, db: &str, id: i64) -> impl FnMut(u64) + Send + use<> {
+    let (c, db) = (c.clone(), db.to_string());
+    let mut cl: Option<Client> = None;
+    move |n: u64| {
+        if cl.is_none() {
+            cl = connect(&c, &db).ok();
+        }
+        if let Some(x) = cl.as_mut() {
+            let _ = x.execute("UPDATE pgbx.history SET bytes=$2 WHERE id=$1 AND state='running'", &[&id, &(n as i64)]);
+        }
+    }
+}
+
 fn execute(j: &Job) -> Result<Done, String> {
+    let mut progress = progress_writer(&j.c, &j.db, j.id);
     match j.kind.as_str() {
-        "backup" => backup(&j.c, &j.cfg, &j.db, &j.path, j.forced),
+        "backup" => backup(&j.c, &j.cfg, &j.db, &j.path, j.forced, &mut progress),
         "restore" => {
             let mut admin = connect(&j.c, &j.cfg.admin_db)?;
-            restore(&j.c, &j.cfg, &mut admin, &j.path, &j.params)
+            restore(&j.c, &j.cfg, &mut admin, &j.path, &j.params, &mut progress)
         }
         "verify" => {
             let mut admin = connect(&j.c, &j.cfg.admin_db)?;
             let mut src = connect(&j.c, &j.db)?;
             let scratch = j.scratch.clone().unwrap_or_else(|| format!("{VERIFY_PREFIX}{}", j.id));
-            verify(&j.c, &j.cfg, &mut admin, &mut src, &j.path, &scratch)
+            verify(&j.c, &j.cfg, &mut admin, &mut src, &j.path, &scratch, &mut progress)
         }
         "prune" => Ok(Done::default()),
         other => Err(format!("unknown job kind {other}")),
@@ -905,7 +1194,7 @@ fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), St
         // pgbx.cancel() of a running job: its upload was aborted / its partial database dropped; no alert
         Err(e) if cancelled => {
             cl.execute(
-                "UPDATE pgbx.history SET state='cancelled', finished=now(),
+                "UPDATE pgbx.history SET state='cancelled', finished=now(), bytes=NULL,
                         error='cancelled by ' || coalesce(params->>'cancelled_by', '?') || ' while running' WHERE id=$1",
                 &[&id],
             )
@@ -946,7 +1235,7 @@ fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), St
             let wait = backoff_minutes(j.cfg.defer_backoff.as_deref(), deferrals as usize);
             let until = (Utc::now() + chrono::Duration::minutes(wait as i64)).min(deadline);
             cl.execute(
-                "UPDATE pgbx.history SET state='queued', started=NULL, params = params || jsonb_build_object(
+                "UPDATE pgbx.history SET state='queued', started=NULL, bytes=NULL, params = params || jsonb_build_object(
                     'deferrals', $2::int, 'lock_timeouts', $3::int, 'deferred_until', $4::timestamptz,
                     'defer_reason', 'lock_timeout', 'deadline', $5::timestamptz) WHERE id=$1",
                 &[&id, &(deferrals + 1), &(locks + 1), &SystemTime::from(until), &SystemTime::from(deadline)],
@@ -958,7 +1247,7 @@ fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), St
             ));
         }
         Err(e) => {
-            cl.execute("UPDATE pgbx.history SET state='failed', finished=now(), error=$2 WHERE id=$1", &[&id, e])
+            cl.execute("UPDATE pgbx.history SET state='failed', finished=now(), error=$2, bytes=NULL WHERE id=$1", &[&id, e])
                 .map_err(pe)?;
             log(&format!("{db}: {kind} #{id} failed: {e}"));
             alert(j.cfg.alert_command.as_deref(), &j.c.server, db, kind, id, e);
@@ -1013,15 +1302,27 @@ fn publish_overview(admin: &mut Client, cl: &mut Client, db: &str, cron: &str) -
         .iter()
         .map(|r| r.get(0))
         .collect();
+    // how far off the time estimates were for recent jobs that ran long enough to judge (>= 30 s)
+    let eta_error: Option<f64> = cl
+        .query_one(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(x.secs - x.eta) / x.secs) FROM (
+                 SELECT extract(epoch FROM finished - started)::float8 AS secs, (params->>'eta_sec')::float8 AS eta FROM pgbx.history
+                  WHERE state IN ('done', 'expired') AND params ? 'eta_sec' AND finished - started >= interval '30 seconds'
+                  ORDER BY id DESC LIMIT 5) x",
+            &[],
+        )
+        .map_err(pe)?
+        .get(0);
     admin
         .execute(
             "INSERT INTO pgbx.server_overview AS o
                 (database, state, schedule, last_backup_at, last_backup_size, next_backup_at, backups_kept, last_verify, last_error,
-                 seen_at, interval_secs, dump_secs)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11)
+                 seen_at, interval_secs, dump_secs, eta_error)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12)
              ON CONFLICT (database) DO UPDATE SET state=$2, schedule=$3, last_backup_at=$4, last_backup_size=$5,
-                next_backup_at=$6, backups_kept=$7, last_verify=$8, last_error=$9, seen_at=now(), interval_secs=$10, dump_secs=$11",
-            &[&db, &state, &schedule, &last_at, &size, &next_at, &kept, &verify, &err, &interval, &dump_secs],
+                next_backup_at=$6, backups_kept=$7, last_verify=$8, last_error=$9, seen_at=now(), interval_secs=$10, dump_secs=$11,
+                eta_error=$12",
+            &[&db, &state, &schedule, &last_at, &size, &next_at, &kept, &verify, &err, &interval, &dump_secs, &eta_error],
         )
         .map_err(pe)?;
     Ok(())
@@ -1107,7 +1408,7 @@ fn user_tables(cl: &mut Client) -> Result<i64, String> {
 
 /// pg_dump (custom format) streamed straight into a multipart S3 upload — no temp file, no full copy in memory.
 /// Key: s3://bucket/<server>/<path>/<UTC timestamp>.dump. Records how many user tables it saw (for verify).
-fn backup(c: &Ctx, cfg: &JobCfg, db: &str, path: &str, forced: bool) -> Result<Done, String> {
+fn backup(c: &Ctx, cfg: &JobCfg, db: &str, path: &str, forced: bool, progress: &mut dyn FnMut(u64)) -> Result<Done, String> {
     let mut src = connect(c, db)?;
     let tables = user_tables(&mut src)?;
     // data scope: definitions of every table are dumped; rows are skipped for these (resolved now, so new tables count)
@@ -1132,7 +1433,7 @@ fn backup(c: &Ctx, cfg: &JobCfg, db: &str, path: &str, forced: bool) -> Result<D
         .map_err(|e| format!("spawn pg_dump: {e}"))?;
     set_child(child.id());
     let mut out = child.stdout.take().unwrap();
-    let up = transfer::upload_stream(&b, &key, &mut out, cfg.upload_kbps);
+    let up = transfer::upload_stream(&b, &key, &mut out, cfg.upload_kbps, progress);
     drop(out); // if the upload gave up, this stops pg_dump (broken pipe)
     if up.is_err() {
         let _ = child.kill();
@@ -1345,7 +1646,9 @@ fn pick_backup(c: &Ctx, b: &Bucket, path: &str, at: DateTime<Utc>) -> Result<Str
 }
 
 /// CREATE DATABASE <into> TEMPLATE template0, then stream the S3 object straight into pg_restore's stdin.
-fn restore_key_into(c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: &str, into: &str, app: &str) -> Result<i64, String> {
+fn restore_key_into(
+    c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: &str, into: &str, app: &str, progress: &mut (dyn FnMut(u64) + Send),
+) -> Result<i64, String> {
     // template0: the dump brings its own CREATE EXTENSION pgbx, so start from a database without it
     admin
         .batch_execute(&format!("CREATE DATABASE \"{into}\" TEMPLATE template0"))
@@ -1362,7 +1665,7 @@ fn restore_key_into(c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: 
         .map_err(|e| format!("spawn pg_restore: {e}"))?;
     set_child(child.id());
     let mut stdin = child.stdin.take().unwrap();
-    let dl = transfer::download_resumable(b, key, &mut stdin, cfg.download_kbps);
+    let dl = transfer::download_resumable(b, key, &mut stdin, cfg.download_kbps, progress);
     drop(stdin); // EOF for pg_restore
     if dl.is_err() && shutting_down() {
         let _ = child.kill();
@@ -1385,7 +1688,7 @@ fn restore_key_into(c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: 
 }
 
 /// Newest dump at or before `at` -> a NEW database. The live one is never touched.
-fn restore(c: &Ctx, cfg: &JobCfg, admin: &mut Client, path: &str, params: &str) -> Result<Done, String> {
+fn restore(c: &Ctx, cfg: &JobCfg, admin: &mut Client, path: &str, params: &str, progress: &mut (dyn FnMut(u64) + Send)) -> Result<Done, String> {
     let p = parse_flat_json(params);
     let into = p.get("into_db").ok_or("restore needs into_db")?.clone();
     if !into.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
@@ -1397,7 +1700,7 @@ fn restore(c: &Ctx, cfg: &JobCfg, admin: &mut Client, path: &str, params: &str) 
         .unwrap_or_else(Utc::now);
     let b = cfg.bucket()?;
     let key = pick_backup(c, &b, path, at)?;
-    let bytes = restore_key_into(c, cfg, admin, &b, &key, &into, "pgbx_restore")?;
+    let bytes = restore_key_into(c, cfg, admin, &b, &key, &into, "pgbx_restore", progress)?;
     // the copy must not back up into the original's folder: give it its own path (= its own name)
     let mut copy = connect(c, &into)?;
     copy.batch_execute("UPDATE pgbx.config SET path = NULL").map_err(pe)?;
@@ -1405,11 +1708,13 @@ fn restore(c: &Ctx, cfg: &JobCfg, admin: &mut Client, path: &str, params: &str) 
 }
 
 /// Restore test: newest backup -> scratch database -> same number of user tables as at backup time -> drop.
-fn verify(c: &Ctx, cfg: &JobCfg, admin: &mut Client, source: &mut Client, path: &str, scratch: &str) -> Result<Done, String> {
+fn verify(
+    c: &Ctx, cfg: &JobCfg, admin: &mut Client, source: &mut Client, path: &str, scratch: &str, progress: &mut (dyn FnMut(u64) + Send),
+) -> Result<Done, String> {
     let b = cfg.bucket()?;
     let key = pick_backup(c, &b, path, Utc::now())?;
     let result = (|| {
-        let bytes = restore_key_into(c, cfg, admin, &b, &key, scratch, "pgbx_verify")?;
+        let bytes = restore_key_into(c, cfg, admin, &b, &key, scratch, "pgbx_verify", progress)?;
         let mut sc = connect(c, scratch)?;
         let got = user_tables(&mut sc)?;
         let ok = sc.query_one("SELECT 1", &[]).is_ok();
@@ -1569,6 +1874,36 @@ mod t {
         let run = Some((t("2026-10-02T01:00:00Z"), t("2026-10-02T04:30:00Z")));
         assert_eq!(due_backup(hourly, t("2026-10-02T05:00:01Z"), Some(t("2026-10-02T01:00:00Z")), run, run.map(|r| r.1), skip, 1.5),
                    Ok(Due::Yes { skipped: 3, guard: false }));
+    }
+
+    #[test]
+    fn queue_simulation() {
+        // one slot busy for 100 s, restore lane on: a restore starts now in the lane, a backup after the slot frees
+        let mut q = QueueSim::new(1, true);
+        q.busy(1, 100.0);
+        assert_eq!(q.place(true, 30.0), 0.0);
+        assert_eq!(q.place(false, 50.0), 100.0);
+        assert_eq!(q.place(true, 10.0), 30.0); // the lane frees first
+        assert_eq!(q.wait_for_new(), 150.0);
+        let mut q = QueueSim::new(2, false);
+        q.busy(1, 20.0);
+        assert_eq!(q.place(true, 5.0), 0.0); // slot 2 is free
+        assert_eq!(q.wait_for_new(), 5.0);
+    }
+
+    #[test]
+    fn eta_helpers() {
+        assert_eq!(dur(45.0), "45 s");
+        assert_eq!(dur(1080.0), "18 min");
+        assert_eq!(dur(9000.0), "2.5 h");
+        assert_eq!(load_factor(0.5, 4), 1.0);
+        assert_eq!(load_factor(8.0, 4), 3.0);
+        assert!((load_factor(1.35 * 4.0, 4) - 2.0).abs() < 1e-9);
+        assert_eq!(probe_level("zstd:3"), Some((1, 2.5)));
+        assert_eq!(probe_level("6"), Some((6, 1.0)));
+        assert_eq!(probe_level("gzip:9"), Some((9, 1.0)));
+        assert_eq!(probe_level("lz4"), Some((1, 4.0)));
+        assert_eq!(probe_level("none"), None);
     }
 
     #[test]

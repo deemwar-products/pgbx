@@ -59,6 +59,8 @@ out=$(J link --db shop --expires '10 minutes'); url=$(jq1 "$out" .url)
 check "link: fetchable from the host (HTTP 200)" "$(curl -s -o /dev/null -w '%{http_code}' "$url")" 200
 out=$(J overview); check "overview lists shop" "$(jq1 "$out" '[.databases[].database] | index("shop") != null')" true
 out=$(J list --db shop); check "list" "$(jq1 "$out" .ok)" true
+out=$(J jobs); check "jobs: the server-wide queue" "$(jq1 "$out" .ok)|$(jq1 "$out" '.jobs|type')|$(jq1 "$out" .safety)" "true|array|readonly"
+out=$(J jobs cancel 999999 --db shop); rc=$?; refused "jobs cancel needs --yes" "$out" $rc 1 "--yes"
 
 echo "## c. refusals (one JSON object, exit 1; usage errors exit 2)"
 out=$(J db-restore --db shop --into shop); rc=$?; refused "db-restore into the source" "$out" $rc 1 "NEW database"

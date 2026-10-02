@@ -3,7 +3,8 @@
 use crate::{one, pe, rows, scalar, Ctx, Out};
 use serde_json::{json, Value};
 
-const QUEUE_SQL: &str = "SELECT database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail, seen_at
+const QUEUE_SQL: &str = "SELECT database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail,
+                                progress, eta_start, eta_finish, est_bytes, done_bytes, seen_at
                          FROM pgbx.server_queue
                          ORDER BY state IN ('running', 'cancelling') DESC, position NULLS LAST, requested_at";
 
@@ -77,8 +78,9 @@ pub fn text(v: &Value) -> String {
             (_, Value::Number(n)) => format!("slot {n}"),
             _ => "-".into(),
         };
+        let progress = r["progress"].as_str().map(|p| format!(" [{p}]")).unwrap_or_default();
         s.push_str(&format!(
-            "{:<20} {:>6} {:<8} {:<10} {:<12} {}\n",
+            "{:<20} {:>6} {:<8} {:<10} {:<12} {}{progress}\n",
             scalar(&r["database"]), scalar(&r["job_id"]), scalar(&r["kind"]), scalar(&r["state"]), pos, scalar(&r["detail"])
         ));
     }
@@ -105,11 +107,11 @@ mod tests {
     #[test]
     fn text_lines() {
         let v = json!({"jobs": [{"database": "shop", "job_id": 3, "kind": "backup", "state": "running", "slot": 1, "position": null,
-                                 "detail": "running in job slot 1"},
+                                 "detail": "running in job slot 1", "progress": "41 % · ~9 min left"},
                                 {"database": "crm", "job_id": 4, "kind": "restore", "state": "queued", "slot": null, "position": 1,
                                  "detail": "waits"}],
                        "slots": {"max_concurrent_jobs": "1", "restore_lane": "on"}});
         let t = text(&v);
-        assert!(t.contains("slot 1") && t.contains("#1 in line") && t.contains("restore_lane=on"), "{t}");
+        assert!(t.contains("slot 1") && t.contains("#1 in line") && t.contains("restore_lane=on") && t.contains("[41 % · ~9 min left]"), "{t}");
     }
 }

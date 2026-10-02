@@ -5,7 +5,8 @@
 #      (server_queue, status(), pgbx jobs) and who may see it
 #   2. overrun_policy=skip: a dump longer than its interval skips slots (params.skipped_slots), never back to back
 #   3. cancel() of RUNNING jobs: backup (upload aborted, nothing in S3, no alert) and restore (half-restored db dropped)
-#   4. crash: SIGTERM restart and kill -9 of the worker mid-upload -> job failed, no dump and no multipart upload left
+#   4. time estimates: NOTICE on create, live progress, job_eta(), within +-50 % after 3 runs, capacity, doctor
+#   5. crash: SIGTERM restart and kill -9 of the worker mid-upload -> job failed, no dump and no multipart upload left
 set -u
 cd "$(dirname "$0")/../docker"
 DC="docker compose -f compose.test.yml"
@@ -71,6 +72,9 @@ check "status() in qb says why its next job waits" \
   "$(P -d qb -c "SELECT next_job||'|'||queue_position||'|'||waiting_reason FROM pgbx.status()")" \
   "$rid|1|waits for a job slot: 1 of 1 in use (qa backup #$slow)"
 check "status() in qa: running_job" "$(P -d qa -c "SELECT running_job FROM pgbx.status()")" "$slow"
+check "job_eta() of the queued restore: #1 in line, a start and a finish" \
+  "$(P -d qb -c "SELECT queue_position||'|'||(progress LIKE 'queued, #1 in line: starts ~%')||'|'||(eta_finish > eta_start) FROM pgbx.job_eta($rid)")" "1|true|true"
+check "server_queue: the running dump reports progress" "$(P -c "SELECT progress ~ '^[0-9]+ % · ~' FROM pgbx.server_queue WHERE database='qa' AND job_id=$slow")" t
 out=$($DC exec -T -u postgres db pgbx jobs --json 2>/dev/null)
 check "pgbx jobs --json: qa running, qb restore queued #1" \
   "$(echo "$out" | jq -r --arg s "$slow" --arg r "$rid" '[(.jobs[]|select(.database=="qa" and (.job_id|tostring)==$s)|.state), (.jobs[]|select(.database=="qb" and (.job_id|tostring)==$r)|"\(.state) \(.position)")]|join("|")')" \
@@ -138,7 +142,28 @@ check "half-restored database dropped" "$(P -c "SELECT count(*) FROM pg_database
 bad=$(P -d qa -c "SELECT pgbx.cancel($id)" 2>&1); check "cancel of a cancelled job refused" "$(echo "$bad" | grep -c 'only a queued or running job')" 1
 greset download_kbps
 
-echo "## 4. crash: the job never leaves a dump or an open multipart upload behind"
+echo "## 4. time estimates"
+gset upload_kbps 1024
+out=$($DC exec -T db psql -U postgres -d qa -qAt -c "SELECT pgbx.backup_now()" 2>&1)
+id=$(echo "$out" | grep -E '^[0-9]+$'); echo "  $(echo "$out" | grep NOTICE)"
+check "NOTICE on create: when it starts, how long, how big, why" "$(echo "$out" | grep -cE "backup job $id queued.*starts ~.*takes ~.*confidence")" 1
+mid=no; prog=""; for _ in $(seq 90); do
+  r=$(P -d qa -c "SELECT h.state||'|'||coalesce(j.done_bytes,0)||'|'||coalesce(j.progress,'') FROM pgbx.history h, pgbx.job_eta(h.id) j WHERE h.id=$id")
+  st=${r%%|*}; rest=${r#*|}; d=${rest%%|*}
+  [ "$st" = running ] && [ "$d" -gt 0 ] && { mid=yes; prog=${rest#*|}; }
+  [ "$st" = done ] && break; sleep 1; done
+echo "  while running: $prog"
+check "live progress while running (done_bytes > 0, 'N % · ~T left')" "$mid|$(echo "$prog" | grep -cE '^[0-9]+ % · ~')" "yes|1"
+check "finished" "$st" done
+for n in 2 3 4; do id=$(P -d qa -c "SELECT pgbx.backup_now()" 2>/dev/null); s=$(wait_end qa "$id" 120); done
+r=$(P -d qa -c "SELECT round(extract(epoch FROM finished - started))||'|'||(params->>'eta_sec')||'|'||(abs(extract(epoch FROM finished - started) - (params->>'eta_sec')::float8) <= 0.5 * extract(epoch FROM finished - started)) FROM pgbx.history WHERE id=$id")
+echo "  4th capped backup: actual|estimate = ${r%|*} s ($(P -d qa -c "SELECT params->>'eta_basis' FROM pgbx.history WHERE id=$id"))"
+check "after 3 runs the estimate is within +-50 % of the actual" "$s|${r##*|}" "done|true"
+check "capacity measured (cpu probe, upload speed)" "$(P -d qa -c "SELECT (cpu_bps > 0)||'|'||(upload_bps > 0) FROM pgbx.server_capacity")" "true|true"
+check "doctor(): capacity and eta_accuracy rows" "$(P -c "SELECT count(*) FROM pgbx.doctor() WHERE name IN ('capacity', 'eta_accuracy')")" 2
+greset upload_kbps
+
+echo "## 5. crash: the job never leaves a dump or an open multipart upload behind"
 before=$(dumps qa); s3before=$(s3_dumps qa)
 id=$(P -d qa -c "SELECT pgbx.backup_now()"); wait_state qa "$id" running 30 >/dev/null; sleep 4
 check "multipart upload open while it runs" "$(open_uploads)" 1

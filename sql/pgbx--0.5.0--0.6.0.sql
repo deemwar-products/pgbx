@@ -153,6 +153,31 @@ BEGIN
                 ELSE format('connect to %s and give it a longer schedule: SELECT pgbx.configure(schedule => %L);',
                             bad, coalesce(fix, 'weekly')) END;
     RETURN NEXT;
+
+    -- informational: what the time estimates are based on (ADR 0001 §4)
+    name := 'capacity';
+    ok := true; fix := NULL;
+    SELECT format('one core compresses %s/s (%s)%s; disk reads %s; upload %s, download %s; load x%s; %s core(s)',
+                  coalesce(pg_size_pretty(c.cpu_bps::bigint), '?'), coalesce(c.cpu_codec, 'not measured'),
+                  coalesce(', measured ' || date_trunc('minute', c.measured_at)::text, ''),
+                  coalesce(pg_size_pretty(c.disk_bps::bigint) || '/s', 'unknown (track_io_timing off)'),
+                  coalesce(pg_size_pretty(c.upload_bps::bigint) || '/s', 'not seen yet'),
+                  coalesce(pg_size_pretty(c.download_bps::bigint) || '/s', 'not seen yet'),
+                  round(coalesce(c.load_factor, 1)::numeric, 1), coalesce(c.cores::text, '?'))
+      INTO detail FROM pgbx.server_capacity c;
+    detail := coalesce(detail, 'not measured yet (the worker measures it once a day, pgbx.eta_calibrate)');
+    RETURN NEXT;
+
+    -- how good the time estimates were: median |actual - estimate| / actual over each database's recent jobs
+    name := 'eta_accuracy';
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY s.eta_error), count(*) INTO worst_ratio, n
+      FROM pgbx.server_overview s WHERE s.eta_error IS NOT NULL;
+    ok := n = 0 OR worst_ratio <= 0.5;
+    detail := CASE WHEN n = 0 THEN 'no finished job with an estimate yet'
+                   ELSE format('estimates were off by %s %% (median over %s database(s))', round((100 * worst_ratio)::numeric), n) END;
+    fix := CASE WHEN ok THEN NULL
+                ELSE 'estimates settle after 3 runs of a job; if they stay off, check pgbx.upload_kbps / load, or lower pgbx.eta_samples so they follow recent growth' END;
+    RETURN NEXT;
 END $$;
 
 -- coalesced manual jobs and cancel (ADR 0001 §0)
@@ -173,10 +198,12 @@ BEGIN
                        'coalesced', coalesce((params->>'coalesced')::int, 0) + 1)
              WHERE id = j;
             RAISE NOTICE 'pgbx: % job % is already queued; returning it instead of adding another', k, j;
+            PERFORM pgbx._notice_eta(j);
             RETURN j;
         END IF;
     END IF;
     INSERT INTO pgbx.history (kind, trigger) VALUES (k, 'manual') RETURNING id INTO j;
+    PERFORM pgbx._notice_eta(j);
     RETURN j;
 END $$;
 
@@ -241,7 +268,8 @@ CREATE OR REPLACE FUNCTION pgbx.status() RETURNS TABLE (
     last_backup_at timestamptz, last_backup_age interval, last_backup_size text, last_backup_key text,
     backups_kept bigint, retention text, data_scope text, verify_schedule text, last_verified_at timestamptz, last_verify_result text,
     last_error text, last_error_at timestamptz, paused_reason text, paused_at timestamptz,
-    queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text
+    queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text,
+    job_progress text, job_eta text
 ) LANGUAGE plpgsql STABLE AS $$
 DECLARE cfg pgbx.config; lb pgbx.history; le pgbx.history; lv pgbx.history; last_auto timestamptz;
 BEGIN
@@ -286,7 +314,13 @@ BEGIN
                coalesce(cfg.path, current_database())),
         (SELECT max(h.id) FROM pgbx.history h WHERE h.state='running'),
         nq.id, (nq.params->>'queue_position')::int,
-        coalesce(nq.params->>'wait_reason', CASE WHEN nq.id IS NOT NULL THEN 'queued; the worker picks it up within pgbx.poll_seconds' END)
+        coalesce(nq.params->>'wait_reason', CASE WHEN nq.id IS NOT NULL THEN 'queued; the worker picks it up within pgbx.poll_seconds' END),
+        (SELECT j.progress FROM pgbx.history h, pgbx.job_eta(h.id) j WHERE h.state='running' ORDER BY h.id DESC LIMIT 1),
+        CASE WHEN nq.id IS NOT NULL THEN (SELECT j.progress FROM pgbx.job_eta(nq.id) j)
+             WHEN cfg.enabled THEN format('next backup %s, takes ~%s',
+                 CASE WHEN last_auto IS NULL THEN 'within a minute (first backup)'
+                      ELSE 'at ' || to_char(to_timestamp(pgbx.next_run_epoch(cfg.schedule, extract(epoch FROM last_auto))), 'YYYY-MM-DD HH24:MI') END,
+                 (SELECT pgbx._dur(e.est_secs) FROM pgbx._estimate('backup') e)) END
     FROM (SELECT NULL::bigint AS id, NULL::jsonb AS params
           UNION ALL (SELECT h.id, h.params FROM pgbx.history h WHERE h.state='queued'
                      ORDER BY (h.params->>'queue_position')::int NULLS LAST, h.id LIMIT 1)
@@ -294,3 +328,155 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION pgbx.status() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pgbx.status() TO pgbx_viewer;
+
+-- time estimates (ADR 0001 §4): job_eta(), a NOTICE on job create, live progress, capacity, doctor accuracy
+ALTER TABLE pgbx.server_queue ADD COLUMN eta_start timestamptz, ADD COLUMN eta_finish timestamptz, ADD COLUMN est_bytes bigint,
+    ADD COLUMN done_bytes bigint, ADD COLUMN progress text;
+ALTER TABLE pgbx.server_overview ADD COLUMN eta_error float8;
+-- What this server can do, measured by the worker and copied into every database.
+CREATE TABLE pgbx.server_capacity (
+    id           int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    cores        int,                                          -- shown only: a dump uses one core
+    cpu_bps      float8,                                       -- one core compressing real table pages (pgbx.job_nice)
+    cpu_codec    text,                                         -- the pgbx.dump_compression that was measured
+    disk_bps     float8,                                       -- reads, from blk_read_time (needs track_io_timing)
+    upload_bps   float8,                                       -- median of the last 20 upload parts
+    download_bps float8,                                       -- median of recent downloads
+    load_factor  float8,                                       -- 1 idle .. 3 saturated: estimates stretch by it
+    backup_bps   float8,                                       -- server-wide median speed of recent jobs (dump bytes/s)
+    restore_bps  float8,
+    verify_bps   float8,
+    queue_jobs   int,                                          -- jobs running or waiting, server-wide
+    wait_secs    float8,                                       -- estimated wait for a job queued now
+    measured_at  timestamptz,                                  -- last cpu probe
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT ON pgbx.server_capacity TO pgbx_viewer;
+CREATE OR REPLACE FUNCTION pgbx._dur(secs float8) RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN CASE WHEN secs IS NULL THEN '?' WHEN secs < 90 THEN round(secs) || ' s' WHEN secs < 5400 THEN round(secs / 60) || ' min'
+                WHEN secs < 172800 THEN round((secs / 3600)::numeric, 1) || ' h' ELSE round((secs / 86400)::numeric, 1) || ' d' END;
+END $$;
+CREATE OR REPLACE FUNCTION pgbx._estimate(k text, OUT est_bytes bigint, OUT est_secs float8, OUT speed_bps float8, OUT confidence text,
+                               OUT basis text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE cap pgbx.server_capacity; n int := greatest(1, least(50, coalesce(nullif(current_setting('pgbx.eta_samples', true), '')::int, 5)));
+        ratio float8; speeds float8[]; s float8; why text; capkb int; srv float8;
+BEGIN
+    SELECT * INTO cap FROM pgbx.server_capacity;
+    -- a backup is the database size times this database's compression ratio (0.3 until known); a restore, its dump
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x.r) INTO ratio
+      FROM (SELECT h.bytes::float8 / (h.params->>'db_size')::float8 AS r FROM pgbx.history h
+             WHERE h.kind = 'backup' AND h.state IN ('done', 'expired') AND h.bytes > 0 AND (h.params->>'db_size')::bigint > 0
+             ORDER BY h.id DESC LIMIT n) x;
+    IF k = 'backup' THEN
+        est_bytes := (pg_database_size(current_database()) * coalesce(ratio, 0.3))::bigint;
+    ELSIF k IN ('restore', 'verify') THEN
+        SELECT h.bytes INTO est_bytes FROM pgbx.history h WHERE h.kind = 'backup' AND h.state = 'done' AND h.bytes > 0
+         ORDER BY h.id DESC LIMIT 1;
+    END IF;
+    est_bytes := coalesce(est_bytes, 0);
+    SELECT array_agg(x.b / x.secs) INTO speeds
+      FROM (SELECT h.bytes::float8 AS b, extract(epoch FROM h.finished - h.started)::float8 AS secs FROM pgbx.history h
+             WHERE h.kind = k AND h.state IN ('done', 'expired') AND h.bytes > 0 AND h.finished > h.started
+             ORDER BY h.id DESC LIMIT n) x;
+    srv := CASE k WHEN 'backup' THEN cap.backup_bps WHEN 'restore' THEN cap.restore_bps WHEN 'verify' THEN cap.verify_bps END;
+    IF coalesce(cardinality(speeds), 0) >= least(3, n) THEN
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) INTO s FROM unnest(speeds) v;
+        confidence := CASE WHEN (SELECT max(v) / nullif(min(v), 0) FROM unnest(speeds) v) <= 2 THEN 'high' ELSE 'medium' END;
+        basis := format('from the last %s %s jobs of this database', cardinality(speeds), k);
+    ELSIF srv > 0 THEN
+        s := srv; confidence := 'medium'; basis := format('from recent %s jobs on this server', k);
+    ELSE
+        -- the slowest of the pipes a dump goes through; raw read / compression rates shrink by the ratio
+        SELECT p.pipe, p.rate INTO why, s FROM (VALUES
+            ('cpu', CASE WHEN k = 'backup' THEN cap.cpu_bps * coalesce(ratio, 0.3) END),
+            ('disk', CASE WHEN k = 'backup' THEN cap.disk_bps * coalesce(ratio, 0.3) END),
+            ('upload', CASE WHEN k = 'backup' THEN cap.upload_bps END),
+            ('download', CASE WHEN k IN ('restore', 'verify') THEN cap.download_bps END)) p(pipe, rate)
+         WHERE p.rate > 0 ORDER BY p.rate LIMIT 1;
+        IF s IS NULL THEN
+            s := 1e6 * greatest(1, coalesce(nullif(current_setting('pgbx.eta_default_mbps', true), '')::int, 20));
+            basis := 'nothing measured yet: pgbx.eta_default_mbps';
+        ELSE
+            basis := format('limited by %s (%s/s)', why, pg_size_pretty(s::bigint));
+        END IF;
+        confidence := 'low';
+    END IF;
+    capkb := coalesce(nullif(current_setting(CASE WHEN k = 'backup' THEN 'pgbx.upload_kbps' ELSE 'pgbx.download_kbps' END, true), '')::int, 0);
+    IF capkb > 0 AND capkb * 1024.0 < s THEN
+        s := capkb * 1024.0;
+        basis := format('limited by %s (%s/s)', CASE WHEN k = 'backup' THEN 'pgbx.upload_kbps' ELSE 'pgbx.download_kbps' END,
+                        pg_size_pretty(s::bigint));
+    END IF;
+    IF coalesce(cap.load_factor, 1) > 1.05 THEN
+        s := s / cap.load_factor;
+        basis := basis || format(', slower: server busy (x%s)', round(cap.load_factor::numeric, 1));
+    END IF;
+    speed_bps := s;
+    est_secs := greatest(1, est_bytes / s);
+END $$;
+CREATE OR REPLACE FUNCTION pgbx.job_eta(job_id bigint) RETURNS TABLE (queue_position int, eta_start timestamptz, eta_finish timestamptz,
+    est_bytes bigint, done_bytes bigint, confidence text, progress text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE h pgbx.history; e record; left_s float8; el float8;
+BEGIN
+    SELECT * INTO h FROM pgbx.history x WHERE x.id = job_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgbx: no job % in database %', job_id, current_database();
+    ELSIF h.state NOT IN ('queued', 'running') THEN
+        RETURN QUERY SELECT NULL::int, h.started, h.finished, h.bytes, h.bytes, NULL::text, h.state;
+        RETURN;
+    END IF;
+    SELECT * INTO e FROM pgbx._estimate(h.kind);
+    IF h.state = 'running' THEN
+        est_bytes := coalesce((h.params->>'est_bytes')::bigint, e.est_bytes);
+        done_bytes := coalesce(h.bytes, 0);
+        el := extract(epoch FROM now() - h.started);
+        IF done_bytes > 0 AND el > 5 THEN
+            left_s := greatest(est_bytes - done_bytes, 0) / (done_bytes / el); -- the job's own throughput so far
+            confidence := 'measured';
+        ELSE
+            left_s := greatest(coalesce((h.params->>'eta_sec')::float8, e.est_secs) - el, 0);
+            confidence := e.confidence;
+        END IF;
+        queue_position := 0; eta_start := h.started; eta_finish := now() + make_interval(secs => left_s);
+        progress := format('%s %% · ~%s left', least(99, floor(100.0 * done_bytes / greatest(est_bytes, 1)))::int, pgbx._dur(left_s));
+    ELSE
+        queue_position := (h.params->>'queue_position')::int;
+        eta_start := greatest(now(), coalesce((h.params->>'eta_start')::timestamptz, now()));
+        est_bytes := e.est_bytes; done_bytes := 0; confidence := e.confidence;
+        eta_finish := eta_start + make_interval(secs => e.est_secs);
+        progress := format('queued%s: starts ~%s, takes ~%s', coalesce(', #' || queue_position || ' in line', ''),
+                           CASE WHEN eta_start < now() + interval '1 minute' THEN 'now' ELSE to_char(eta_start, 'HH24:MI') END,
+                           pgbx._dur(e.est_secs));
+    END IF;
+    RETURN NEXT;
+END $$;
+CREATE OR REPLACE FUNCTION pgbx._notice_eta(j bigint) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE h pgbx.history; e record; cap pgbx.server_capacity; ahead int; starts timestamptz;
+BEGIN
+    SELECT * INTO h FROM pgbx.history x WHERE x.id = j;
+    SELECT * INTO e FROM pgbx._estimate(h.kind);
+    SELECT * INTO cap FROM pgbx.server_capacity;
+    ahead := coalesce(cap.queue_jobs, 0);
+    starts := now() + make_interval(secs => coalesce(cap.wait_secs, 0));
+    RAISE NOTICE '%', format('pgbx: %s job %s queued%s, starts ~%s, takes ~%s (%s, %s confidence, %s)', h.kind, j,
+        CASE WHEN ahead > 0 THEN format(' (%s job(s) running or waiting on this server)', ahead) ELSE '' END,
+        CASE WHEN starts < now() + interval '1 minute' THEN 'now' ELSE to_char(starts, 'HH24:MI') END,
+        pgbx._dur(e.est_secs), pg_size_pretty(e.est_bytes), e.confidence, e.basis);
+END $$;
+-- restore() becomes plpgsql to raise the NOTICE (same signature)
+CREATE OR REPLACE FUNCTION pgbx.restore(into_db text, at timestamptz DEFAULT now()) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE j bigint;
+BEGIN
+    INSERT INTO pgbx.history (kind, trigger, params)
+    VALUES ('restore', 'manual', jsonb_build_object('into_db', restore.into_db, 'at', restore.at)) RETURNING id INTO j;
+    PERFORM pgbx._notice_eta(j);
+    RETURN j;
+END $$;
+REVOKE ALL ON FUNCTION pgbx._dur(double precision), pgbx._estimate(text), pgbx.job_eta(bigint), pgbx._notice_eta(bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pgbx._dur(double precision) TO pgbx_viewer;
+ALTER FUNCTION pgbx.job_eta(bigint) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.job_eta(bigint) TO pgbx_viewer;
+ALTER FUNCTION pgbx.restore(text, timestamptz) SECURITY DEFINER SET search_path = pg_catalog, pgbx;

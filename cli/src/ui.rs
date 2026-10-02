@@ -201,7 +201,8 @@ fn api_timeline(cx: &Ctx, days: i32) -> Result<Value, String> {
 /// The server-wide job queue (what runs, what waits and why), as the worker last wrote it.
 fn api_queue(cx: &Ctx) -> Result<Value, String> {
     let mut c = admin(cx)?;
-    let jobs = rows(&mut c, "SELECT database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail, seen_at
+    let jobs = rows(&mut c, "SELECT database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail,
+                                    progress, eta_start, eta_finish, est_bytes, done_bytes, seen_at
                              FROM pgbx.server_queue ORDER BY state IN ('running', 'cancelling') DESC, position NULLS LAST, requested_at", &[])?;
     let slots = one(&mut c, "SELECT current_setting('pgbx.max_concurrent_jobs', true) AS max_concurrent_jobs,
                                     current_setting('pgbx.restore_lane', true) AS restore_lane", &[])?;

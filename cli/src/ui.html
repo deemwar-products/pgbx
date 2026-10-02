@@ -78,6 +78,7 @@ function queueCard(q) {
     ["job", r => esc(r.job_id)], ["kind", r => `<span class=chip>${esc(r.kind)}</span>`], ["state", r => st(r.state)],
     ["where", r => r.position != null ? `#${esc(r.position)} in line` : r.slot === 0 ? "restore lane" : r.slot != null ? `slot ${esc(r.slot)}` : ""],
     ["since", r => `${ts(r.started_at || r.requested_at)} <span class=mute>${ago(r.started_at || r.requested_at)}</span>`],
+    ["progress / estimate", r => esc(r.progress || ""), 1],
     ["why / what", r => esc(r.detail), 1],
   ], q.jobs, "nothing running or queued") + "</div>";
 }
