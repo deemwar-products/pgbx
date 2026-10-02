@@ -1,0 +1,75 @@
+---
+// Homepage diagram: install the extension once, then drive it from anywhere (you or an agent) through the CLI.
+---
+<figure class="hiw">
+  <svg viewBox="0 0 960 400" role="img" aria-label="An agent skill or a person runs the pgbx CLI on a laptop or CI. The CLI connects over SQL, directly or through an SSH tunnel and jump host, to the pgbx extension inside Postgres on the database server. The extension backs up every database to your S3 bucket. If the server is gone, the CLI restores straight from S3.">
+    <defs>
+      <marker id="hiw-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0L10 5L0 10z" class="hiw-head"/>
+      </marker>
+    </defs>
+
+    <text x="20" y="28" class="hiw-zone">ANYWHERE: laptop · CI · agent box (macOS, Windows, Linux)</text>
+    <rect x="20" y="40" width="300" height="320" rx="14" class="hiw-zonebox"/>
+
+    <rect x="45" y="70" width="250" height="110" rx="10" class="hiw-box hiw-alt"/>
+    <text x="170" y="100" class="hiw-title">You, or your AI agent</text>
+    <text x="170" y="125" class="hiw-sub">Claude Code / Codex + pgbx-skill</text>
+    <text x="170" y="148" class="hiw-mono">"back up prod before this migration"</text>
+
+    <line x1="170" y1="182" x2="170" y2="222" class="hiw-line" marker-end="url(#hiw-a)"/>
+
+    <rect x="45" y="226" width="250" height="110" rx="10" class="hiw-box hiw-accent"/>
+    <text x="170" y="256" class="hiw-title">pgbx CLI</text>
+    <text x="170" y="281" class="hiw-sub">the client · every command --json</text>
+    <text x="170" y="304" class="hiw-mono">--profile prod · query · tunnel</text>
+    <text x="170" y="324" class="hiw-mono">risky steps need --yes</text>
+
+    <path d="M297 281 H420" class="hiw-line" marker-end="url(#hiw-a)"/>
+    <text x="358" y="268" class="hiw-label">SQL</text>
+    <text x="358" y="302" class="hiw-label hiw-dim">SSH tunnel ·</text>
+    <text x="358" y="318" class="hiw-label hiw-dim">jump hosts OK</text>
+
+    <text x="430" y="28" class="hiw-zone">DATABASE SERVER (install once)</text>
+    <rect x="430" y="40" width="300" height="320" rx="14" class="hiw-zonebox"/>
+    <rect x="455" y="70" width="250" height="266" rx="10" class="hiw-box"/>
+    <text x="580" y="100" class="hiw-title">PostgreSQL 13–18</text>
+    <rect x="475" y="120" width="210" height="196" rx="8" class="hiw-box hiw-accent"/>
+    <text x="580" y="148" class="hiw-title">pgbx extension</text>
+    <text x="580" y="174" class="hiw-sub">does the work, in SQL</text>
+    <text x="580" y="204" class="hiw-mono">every DB backed up</text>
+    <text x="580" y="226" class="hiw-mono">new DBs within a minute</text>
+    <text x="580" y="248" class="hiw-mono">retention · schedules</text>
+    <text x="580" y="270" class="hiw-mono">weekly restore test</text>
+    <text x="580" y="292" class="hiw-mono">restore → new DB only</text>
+
+    <path d="M687 200 H800" class="hiw-line" marker-end="url(#hiw-a)"/>
+    <text x="744" y="188" class="hiw-label">pg_dump</text>
+
+    <rect x="804" y="150" width="140" height="100" rx="10" class="hiw-box hiw-alt"/>
+    <text x="874" y="190" class="hiw-title">S3 bucket</text>
+    <text x="874" y="214" class="hiw-sub">yours: AWS, R2,</text>
+    <text x="874" y="232" class="hiw-sub">Hetzner, B2, MinIO</text>
+
+    <path d="M874 252 V385 H170 V338" class="hiw-line hiw-dash" marker-end="url(#hiw-a)"/>
+    <text x="520" y="378" class="hiw-label hiw-dim">server gone? db-restore --from-s3 onto any Postgres</text>
+  </svg>
+</figure>
+
+<style>
+  .hiw { margin: 2rem 0; }
+  .hiw svg { width: 100%; height: auto; display: block; }
+  .hiw-zone { font: 600 12px var(--sl-font, system-ui); letter-spacing: .06em; fill: var(--sl-color-gray-3); }
+  .hiw-zonebox { fill: none; stroke: var(--sl-color-gray-5); stroke-dasharray: 4 5; }
+  .hiw-box { fill: var(--sl-color-bg-nav); stroke: var(--sl-color-gray-4); }
+  .hiw-accent { stroke: var(--sl-color-accent); stroke-width: 2; }
+  .hiw-alt { stroke: var(--sl-color-gray-3); }
+  .hiw-title { font: 600 17px var(--sl-font, system-ui); fill: var(--sl-color-white); text-anchor: middle; }
+  .hiw-sub { font: 13px var(--sl-font, system-ui); fill: var(--sl-color-gray-2); text-anchor: middle; }
+  .hiw-mono { font: 12px var(--sl-font-mono, ui-monospace, monospace); fill: var(--sl-color-gray-2); text-anchor: middle; }
+  .hiw-label { font: 12px var(--sl-font-mono, ui-monospace, monospace); fill: var(--sl-color-text-accent); text-anchor: middle; }
+  .hiw-dim { fill: var(--sl-color-gray-3); }
+  .hiw-line { fill: none; stroke: var(--sl-color-accent); stroke-width: 2; }
+  .hiw-dash { stroke-dasharray: 6 5; stroke: var(--sl-color-gray-3); }
+  .hiw-head { fill: var(--sl-color-accent); }
+</style>
