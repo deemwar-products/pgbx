@@ -19,7 +19,7 @@ W=$(mktemp -d)
 export PGBX_CONFIG_DIR=$W/config PGBX_MEMORY_DIR=$W/mem
 unset PGBX_URL PGBX_PROFILE
 PIDS=""
-cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null; done; docker rm -f $CO >/dev/null 2>&1; rm -rf "$W"; }
+cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null; done; docker rm -fv $CO >/dev/null 2>&1; rm -rf "$W"; }
 trap cleanup EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  PASS $1"; pass=$((pass+1)); else echo "  FAIL $1 (got '$2', want '$3')"; fail=$((fail+1)); fi; }
@@ -120,8 +120,8 @@ else
 fi
 
 echo "## 3. client-only server (stock postgres, no pgbx extension)"
-docker rm -f $CO >/dev/null 2>&1
-docker run -d --name $CO -p "127.0.0.1:$COPORT:5432" -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16-alpine >/dev/null
+docker rm -fv $CO >/dev/null 2>&1
+docker run -d --rm --name $CO -p "127.0.0.1:$COPORT:5432" -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16-alpine >/dev/null
 for _ in $(seq 60); do docker logs $CO 2>&1 | grep -q "init process complete" && docker exec $CO pg_isready -q -U postgres 2>/dev/null && break; sleep 1; done
 for _ in $(seq 30); do docker exec $CO psql -qAtU postgres -c "SELECT 1" >/dev/null 2>&1 && break; sleep 1; done
 docker exec $CO psql -qU postgres -c "CREATE DATABASE app" >/dev/null

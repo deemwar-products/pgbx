@@ -12,7 +12,7 @@ W=$(mktemp -d)
 export PGBX_CONFIG_DIR=$W/config PGBX_SSH_BIN=$W/ssh PGBX_MEMORY_DIR=$W/mem
 unset PGBX_URL PGBX_PROFILE
 ADAPTER="node $ROOT/adapters/ssh/ssh-adapter.js"
-cleanup() { docker rm -f $PG $SSHD >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; pkill -f "$W/ssh_config" 2>/dev/null; rm -rf "$W"; }
+cleanup() { docker rm -fv $PG $SSHD >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; pkill -f "$W/ssh_config" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  PASS $1"; pass=$((pass+1)); else echo "  FAIL $1 (got '$2', want '$3')"; fail=$((fail+1)); fi; }
@@ -34,10 +34,10 @@ Host pgbxco
 CFG
 printf '#!/bin/sh\nexec ssh -F %s "$@"\n' "$W/ssh_config" > "$W/ssh"; chmod +x "$W/ssh"
 
-docker rm -f $PG $SSHD >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1
+docker rm -fv $PG $SSHD >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1
 docker network create $NET >/dev/null
-docker run -d --name $PG --network $NET -p "127.0.0.1:$PPORT:5432" -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16-alpine >/dev/null
-docker run -d --name $SSHD --network $NET -p "127.0.0.1:$SPORT:22" -e KEY="$(cat "$W/key.pub")" alpine:3.20 sh -c '
+docker run -d --rm --name $PG --network $NET -p "127.0.0.1:$PPORT:5432" -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16-alpine >/dev/null
+docker run -d --rm --name $SSHD --network $NET -p "127.0.0.1:$SPORT:22" -e KEY="$(cat "$W/key.pub")" alpine:3.20 sh -c '
   apk add -q --no-cache openssh >/dev/null && ssh-keygen -A >/dev/null && mkdir -p /root/.ssh &&
   echo "$KEY" > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys &&
   sed -i "s/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/" /etc/ssh/sshd_config && passwd -u root >/dev/null 2>&1;
