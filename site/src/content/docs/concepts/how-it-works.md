@@ -4,7 +4,9 @@ description: The three parts of pgbx — the pgbx extension inside Postgres, the
 sidebar: { order: 1 }
 ---
 
-pgbx has three parts. You only *need* the first one; the other two make it easier to drive.
+pgbx has three parts. For backups you only *need* the first one; the other two make it easier to drive.
+The CLI also works on its own, against any Postgres without the extension: see
+[Use pgbx as your Postgres client](../../guides/client-only/).
 
 ```
  laptop / CI / agent machine
@@ -67,7 +69,7 @@ pgbx query "SELECT now()" --profile prod  # later commands reuse it
 
 Commands that need the machine itself (`doctor`, `logs`, `diagnose`, `setup server`) run there as
 `ssh ops@db... pgbx <command> --json`, so the server needs the pgbx CLI too (the install one-liner puts it
-there). `pgbx tunnel list` shows open tunnels; `pgbx tunnel close prod` closes one.
+there). Without it, `doctor` checks what it can through the tunnel instead. `pgbx tunnel list` shows open tunnels; `pgbx tunnel close prod` closes one.
 
 ### Looking around without a shell
 

@@ -10,6 +10,7 @@ All suites run against fresh containers. Check counts are **to be re-measured** 
 | `tests/e2e.sh` | to be re-measured | auto-install in new databases, first backup, schedules, retention, pause/resume, data scope, roles, one-database restore, verify, download links, against a real S3 bucket |
 | `tests/cli_e2e.sh` | to be re-measured | every `pgbx` command, `--json` shape, safety gates (`--yes`), `db-restore --from-s3` onto a plain Postgres container without the extension, Postgres-down paths, diagnose |
 | `tests/ui_e2e.sh` | to be re-measured | `pgbx ui`: pages, JSON, GET only, viewer role; no whole-server endpoint |
+| `tests/client_only_e2e.sh` | 28 passed | pgbx as a plain client: stock `postgres:16` with no extension and no S3, directly and over SSH to a host without pgbx; setup client, query, status, doctor, memories, skill exit 0; backup commands refuse plainly |
 | `tests/upgrade_e2e.sh` | to be re-measured | worker auto-update (`ALTER EXTENSION pgbx UPDATE`, incl. `template1`) |
 | `tests/diag_smoke.sh`, `tests/ui_smoke.sh` | to be re-measured | throwaway-container smokes: doctor/diagnose with pg_wal piling up; UI + audit retention |
 | `tests/bench_local.sh` | to be re-measured | ~1.2 GB against a local S3: backup and restore throughput, S3 outages, fast shutdown |

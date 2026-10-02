@@ -29,7 +29,8 @@ From a checkout: `sh skills/pgbx-skill/install.sh`; self-check: `sh skills/pgbx-
 - No shell: read questions go through `pgbx query "SELECT ..." --json`; a server behind SSH is a profile with
   `--ssh`, and pgbx opens and reuses the tunnel. The skill never runs `ssh` or `psql` itself and never tries to
   get around the query guard.
-- Discover (`pgbx status --json`, `pgbx doctor --json`) before any change.
+- Discover (`pgbx status --json`, `pgbx doctor --json`) before any change. Read questions skip that and work on
+  servers without the pgbx extension too: `backups: "off"` is normal, and the skill does not push installing it.
 - Never read or print credentials. A `download_url` link is used, never pasted into chat.
 - One-database restore always lands in a **new** database.
 - Every job is waited on; success is never claimed from `queued`.

@@ -10,6 +10,8 @@ Postgres and does the backups) and the **pgbx CLI** (`pgbx`, the client you run 
 optional agent skill. See [How it works](../../concepts/how-it-works/).
 
 pgbx is set up in two places. Do the server once; do the laptop part on every machine you run `pgbx` from.
+Only want a Postgres client (profiles, SSH, read queries as JSON, agent memory) and no backups? Skip the server
+part: [Use pgbx as your Postgres client](../../guides/client-only/).
 
 ## On the database server
 
@@ -62,8 +64,9 @@ agent skill; the extension itself always runs on the Linux database server.
 
 `setup client` saves a profile named `prod` (the default if it is your first), then tests it: it connects
 (through an SSH tunnel when you gave `--ssh`), and prints the Postgres version, the pgbx extension version and a
-backup status summary. If something is missing it prints the one next step, for example "extension not found:
-on the server run the install line and `sudo pgbx setup server`". Passwords are never stored in the profile:
+backup status summary. If something is missing it prints the one next step. A server without the extension is
+fine: `setup client` still succeeds and says backups are off there, while queries, profiles and tunnels work
+(see [Use pgbx as your Postgres client](../../guides/client-only/) if that is all you want). Passwords are never stored in the profile:
 put them in `~/.pgpass`. Finally it offers to install the agent skill. After that, every command takes
 `--profile prod`, or uses the default: `pgbx status`.
 
