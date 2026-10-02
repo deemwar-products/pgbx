@@ -178,6 +178,25 @@ BEGIN
     fix := CASE WHEN ok THEN NULL
                 ELSE 'estimates settle after 3 runs of a job; if they stay off, check pgbx.upload_kbps / load, or lower pgbx.eta_samples so they follow recent growth' END;
     RETURN NEXT;
+
+    -- the schedule sits in a busy hour while a much quieter one is known (ADR 0001 §2)
+    name := 'schedule_in_quiet_window';
+    v := NULL; bad := NULL; fix := NULL;
+    FOR o IN SELECT s.database, s.window_cron, s.window_score, s.current_score, s.schedule FROM pgbx.server_overview s
+              WHERE coalesce(s.state, '') NOT ILIKE 'paused%' AND s.window_confidence = 'high' AND s.current_score > 1
+                AND s.current_score > coalesce(nullif(current_setting('pgbx.doctor_busy_ratio', true), '')::float8, 3) * s.window_score
+              ORDER BY s.current_score / greatest(s.window_score, 0.001) DESC LOOP
+        v := concat_ws('; ', v, format('%s: "%s" runs at %sx average activity; %s would be %sx', o.database, o.schedule,
+                                       o.current_score, o.window_cron, o.window_score));
+        IF bad IS NULL THEN
+            bad := o.database;
+            fix := format('connect to %s and run SELECT pgbx.configure(schedule => %L); (or pgbx schedule suggest --db %s --apply)',
+                          o.database, o.window_cron, o.database);
+        END IF;
+    END LOOP;
+    ok := v IS NULL;
+    detail := CASE WHEN ok THEN 'no schedule sits in a busy hour while a much quieter one is known (pgbx.suggest_window())' ELSE v END;
+    RETURN NEXT;
 END $$;
 
 -- coalesced manual jobs and cancel (ADR 0001 §0)
@@ -269,7 +288,7 @@ CREATE OR REPLACE FUNCTION pgbx.status() RETURNS TABLE (
     backups_kept bigint, retention text, data_scope text, verify_schedule text, last_verified_at timestamptz, last_verify_result text,
     last_error text, last_error_at timestamptz, paused_reason text, paused_at timestamptz,
     queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text,
-    job_progress text, job_eta text
+    job_progress text, job_eta text, suggested_schedule text
 ) LANGUAGE plpgsql STABLE AS $$
 DECLARE cfg pgbx.config; lb pgbx.history; le pgbx.history; lv pgbx.history; last_auto timestamptz;
 BEGIN
@@ -320,7 +339,11 @@ BEGIN
              WHEN cfg.enabled THEN format('next backup %s, takes ~%s',
                  CASE WHEN last_auto IS NULL THEN 'within a minute (first backup)'
                       ELSE 'at ' || to_char(to_timestamp(pgbx.next_run_epoch(cfg.schedule, extract(epoch FROM last_auto))), 'YYYY-MM-DD HH24:MI') END,
-                 (SELECT pgbx._dur(e.est_secs) FROM pgbx._estimate('backup') e)) END
+                 (SELECT pgbx._dur(e.est_secs) FROM pgbx._estimate('backup') e)) END,
+        (SELECT CASE WHEN w.cron IS NULL THEN w.start_at
+                     ELSE format('%s (%s, %sx average activity vs %sx now; %s confidence) — never applied by itself: %s',
+                                 w.cron, w.start_at, w.score, w.current_score, w.confidence, w.apply_sql) END
+           FROM pgbx.suggest_window() w)
     FROM (SELECT NULL::bigint AS id, NULL::jsonb AS params
           UNION ALL (SELECT h.id, h.params FROM pgbx.history h WHERE h.state='queued'
                      ORDER BY (h.params->>'queue_position')::int NULLS LAST, h.id LIMIT 1)
@@ -480,3 +503,118 @@ GRANT EXECUTE ON FUNCTION pgbx._dur(double precision) TO pgbx_viewer;
 ALTER FUNCTION pgbx.job_eta(bigint) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.job_eta(bigint) TO pgbx_viewer;
 ALTER FUNCTION pgbx.restore(text, timestamptz) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+
+-- quiet-window suggestion (ADR 0001 §2): activity per hour, suggest_window(), doctor schedule_in_quiet_window
+ALTER TABLE pgbx.server_capacity ADD COLUMN backup_slots jsonb;
+ALTER TABLE pgbx.server_overview ADD COLUMN window_cron text, ADD COLUMN window_score float8, ADD COLUMN current_score float8,
+    ADD COLUMN window_confidence text;
+-- Activity per hour of the week (UTC), learned from pg_stat_database deltas.
+CREATE TABLE pgbx.activity_hourly (
+    scope      text NOT NULL CHECK (scope IN ('db', 'server')),
+    dow        smallint NOT NULL CHECK (dow BETWEEN 0 AND 6),      -- 0 = Sunday
+    hour       smallint NOT NULL CHECK (hour BETWEEN 0 AND 23),
+    samples    int NOT NULL DEFAULT 0,                             -- hours folded in
+    xacts      float8 NOT NULL DEFAULT 0,                          -- transactions per hour
+    writes     float8 NOT NULL DEFAULT 0,                          -- rows inserted + updated + deleted per hour
+    reads      float8 NOT NULL DEFAULT 0,                          -- blocks read per hour
+    active_max float8 NOT NULL DEFAULT 0,                          -- most non-idle sessions seen in the hour
+    updated_at timestamptz,
+    PRIMARY KEY (scope, dow, hour)
+);
+GRANT SELECT ON pgbx.activity_hourly TO pgbx_viewer;
+CREATE OR REPLACE FUNCTION pgbx._activity_add(sc text, hour_start timestamptz, x float8, w float8, r float8, act float8, decay float8)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO pgbx.activity_hourly AS a (scope, dow, hour, samples, xacts, writes, reads, active_max, updated_at)
+    VALUES (sc, extract(dow FROM hour_start AT TIME ZONE 'UTC'), extract(hour FROM hour_start AT TIME ZONE 'UTC'), 1, x, w, r, act, now())
+    ON CONFLICT (scope, dow, hour) DO UPDATE SET
+        samples    = a.samples + 1,
+        xacts      = _activity_add.decay * a.xacts + (1 - _activity_add.decay) * excluded.xacts,
+        writes     = _activity_add.decay * a.writes + (1 - _activity_add.decay) * excluded.writes,
+        reads      = _activity_add.decay * a.reads + (1 - _activity_add.decay) * excluded.reads,
+        active_max = _activity_add.decay * a.active_max + (1 - _activity_add.decay) * excluded.active_max,
+        updated_at = now();
+END $$;
+CREATE OR REPLACE FUNCTION pgbx.suggest_window(hours int DEFAULT 1) RETURNS TABLE (start_at text, cron text, score float8, confidence text,
+    current_schedule text, current_score float8, window_hours int, est_duration text, days_sampled float8, apply_sql text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    sc text; mx float8; mw float8; ma float8; tot bigint; k int; r record; s float8[]; p float8[] := array_fill(0::float8, ARRAY[24]);
+    dayt float8[] := array_fill(0::float8, ARRAY[7]); blocked bool[] := array_fill(false, ARRAY[168]); weekly bool;
+    best float8; bestpen bool; pen bool; bi int; v float8; i int; j int; cfg pgbx.config; slots jsonb; e record; nxt timestamptz; cur int;
+    mind int := greatest(1, coalesce(nullif(current_setting('pgbx.suggest_min_days', true), '')::int, 7));
+    days text[] := ARRAY['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+BEGIN
+    SELECT * INTO cfg FROM pgbx.config;
+    current_schedule := coalesce(cfg.schedule_label, 'daily at 02:00');
+    sc := CASE WHEN EXISTS (SELECT 1 FROM pgbx.activity_hourly a WHERE a.scope = 'server' AND a.samples > 0) THEN 'server' ELSE 'db' END;
+    SELECT avg(a.xacts), avg(a.writes), avg(a.active_max), coalesce(sum(a.samples), 0) INTO mx, mw, ma, tot
+      FROM pgbx.activity_hourly a WHERE a.scope = sc;
+    days_sampled := round((tot / 24.0)::numeric, 1);
+    SELECT * INTO e FROM pgbx._estimate('backup');
+    window_hours := least(12, greatest(1, coalesce(hours, 1), ceil(e.est_secs / 3600.0)::int));
+    est_duration := pgbx._dur(e.est_secs);
+    IF tot = 0 THEN
+        confidence := 'none'; start_at := 'no activity samples yet (the worker learns them hour by hour)';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    -- each signal relative to its weekly mean, summed; an hour not sampled yet counts as average
+    k := (mx > 0)::int + (mw > 0)::int + (ma > 0)::int;
+    s := array_fill(k::float8, ARRAY[168]);
+    FOR r IN SELECT * FROM pgbx.activity_hourly a WHERE a.scope = sc AND a.samples > 0 LOOP
+        s[r.dow * 24 + r.hour + 1] := coalesce(r.xacts / nullif(mx, 0), 0) + coalesce(r.writes / nullif(mw, 0), 0)
+                                      + coalesce(r.active_max / nullif(ma, 0), 0);
+    END LOOP;
+    FOR i IN 0..167 LOOP
+        p[i % 24 + 1] := p[i % 24 + 1] + s[i + 1] / 7;
+        dayt[i / 24 + 1] := dayt[i / 24 + 1] + s[i + 1];
+    END LOOP;
+    weekly := (SELECT min(d) FROM unnest(dayt) d) > 0 AND (SELECT max(d) / min(d) FROM unnest(dayt) d) > 2;
+    -- hours other databases' backups start in (published by the worker)
+    SELECT c.backup_slots INTO slots FROM pgbx.server_capacity c;
+    FOR r IN SELECT x.key, x.value FROM jsonb_each(coalesce(slots, '{}')) x WHERE x.key <> current_database() LOOP
+        FOR i IN SELECT jsonb_array_elements_text(r.value)::int LOOP
+            blocked[i + 1] := true;
+        END LOOP;
+    END LOOP;
+    best := NULL;
+    FOR i IN 0..(CASE WHEN weekly THEN 167 ELSE 23 END) LOOP
+        v := 0; pen := false;
+        FOR j IN 0..window_hours - 1 LOOP
+            v := v + CASE WHEN weekly THEN s[(i + j) % 168 + 1] ELSE p[(i + j) % 24 + 1] END;
+            pen := pen OR (weekly AND blocked[(i + j) % 168 + 1])
+                   OR (NOT weekly AND (SELECT bool_or(blocked[d * 24 + (i + j) % 24 + 1]) FROM generate_series(0, 6) d));
+        END LOOP;
+        -- a window another database's backup starts in only wins when every window is taken
+        IF best IS NULL OR (bestpen AND NOT pen) OR (pen = bestpen AND v < best) THEN
+            best := v; bestpen := pen; bi := i;
+        END IF;
+    END LOOP;
+    score := round((best / (window_hours * greatest(k, 1)))::numeric, 3);
+    IF weekly THEN
+        cron := format('0 %s * * %s', bi % 24, bi / 24);
+        start_at := format('%s %s:00 UTC', days[bi / 24 + 1], lpad((bi % 24)::text, 2, '0'));
+    ELSE
+        cron := format('0 %s * * *', bi);
+        start_at := format('daily %s:00 UTC', lpad(bi::text, 2, '0'));
+    END IF;
+    -- the current schedule's next slot, scored the same way
+    BEGIN
+        nxt := to_timestamp(pgbx.next_run_epoch(coalesce(cfg.schedule, '0 2 * * *'), extract(epoch FROM now())));
+        cur := extract(dow FROM nxt AT TIME ZONE 'UTC')::int * 24 + extract(hour FROM nxt AT TIME ZONE 'UTC')::int;
+        v := 0;
+        FOR j IN 0..window_hours - 1 LOOP
+            v := v + CASE WHEN weekly THEN s[(cur + j) % 168 + 1] ELSE p[(cur % 24 + j) % 24 + 1] END;
+        END LOOP;
+        current_score := round((v / (window_hours * greatest(k, 1)))::numeric, 3);
+    EXCEPTION WHEN others THEN
+        current_score := NULL;
+    END;
+    confidence := CASE WHEN tot / 24.0 >= mind THEN 'high' ELSE 'low' END;
+    apply_sql := format('SELECT pgbx.configure(schedule => %L);', cron);
+    RETURN NEXT;
+END $$;
+REVOKE ALL ON FUNCTION pgbx._activity_add(text, timestamptz, float8, float8, float8, float8, float8), pgbx.suggest_window(int) FROM PUBLIC;
+ALTER FUNCTION pgbx.suggest_window(int) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.suggest_window(int) TO pgbx_viewer;

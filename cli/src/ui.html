@@ -16,6 +16,7 @@ header h1{font-size:16px;margin:0}
 nav{display:flex;gap:4px;flex-wrap:wrap}
 nav a{padding:6px 10px;border-radius:6px;color:var(--fg);text-decoration:none}
 nav a.on{background:var(--chip);font-weight:600}
+button.apply{background:var(--chip);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:4px 10px;cursor:pointer}
 #theme{margin-left:auto;background:none;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:4px 8px;cursor:pointer}
 main{padding:16px;max-width:1300px;margin:0 auto}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:14px}
@@ -142,9 +143,28 @@ async function health() {
   ], j.checks) + "</div>";
 }
 
+function suggestCard(name, w) {
+  if (!w || !w.cron) return w ? `<div class="card"><h2>Quietest time to back up</h2><p class="mute">${esc(w.start_at)}</p></div>` : "";
+  const cli = `pgbx schedule suggest --db ${name} --apply`;
+  return `<div class="card"><h2>Quietest time to back up</h2>
+    <p><b>${esc(w.start_at)}</b> <code>${esc(w.cron)}</code> · ${esc(w.score)}x average activity vs ${esc(w.current_score)}x for the
+       current schedule (${esc(w.current_schedule)}) · ${esc(w.confidence)} confidence, ${esc(w.days_sampled)} days sampled ·
+       backup takes ~${esc(w.est_duration)}</p>
+    <p class="mute">Never applied by itself. This page is read-only: Apply copies the call; run it in a migration or with the CLI.</p>
+    <p><button type="button" class="apply" data-sql="${esc(w.apply_sql)}">Apply (copy SQL)</button>
+       <button type="button" class="apply" data-sql="${esc(cli)}">Apply (copy CLI)</button>
+       <code>${esc(w.apply_sql)}</code> <span class="mute" id="copied"></span></p></div>`;
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("button.apply"); if (!b) return;
+  const done = m => { const c = $("#copied"); if (c) c.textContent = m; };
+  try { navigator.clipboard.writeText(b.dataset.sql).then(() => done("copied: " + b.dataset.sql), () => done("copy this: " + b.dataset.sql)); }
+  catch (err) { done("copy this: " + b.dataset.sql); }
+});
+
 async function db(name) {
   const j = await get("/api/db/" + encodeURIComponent(name)), s = j.status || {};
-  return `<div class="card"><h2>${esc(name)}</h2><p class="big">${st(s.state)}</p>
+  return suggestCard(name, j.suggestion) + `<div class="card"><h2>${esc(name)}</h2><p class="big">${st(s.state)}</p>
       <div class="scroll"><table><tbody>${Object.entries(s).map(([k, v]) => `<tr><th>${esc(k)}</th><td class=wrap>${esc(typeof v === "object" && v ? JSON.stringify(v) : v)}</td></tr>`).join("")}</tbody></table></div></div>
     <div class="card"><h2>Backups kept (${j.backups.length})</h2>` + table([
       ["id", r => esc(r.id)], ["taken", r => ts(r.taken_at)], ["age", r => esc(r.age)], ["trigger", r => esc(r.trigger)],

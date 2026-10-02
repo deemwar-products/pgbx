@@ -77,6 +77,20 @@ if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
   defs="SELECT md5(string_agg(pg_get_functiondef(p.oid), '' ORDER BY p.proname, p.oid::regprocedure::text))
         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pgbx'"
   check "updated functions = fresh install" "$(P -d prev -c "$defs")" "$(P -d fresh -c "$defs")"
+  cols="SELECT md5(string_agg(format('%s.%s %s %s %s', c.table_name, c.column_name, c.ordinal_position, c.data_type,
+                                    coalesce(c.column_default, '')), ',' ORDER BY c.table_name, c.ordinal_position))
+        FROM information_schema.columns c WHERE c.table_schema = 'pgbx'"
+  check "updated tables and columns = fresh install" "$(P -d prev -c "$cols")" "$(P -d fresh -c "$cols")"
+  acls="SELECT md5(coalesce((SELECT string_agg(c.relname || ':' || coalesce(c.relacl::text, '-'), ',' ORDER BY c.relname)
+                             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'pgbx'), '')
+                || coalesce((SELECT string_agg(p.oid::regprocedure::text || ':' || coalesce(p.proacl::text, '-'), ',' ORDER BY 1)
+                             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pgbx'), ''))"
+  check "updated privileges = fresh install" "$(P -d prev -c "$acls")" "$(P -d fresh -c "$acls")"
+  if [ "$(P -d prev -c "$acls")" != "$(P -d fresh -c "$acls")" ]; then
+    q="SELECT p.oid::regprocedure::text || ':' || coalesce(p.proacl::text, '-') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pgbx'
+       UNION ALL SELECT c.relname || ':' || coalesce(c.relacl::text, '-') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'pgbx' ORDER BY 1"
+    diff <(P -d prev -c "$q") <(P -d fresh -c "$q") | head -20
+  fi
   check "doctor() has long_running_job after the update" "$(P -c "SELECT count(*) FROM pgbx.doctor() WHERE name='long_running_job'")" 1
   id=$(P -d prev -c "SELECT pgbx.backup_now()"); check "backup after the update" "$(wait_job prev "$id" pgbx)" done
 else

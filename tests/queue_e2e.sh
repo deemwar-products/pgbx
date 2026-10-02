@@ -108,8 +108,8 @@ P -d qa -c "SELECT pgbx.set_schedule('every 1 minute')" >/dev/null
 for _ in $(seq 150); do s1=$(P -d qa -c "SELECT id FROM pgbx.history WHERE kind='backup' AND trigger='schedule' ORDER BY id LIMIT 1"); [ -n "$s1" ] && break; sleep 1; done
 check "a scheduled backup runs" "$(wait_end qa "$s1" 300)" done
 for _ in $(seq 120); do s2=$(P -d qa -c "SELECT id FROM pgbx.history WHERE kind='backup' AND trigger='schedule' AND id > $s1 ORDER BY id LIMIT 1"); [ -n "$s2" ] && break; sleep 1; done
-r=$(P -d qa -c "SELECT (extract(epoch FROM a.finished - a.started) > 60)::text || '|' || coalesce(b.params->>'skipped_slots', '0')::int >= 1 || '|' ||
-               (b.requested_at >= date_trunc('minute', a.finished) + interval '1 minute')
+r=$(P -d qa -c "SELECT (extract(epoch FROM a.finished - a.started) > 60)::text || '|' || (coalesce(b.params->>'skipped_slots', '0')::int >= 1)::text || '|' ||
+               (b.requested_at >= date_trunc('minute', a.finished) + interval '1 minute')::text
                FROM pgbx.history a, pgbx.history b WHERE a.id = $s1 AND b.id = $s2")
 check "dump > 1 min; next run records skipped_slots and waits for the next slot after it finished" "$r" "true|true|true"
 P -d qa -c "SELECT pgbx.set_schedule('daily at 02:00')" >/dev/null
@@ -174,7 +174,9 @@ echo "  error: $(P -d qa -c "SELECT error FROM pgbx.history WHERE id=$id")"
 sleep 5; check "no multipart upload left" "$(open_uploads)" 0
 check "no new dump in history or S3" "$(dumps qa)|$(s3_dumps qa)" "$before|$s3before"
 id=$(P -d qa -c "SELECT pgbx.backup_now()"); wait_state qa "$id" running 30 >/dev/null; sleep 4
-pid=$(P -c "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pgbx scheduler'")
+# the scheduler by its process title (it has no database session of its own)
+pid=$($DC exec -T db sh -c 'for p in /proc/[0-9]*; do tr "\0" " " < $p/cmdline 2>/dev/null | grep -q "^postgres: pgbx scheduler" && echo ${p#/proc/}; done' | head -1)
+check "found the scheduler process" "$([ -n "$pid" ] && echo yes)" yes
 since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 $DC exec -T db kill -9 "$pid"; sleep 3; wait_up
 for _ in $(seq 60); do s=$(state qa "$id" 2>/dev/null); [ "$s" = failed ] && break; sleep 1; done

@@ -288,6 +288,11 @@ struct Sched {
     cap_written: HashMap<String, String>,  // what server_capacity holds in each database
     last_probe: Option<Instant>,
     reprobe: bool,
+    act: HashMap<String, Act>,             // activity sampling per database
+    srv_hours: std::collections::BTreeMap<i64, (Stat, f64)>, // finished hours, all databases summed
+    srv_flushed: i64,
+    srv_copied: std::collections::HashSet<String>, // databases holding the latest server histogram
+    slots: std::collections::BTreeMap<String, Vec<i32>>, // each database's backup start hours (UTC hour of week)
 }
 
 /// A queued job of some database, as found this poll.
@@ -368,6 +373,7 @@ fn tick(s: &mut Sched) -> Result<(), String> {
     let (mut cands, mut deferred) = (Vec::new(), Vec::new());
     let mut conns: HashMap<String, Client> = HashMap::new();
     s.speeds.clear();
+    s.slots.clear();
     for db in &dbs {
         if owned.contains(db) {
             continue; // a restore is still writing it: it is not a live database yet
@@ -390,6 +396,7 @@ fn tick(s: &mut Sched) -> Result<(), String> {
     }
     let _ = admin.execute("DELETE FROM pgbx.server_overview WHERE NOT (database::text = ANY($1))", &[&dbs]);
     let waiting = start_jobs(&c, &admin_db, s, cands, &mut conns);
+    flush_server_activity(&mut admin, &admin_db, s, &mut conns);
     publish_queue(&mut admin, s, &waiting, &deferred, &mut conns);
     maybe_probe(s, &c, &mut admin);
     Ok(())
@@ -647,6 +654,14 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<(Clie
             Some(why) => deferred.push((cand, why)),
             None => found.push(cand),
         }
+    }
+    if ACTIVITY_SAMPLING.get()
+        && let Err(e) = sample_activity(&mut cl, db, s)
+    {
+        log(&format!("{db}: activity sampling: {e}"));
+    }
+    if enabled {
+        s.slots.insert(db.to_string(), backup_slots(&schedule, Utc::now()));
     }
     // recent job speeds, for the server-wide fallback of the time estimates
     for r in cl
@@ -927,6 +942,161 @@ impl QueueSim {
     }
 }
 
+/// Cumulative pg_stat_database counters of one database.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub(crate) struct Stat {
+    pub xacts: f64,
+    pub writes: f64,
+    pub reads: f64,
+}
+
+/// One database's activity in the current UTC hour, built from per-poll deltas (ADR 0001 §2).
+#[derive(Default)]
+pub(crate) struct Act {
+    last: Option<(f64, Stat, Option<SystemTime>)>, // previous sample: unix secs, counters, stats_reset
+    hour: i64,                                     // unix hour being summed
+    sum: Stat,
+    active_max: f64,
+    covered: f64, // seconds of the hour that deltas cover
+}
+
+impl Act {
+    /// Add a sample taken at `t` (unix seconds). When the hour rolled over and at least 10 minutes of it were seen,
+    /// returns that hour's per-hour rates (scaled up to a full hour) and the most active sessions seen. A stats reset
+    /// or a counter going backwards drops that delta.
+    pub(crate) fn add(&mut self, t: f64, now: Stat, reset: Option<SystemTime>, active: f64) -> Option<(i64, Stat, f64)> {
+        let hour = (t / 3600.0).floor() as i64;
+        let mut done = None;
+        if hour != self.hour {
+            if self.covered >= 600.0 {
+                let k = 3600.0 / self.covered;
+                done = Some((self.hour, Stat { xacts: self.sum.xacts * k, writes: self.sum.writes * k, reads: self.sum.reads * k }, self.active_max));
+            }
+            (self.hour, self.sum, self.active_max, self.covered) = (hour, Stat::default(), 0.0, 0.0);
+        }
+        if let Some((pt, prev, preset)) = self.last {
+            let dt = t - pt;
+            let sane = preset == reset && now.xacts >= prev.xacts && now.writes >= prev.writes && now.reads >= prev.reads;
+            if sane && dt > 0.0 && dt < 3600.0 {
+                self.sum.xacts += now.xacts - prev.xacts;
+                self.sum.writes += now.writes - prev.writes;
+                self.sum.reads += now.reads - prev.reads;
+                self.covered += dt;
+            }
+        }
+        self.active_max = self.active_max.max(active);
+        self.last = Some((t, now, reset));
+        done
+    }
+}
+
+/// Sample this database's activity (pgbx.activity_sampling) and fold a finished hour into its histogram.
+fn sample_activity(cl: &mut Client, db: &str, s: &mut Sched) -> Result<(), String> {
+    let r = cl
+        .query_one(
+            "SELECT (d.xact_commit + d.xact_rollback)::float8, (d.tup_inserted + d.tup_updated + d.tup_deleted)::float8,
+                    d.blks_read::float8, d.stats_reset,
+                    (SELECT count(*) FROM pg_stat_activity a WHERE a.datname = current_database() AND a.state <> 'idle'
+                        AND a.backend_type = 'client backend' AND a.pid <> pg_backend_pid()
+                        AND coalesce(a.application_name, '') NOT LIKE 'pgbx%')::float8,
+                    extract(epoch FROM clock_timestamp())::float8
+               FROM pg_stat_database d WHERE d.datname = current_database()",
+            &[],
+        )
+        .map_err(pe)?;
+    let now = Stat { xacts: r.get(0), writes: r.get(1), reads: r.get(2) };
+    let finished = s.act.entry(db.to_string()).or_default().add(r.get(5), now, r.get(3), r.get(4));
+    if let Some((hour, rate, active)) = finished {
+        cl.execute(
+            "SELECT pgbx._activity_add('db', to_timestamp($1::float8), $2, $3, $4, $5, $6)",
+            &[&((hour * 3600) as f64), &rate.xacts, &rate.writes, &rate.reads, &active, &ACTIVITY_DECAY.get()],
+        )
+        .map_err(pe)?;
+        if hour > s.srv_flushed {
+            let e = s.srv_hours.entry(hour).or_default();
+            e.0.xacts += rate.xacts;
+            e.0.writes += rate.writes;
+            e.0.reads += rate.reads;
+            e.1 += active;
+        }
+    }
+    Ok(())
+}
+
+/// Finished hours of every database together: fold them into the admin database's 'server' histogram and copy that
+/// into every database (suggest_window() scores the whole server: a dump competes with every database's traffic).
+fn flush_server_activity(admin: &mut Client, admin_db: &str, s: &mut Sched, conns: &mut HashMap<String, Client>) {
+    let current = (Utc::now().timestamp() as f64 / 3600.0).floor() as i64;
+    let done: Vec<i64> = s.srv_hours.keys().copied().filter(|h| *h < current).collect();
+    for h in &done {
+        let (rate, active) = s.srv_hours.remove(h).unwrap_or_default();
+        let r = admin.execute(
+            "SELECT pgbx._activity_add('server', to_timestamp($1::float8), $2, $3, $4, $5, $6)",
+            &[&((h * 3600) as f64), &rate.xacts, &rate.writes, &rate.reads, &active, &ACTIVITY_DECAY.get()],
+        );
+        if let Err(e) = r {
+            log(&format!("server activity: {}", pe(e)));
+        }
+        s.srv_flushed = s.srv_flushed.max(*h);
+    }
+    if !done.is_empty() {
+        s.srv_copied.clear();
+    }
+    let rows = match admin.query(
+        "SELECT dow, hour, samples, xacts, writes, reads, active_max FROM pgbx.activity_hourly WHERE scope = 'server'",
+        &[],
+    ) {
+        Ok(r) if !r.is_empty() => r,
+        _ => return,
+    };
+    let col_i16 = |i: usize| rows.iter().map(|r| r.get::<_, i16>(i)).collect::<Vec<i16>>();
+    let col_f64 = |i: usize| rows.iter().map(|r| r.get::<_, f64>(i)).collect::<Vec<f64>>();
+    let (dow, hour, xacts, writes, reads, act) = (col_i16(0), col_i16(1), col_f64(3), col_f64(4), col_f64(5), col_f64(6));
+    let samples: Vec<i32> = rows.iter().map(|r| r.get(2)).collect();
+    for (db, cl) in conns.iter_mut() {
+        if db == admin_db || s.srv_copied.contains(db) {
+            continue;
+        }
+        let r = (|| -> Result<(), postgres::Error> {
+            let mut tx = cl.transaction()?;
+            tx.execute("DELETE FROM pgbx.activity_hourly WHERE scope = 'server'", &[])?;
+            tx.execute(
+                "INSERT INTO pgbx.activity_hourly (scope, dow, hour, samples, xacts, writes, reads, active_max, updated_at)
+                 SELECT 'server', * , now() FROM unnest($1::smallint[], $2::smallint[], $3::int[], $4::float8[], $5::float8[],
+                                                        $6::float8[], $7::float8[])",
+                &[&dow, &hour, &samples, &xacts, &writes, &reads, &act],
+            )?;
+            tx.commit()
+        })();
+        match r {
+            Ok(()) => {
+                s.srv_copied.insert(db.clone());
+            }
+            Err(e) => log(&format!("{db}: server activity copy: {}", pe(e))),
+        }
+    }
+}
+
+/// Hours of the week (UTC, 0 = Sunday 00:00) a schedule starts backups in, over the next 7 days.
+pub(crate) fn backup_slots(cron: &str, from: DateTime<Utc>) -> Vec<i32> {
+    use chrono::{Datelike, Timelike};
+    let mut out = Vec::new();
+    let mut t = from;
+    for _ in 0..200 {
+        let Ok(n) = schedule::next_after(cron, t) else { break };
+        if n > from + chrono::Duration::days(7) {
+            break;
+        }
+        let idx = n.weekday().num_days_from_sunday() as i32 * 24 + n.hour() as i32;
+        if !out.contains(&idx) {
+            out.push(idx);
+        }
+        t = n;
+    }
+    out.sort();
+    out
+}
+
 /// Same as pgbx._dur() in SQL.
 pub(crate) fn dur(secs: f64) -> String {
     if secs < 90.0 {
@@ -975,19 +1145,24 @@ fn publish_capacity(admin: &mut Client, s: &mut Sched, conns: &mut HashMap<Strin
         queue_jobs,
         wait_min,
         probe.as_ref().map(|p| SystemTime::from(p.2)),
+        format!(
+            "{{{}}}",
+            s.slots.iter().map(|(d, v)| format!("{}:[{}]", jstr(d), v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","))).collect::<Vec<_>>().join(",")
+        ),
     );
-    let key = format!("{:?} {:?}", (vals.0, vals.1, &vals.2, vals.3, vals.4, vals.5, vals.6), (vals.7, vals.8, vals.9, vals.10, vals.11, vals.12));
+    let key = format!("{:?} {:?}", (vals.0, vals.1, &vals.2, vals.3, vals.4, vals.5, vals.6), (vals.7, vals.8, vals.9, vals.10, vals.11, vals.12, &vals.13));
     for (db, cl) in conns.iter_mut() {
         if s.cap_written.get(db) == Some(&key) {
             continue;
         }
         let r = cl.execute(
             "INSERT INTO pgbx.server_capacity AS c (id, cores, cpu_bps, cpu_codec, disk_bps, upload_bps, download_bps, load_factor,
-                     backup_bps, restore_bps, verify_bps, queue_jobs, wait_secs, measured_at, updated_at)
-             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+                     backup_bps, restore_bps, verify_bps, queue_jobs, wait_secs, measured_at, updated_at, backup_slots)
+             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $14::text::jsonb)
              ON CONFLICT (id) DO UPDATE SET cores=$1, cpu_bps=$2, cpu_codec=$3, disk_bps=$4, upload_bps=$5, download_bps=$6,
-                 load_factor=$7, backup_bps=$8, restore_bps=$9, verify_bps=$10, queue_jobs=$11, wait_secs=$12, measured_at=$13, updated_at=now()",
-            &[&vals.0, &vals.1, &vals.2, &vals.3, &vals.4, &vals.5, &vals.6, &vals.7, &vals.8, &vals.9, &vals.10, &vals.11, &vals.12],
+                 load_factor=$7, backup_bps=$8, restore_bps=$9, verify_bps=$10, queue_jobs=$11, wait_secs=$12, measured_at=$13, updated_at=now(),
+                 backup_slots=$14::text::jsonb",
+            &[&vals.0, &vals.1, &vals.2, &vals.3, &vals.4, &vals.5, &vals.6, &vals.7, &vals.8, &vals.9, &vals.10, &vals.11, &vals.12, &vals.13],
         );
         match r {
             Ok(_) => {
@@ -1313,16 +1488,19 @@ fn publish_overview(admin: &mut Client, cl: &mut Client, db: &str, cron: &str) -
         )
         .map_err(pe)?
         .get(0);
+    let w = cl.query_one("SELECT cron, score, current_score, confidence FROM pgbx.suggest_window()", &[]).map_err(pe)?;
+    let (wcron, wscore, wcur, wconf): (Option<String>, Option<f64>, Option<f64>, Option<String>) = (w.get(0), w.get(1), w.get(2), w.get(3));
     admin
         .execute(
             "INSERT INTO pgbx.server_overview AS o
                 (database, state, schedule, last_backup_at, last_backup_size, next_backup_at, backups_kept, last_verify, last_error,
-                 seen_at, interval_secs, dump_secs, eta_error)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12)
+                 seen_at, interval_secs, dump_secs, eta_error, window_cron, window_score, current_score, window_confidence)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12, $13, $14, $15, $16)
              ON CONFLICT (database) DO UPDATE SET state=$2, schedule=$3, last_backup_at=$4, last_backup_size=$5,
                 next_backup_at=$6, backups_kept=$7, last_verify=$8, last_error=$9, seen_at=now(), interval_secs=$10, dump_secs=$11,
-                eta_error=$12",
-            &[&db, &state, &schedule, &last_at, &size, &next_at, &kept, &verify, &err, &interval, &dump_secs, &eta_error],
+                eta_error=$12, window_cron=$13, window_score=$14, current_score=$15, window_confidence=$16",
+            &[&db, &state, &schedule, &last_at, &size, &next_at, &kept, &verify, &err, &interval, &dump_secs, &eta_error,
+              &wcron, &wscore, &wcur, &wconf],
         )
         .map_err(pe)?;
     Ok(())
@@ -1904,6 +2082,39 @@ mod t {
         assert_eq!(probe_level("gzip:9"), Some((9, 1.0)));
         assert_eq!(probe_level("lz4"), Some((1, 4.0)));
         assert_eq!(probe_level("none"), None);
+    }
+
+    #[test]
+    fn activity_hours() {
+        let st = |x: f64| Stat { xacts: x, writes: x / 10.0, reads: 0.0 };
+        let mut a = Act::default();
+        let h0 = 1_000_000.0 * 3600.0; // an hour boundary
+        assert_eq!(a.add(h0 + 10.0, st(100.0), None, 1.0), None);
+        // 30 min of samples at 2 xacts/s in that hour
+        for i in 1..=30 {
+            assert_eq!(a.add(h0 + 10.0 + 60.0 * i as f64, st(100.0 + 120.0 * i as f64), None, 3.0), None);
+        }
+        // a stats reset (counters back to ~0, stats_reset changed) is dropped, not counted as negative
+        let reset = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(5));
+        assert_eq!(a.add(h0 + 1900.0, st(5.0), reset, 0.0), None);
+        let (hour, rate, act) = a.add(h0 + 3600.0 + 5.0, st(5.0 + 120.0), reset, 0.0).unwrap();
+        assert_eq!(hour, 1_000_000);
+        assert!((rate.xacts - 7200.0).abs() < 1.0, "{rate:?}"); // 2/s scaled to a full hour
+        assert!((rate.writes - 720.0).abs() < 1.0);
+        assert_eq!(act, 3.0);
+        // less than 10 minutes seen in an hour: nothing to fold
+        let mut b = Act::default();
+        b.add(h0 + 3000.0, st(0.0), None, 0.0);
+        b.add(h0 + 3300.0, st(10.0), None, 0.0);
+        assert_eq!(b.add(h0 + 3700.0, st(20.0), None, 0.0), None);
+    }
+
+    #[test]
+    fn schedule_slots_of_the_week() {
+        let from = t("2026-10-01T12:00:00Z"); // a Thursday
+        assert_eq!(backup_slots("0 2 * * *", from), vec![2, 26, 50, 74, 98, 122, 146]);
+        assert_eq!(backup_slots("30 4 * * 0", from), vec![4]);
+        assert_eq!(backup_slots("0 * * * *", from).len(), 168);
     }
 
     #[test]

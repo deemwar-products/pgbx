@@ -33,12 +33,12 @@ const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill"];
+const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "apply"];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
     "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
-    "ssh-jump", "tunnel-idle", "max-rows", "serve",
+    "ssh-jump", "tunnel-idle", "max-rows", "serve", "hours",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
@@ -127,6 +127,9 @@ new server / disaster (no extension needed on the target; needs pg_restore):
       newest dump at or before TS (default: newest) -> CREATE DATABASE NEWDB (refused if it exists) -> pg_restore
 policy / access (show with no arguments; changes that reduce protection need --yes):
   pgbx schedule [TEXT]            pgbx retention [--max-backups N] [--max-days N]
+  pgbx schedule suggest [--db X] [--hours N] [--apply [--yes]]
+                                  the quietest window learned from activity + the configure() call to copy;
+                                  never applied by itself (--apply asks y/N on a terminal, else needs --yes)
   pgbx pause --reason TEXT --yes  pgbx resume
   pgbx scope [--include P1,P2] [--exclude P1,P2] [--reset]
   pgbx verify-schedule TEXT|never pgbx link [--backup-id N] [--expires '1 hour']
@@ -180,6 +183,7 @@ pub fn level(cmd: &str, a: &Args) -> Level {
         "setup" if a.pos.first().map(String::as_str) == Some("client") => Level::Safe,
         "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "remove" | "use")) => Level::Safe,
         "schedule" if shows => Level::ReadOnly,
+        "schedule" if a.pos.first().map(String::as_str) == Some("suggest") && !a.has("apply") => Level::ReadOnly,
         "schedule" => Level::Safe,
         "retention" | "scope" if shows => Level::ReadOnly,
         "retention" | "scope" | "pause" | "setup" => Level::Guarded,
@@ -736,6 +740,8 @@ mod tests {
         assert_eq!(level("profile", &p(&["profile", "list"])), Level::ReadOnly);
         assert_eq!(level("profile", &p(&["profile", "add", "x", "--host", "h"])), Level::Safe);
         assert_eq!(level("jobs", &p(&["jobs"])), Level::ReadOnly);
+        assert_eq!(level("schedule", &p(&["schedule", "suggest"])), Level::ReadOnly);
+        assert_eq!(level("schedule", &p(&["schedule", "suggest", "--apply"])), Level::Safe);
         assert_eq!(level("jobs", &p(&["jobs", "cancel", "7"])), Level::Guarded);
     }
 

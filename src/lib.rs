@@ -76,6 +76,11 @@ pub static RESTORE_LANE: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ETA_DEFAULT_MBPS: GucSetting<i32> = GucSetting::<i32>::new(20);
 pub static ETA_CALIBRATE: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ETA_SAMPLES: GucSetting<i32> = GucSetting::<i32>::new(5);
+// quiet-window suggestion (ADR 0001 §2)
+pub static ACTIVITY_SAMPLING: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub static ACTIVITY_DECAY: GucSetting<f64> = GucSetting::<f64>::new(0.9);
+pub static SUGGEST_MIN_DAYS: GucSetting<i32> = GucSetting::<i32>::new(7);
+pub static DOCTOR_BUSY_RATIO: GucSetting<f64> = GucSetting::<f64>::new(3.0);
 pub static OVERRUN_POLICY: GucSetting<Overrun> = GucSetting::<Overrun>::new(Overrun::Skip);
 pub static OVERRUN_MAX_GAP: GucSetting<f64> = GucSetting::<f64>::new(1.5);
 
@@ -120,6 +125,10 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(c"pgbx.eta_default_mbps", c"Speed (MB/s) assumed for time estimates before anything was measured", c"deliberately slow, so first estimates err long", &ETA_DEFAULT_MBPS, 1, 10_000, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_bool_guc(c"pgbx.eta_calibrate", c"Measure one core's compression speed once a day (about 1 s of one niced core)", c"", &ETA_CALIBRATE, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.eta_samples", c"Recent jobs per database that time estimates are based on", c"1-50", &ETA_SAMPLES, 1, 50, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_bool_guc(c"pgbx.activity_sampling", c"Learn each database's activity per hour of the week (one pg_stat_database read per poll)", c"feeds pgbx.suggest_window()", &ACTIVITY_SAMPLING, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_float_guc(c"pgbx.activity_decay", c"Weight of the past in each hour's activity average", c"0.5-0.99; 0.9 adapts in about two weeks", &ACTIVITY_DECAY, 0.5, 0.99, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.suggest_min_days", c"Days of activity samples before suggest_window() has high confidence", c"1-90", &SUGGEST_MIN_DAYS, 1, 90, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_float_guc(c"pgbx.doctor_busy_ratio", c"doctor() warns when the schedule's hour is this many times busier than the suggested window", c"1-100", &DOCTOR_BUSY_RATIO, 1.0, 100.0, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_enum_guc(c"pgbx.overrun_policy", c"Schedule slots that passed while a dump of the database was running", c"skip: the next run is the next slot after the dump finished (see pgbx.overrun_max_gap); catch_up: run once right away", &OVERRUN_POLICY, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_float_guc(c"pgbx.overrun_max_gap", c"With overrun_policy=skip, never wait for a slot more than this many schedule intervals after the last good backup finished", c"1.0-10; past it the backup runs right away", &OVERRUN_MAX_GAP, 1.0, 10.0, GucContext::Sighup, GucFlags::default());
 
@@ -161,7 +170,11 @@ CREATE TABLE pgbx.server_overview (
     seen_at          timestamptz NOT NULL DEFAULT now(),
     interval_secs    float8,                                   -- seconds between this schedule's slots
     dump_secs        float8[],                                 -- run time of the last 3 backups, newest first
-    eta_error        float8                                    -- median |actual - estimate| / actual of recent jobs
+    eta_error        float8,                                   -- median |actual - estimate| / actual of recent jobs
+    window_cron      text,                                     -- suggest_window(): the quietest slot
+    window_score     float8,
+    current_score    float8,                                   -- the current schedule's slot, scored the same way
+    window_confidence text
 );
 
 -- The server-wide job queue as the worker sees it (every database's running, queued and deferred jobs), rewritten
@@ -203,7 +216,25 @@ CREATE TABLE pgbx.server_capacity (
     queue_jobs   int,                                          -- jobs running or waiting, server-wide
     wait_secs    float8,                                       -- estimated wait for a job queued now
     measured_at  timestamptz,                                  -- last cpu probe
-    updated_at   timestamptz NOT NULL DEFAULT now()
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    backup_slots jsonb                                         -- {database: [hour of week (UTC) its backups start in]}
+);
+
+-- Activity per hour of the week, learned from pg_stat_database deltas every poll (ADR 0001 §2). Hours are UTC, like
+-- pgbx schedules. scope 'db' = this database; 'server' = every database together (kept in the admin database and
+-- copied into each one hourly). A bucket is a decayed average (x = d*x + (1-d)*hour, pgbx.activity_decay): it adapts
+-- and never grows (336 rows at most). Not part of a dump: a restored copy learns its own.
+CREATE TABLE pgbx.activity_hourly (
+    scope      text NOT NULL CHECK (scope IN ('db', 'server')),
+    dow        smallint NOT NULL CHECK (dow BETWEEN 0 AND 6),      -- 0 = Sunday
+    hour       smallint NOT NULL CHECK (hour BETWEEN 0 AND 23),
+    samples    int NOT NULL DEFAULT 0,                             -- hours folded in
+    xacts      float8 NOT NULL DEFAULT 0,                          -- transactions per hour
+    writes     float8 NOT NULL DEFAULT 0,                          -- rows inserted + updated + deleted per hour
+    reads      float8 NOT NULL DEFAULT 0,                          -- blocks read per hour
+    active_max float8 NOT NULL DEFAULT 0,                          -- most non-idle sessions seen in the hour
+    updated_at timestamptz,
+    PRIMARY KEY (scope, dow, hour)
 );
 
 -- One row per database. path NULL = use the database name (so the row copied from template1 stays correct).
@@ -351,7 +382,7 @@ CREATE FUNCTION pgbx.status() RETURNS TABLE (
     backups_kept bigint, retention text, data_scope text, verify_schedule text, last_verified_at timestamptz, last_verify_result text,
     last_error text, last_error_at timestamptz, paused_reason text, paused_at timestamptz,
     queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text,
-    job_progress text, job_eta text
+    job_progress text, job_eta text, suggested_schedule text
 ) LANGUAGE plpgsql STABLE AS $$
 DECLARE cfg pgbx.config; lb pgbx.history; le pgbx.history; lv pgbx.history; last_auto timestamptz;
 BEGIN
@@ -402,7 +433,11 @@ BEGIN
              WHEN cfg.enabled THEN format('next backup %s, takes ~%s',
                  CASE WHEN last_auto IS NULL THEN 'within a minute (first backup)'
                       ELSE 'at ' || to_char(to_timestamp(pgbx.next_run_epoch(cfg.schedule, extract(epoch FROM last_auto))), 'YYYY-MM-DD HH24:MI') END,
-                 (SELECT pgbx._dur(e.est_secs) FROM pgbx._estimate('backup') e)) END
+                 (SELECT pgbx._dur(e.est_secs) FROM pgbx._estimate('backup') e)) END,
+        (SELECT CASE WHEN w.cron IS NULL THEN w.start_at
+                     ELSE format('%s (%s, %sx average activity vs %sx now; %s confidence) — never applied by itself: %s',
+                                 w.cron, w.start_at, w.score, w.current_score, w.confidence, w.apply_sql) END
+           FROM pgbx.suggest_window() w)
     FROM (SELECT NULL::bigint AS id, NULL::jsonb AS params
           UNION ALL (SELECT h.id, h.params FROM pgbx.history h WHERE h.state='queued'
                      ORDER BY (h.params->>'queue_position')::int NULLS LAST, h.id LIMIT 1)
@@ -538,6 +573,107 @@ BEGIN
                            CASE WHEN eta_start < now() + interval '1 minute' THEN 'now' ELSE to_char(eta_start, 'HH24:MI') END,
                            pgbx._dur(e.est_secs));
     END IF;
+    RETURN NEXT;
+END $$;
+
+-- internal (worker): fold one hour of activity into its bucket
+CREATE FUNCTION pgbx._activity_add(sc text, hour_start timestamptz, x float8, w float8, r float8, act float8, decay float8)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO pgbx.activity_hourly AS a (scope, dow, hour, samples, xacts, writes, reads, active_max, updated_at)
+    VALUES (sc, extract(dow FROM hour_start AT TIME ZONE 'UTC'), extract(hour FROM hour_start AT TIME ZONE 'UTC'), 1, x, w, r, act, now())
+    ON CONFLICT (scope, dow, hour) DO UPDATE SET
+        samples    = a.samples + 1,
+        xacts      = _activity_add.decay * a.xacts + (1 - _activity_add.decay) * excluded.xacts,
+        writes     = _activity_add.decay * a.writes + (1 - _activity_add.decay) * excluded.writes,
+        reads      = _activity_add.decay * a.reads + (1 - _activity_add.decay) * excluded.reads,
+        active_max = _activity_add.decay * a.active_max + (1 - _activity_add.decay) * excluded.active_max,
+        updated_at = now();
+END $$;
+
+-- The quietest time to back up this database, learned from activity (server-wide when known, else this database's).
+-- Never applied by itself: apply_sql is the configure() call to run, or `pgbx schedule suggest --apply`.
+-- score / current_score: activity of the window relative to an average hour (1.0); the window is at least `hours` long and
+-- long enough for the estimated dump; hours another database's backup starts in are avoided. Weekly when weekdays
+-- differ by more than 2x, else daily. confidence: 'none' (no samples), 'low' (< pgbx.suggest_min_days days), 'high'.
+CREATE FUNCTION pgbx.suggest_window(hours int DEFAULT 1) RETURNS TABLE (start_at text, cron text, score float8, confidence text,
+    current_schedule text, current_score float8, window_hours int, est_duration text, days_sampled float8, apply_sql text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    sc text; mx float8; mw float8; ma float8; tot bigint; k int; r record; s float8[]; p float8[] := array_fill(0::float8, ARRAY[24]);
+    dayt float8[] := array_fill(0::float8, ARRAY[7]); blocked bool[] := array_fill(false, ARRAY[168]); weekly bool;
+    best float8; bestpen bool; pen bool; bi int; v float8; i int; j int; cfg pgbx.config; slots jsonb; e record; nxt timestamptz; cur int;
+    mind int := greatest(1, coalesce(nullif(current_setting('pgbx.suggest_min_days', true), '')::int, 7));
+    days text[] := ARRAY['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+BEGIN
+    SELECT * INTO cfg FROM pgbx.config;
+    current_schedule := coalesce(cfg.schedule_label, 'daily at 02:00');
+    sc := CASE WHEN EXISTS (SELECT 1 FROM pgbx.activity_hourly a WHERE a.scope = 'server' AND a.samples > 0) THEN 'server' ELSE 'db' END;
+    SELECT avg(a.xacts), avg(a.writes), avg(a.active_max), coalesce(sum(a.samples), 0) INTO mx, mw, ma, tot
+      FROM pgbx.activity_hourly a WHERE a.scope = sc;
+    days_sampled := round((tot / 24.0)::numeric, 1);
+    SELECT * INTO e FROM pgbx._estimate('backup');
+    window_hours := least(12, greatest(1, coalesce(hours, 1), ceil(e.est_secs / 3600.0)::int));
+    est_duration := pgbx._dur(e.est_secs);
+    IF tot = 0 THEN
+        confidence := 'none'; start_at := 'no activity samples yet (the worker learns them hour by hour)';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    -- each signal relative to its weekly mean, summed; an hour not sampled yet counts as average
+    k := (mx > 0)::int + (mw > 0)::int + (ma > 0)::int;
+    s := array_fill(k::float8, ARRAY[168]);
+    FOR r IN SELECT * FROM pgbx.activity_hourly a WHERE a.scope = sc AND a.samples > 0 LOOP
+        s[r.dow * 24 + r.hour + 1] := coalesce(r.xacts / nullif(mx, 0), 0) + coalesce(r.writes / nullif(mw, 0), 0)
+                                      + coalesce(r.active_max / nullif(ma, 0), 0);
+    END LOOP;
+    FOR i IN 0..167 LOOP
+        p[i % 24 + 1] := p[i % 24 + 1] + s[i + 1] / 7;
+        dayt[i / 24 + 1] := dayt[i / 24 + 1] + s[i + 1];
+    END LOOP;
+    weekly := (SELECT min(d) FROM unnest(dayt) d) > 0 AND (SELECT max(d) / min(d) FROM unnest(dayt) d) > 2;
+    -- hours other databases' backups start in (published by the worker)
+    SELECT c.backup_slots INTO slots FROM pgbx.server_capacity c;
+    FOR r IN SELECT x.key, x.value FROM jsonb_each(coalesce(slots, '{}')) x WHERE x.key <> current_database() LOOP
+        FOR i IN SELECT jsonb_array_elements_text(r.value)::int LOOP
+            blocked[i + 1] := true;
+        END LOOP;
+    END LOOP;
+    best := NULL;
+    FOR i IN 0..(CASE WHEN weekly THEN 167 ELSE 23 END) LOOP
+        v := 0; pen := false;
+        FOR j IN 0..window_hours - 1 LOOP
+            v := v + CASE WHEN weekly THEN s[(i + j) % 168 + 1] ELSE p[(i + j) % 24 + 1] END;
+            pen := pen OR (weekly AND blocked[(i + j) % 168 + 1])
+                   OR (NOT weekly AND (SELECT bool_or(blocked[d * 24 + (i + j) % 24 + 1]) FROM generate_series(0, 6) d));
+        END LOOP;
+        -- a window another database's backup starts in only wins when every window is taken
+        IF best IS NULL OR (bestpen AND NOT pen) OR (pen = bestpen AND v < best) THEN
+            best := v; bestpen := pen; bi := i;
+        END IF;
+    END LOOP;
+    score := round((best / (window_hours * greatest(k, 1)))::numeric, 3);
+    IF weekly THEN
+        cron := format('0 %s * * %s', bi % 24, bi / 24);
+        start_at := format('%s %s:00 UTC', days[bi / 24 + 1], lpad((bi % 24)::text, 2, '0'));
+    ELSE
+        cron := format('0 %s * * *', bi);
+        start_at := format('daily %s:00 UTC', lpad(bi::text, 2, '0'));
+    END IF;
+    -- the current schedule's next slot, scored the same way
+    BEGIN
+        nxt := to_timestamp(pgbx.next_run_epoch(coalesce(cfg.schedule, '0 2 * * *'), extract(epoch FROM now())));
+        cur := extract(dow FROM nxt AT TIME ZONE 'UTC')::int * 24 + extract(hour FROM nxt AT TIME ZONE 'UTC')::int;
+        v := 0;
+        FOR j IN 0..window_hours - 1 LOOP
+            v := v + CASE WHEN weekly THEN s[(cur + j) % 168 + 1] ELSE p[(cur % 24 + j) % 24 + 1] END;
+        END LOOP;
+        current_score := round((v / (window_hours * greatest(k, 1)))::numeric, 3);
+    EXCEPTION WHEN others THEN
+        current_score := NULL;
+    END;
+    confidence := CASE WHEN tot / 24.0 >= mind THEN 'high' ELSE 'low' END;
+    apply_sql := format('SELECT pgbx.configure(schedule => %L);', cron);
     RETURN NEXT;
 END $$;
 
@@ -839,6 +975,25 @@ BEGIN
     fix := CASE WHEN ok THEN NULL
                 ELSE 'estimates settle after 3 runs of a job; if they stay off, check pgbx.upload_kbps / load, or lower pgbx.eta_samples so they follow recent growth' END;
     RETURN NEXT;
+
+    -- the schedule sits in a busy hour while a much quieter one is known (ADR 0001 §2)
+    name := 'schedule_in_quiet_window';
+    v := NULL; bad := NULL; fix := NULL;
+    FOR o IN SELECT s.database, s.window_cron, s.window_score, s.current_score, s.schedule FROM pgbx.server_overview s
+              WHERE coalesce(s.state, '') NOT ILIKE 'paused%' AND s.window_confidence = 'high' AND s.current_score > 1
+                AND s.current_score > coalesce(nullif(current_setting('pgbx.doctor_busy_ratio', true), '')::float8, 3) * s.window_score
+              ORDER BY s.current_score / greatest(s.window_score, 0.001) DESC LOOP
+        v := concat_ws('; ', v, format('%s: "%s" runs at %sx average activity; %s would be %sx', o.database, o.schedule,
+                                       o.current_score, o.window_cron, o.window_score));
+        IF bad IS NULL THEN
+            bad := o.database;
+            fix := format('connect to %s and run SELECT pgbx.configure(schedule => %L); (or pgbx schedule suggest --db %s --apply)',
+                          o.database, o.window_cron, o.database);
+        END IF;
+    END LOOP;
+    ok := v IS NULL;
+    detail := CASE WHEN ok THEN 'no schedule sits in a busy hour while a much quieter one is known (pgbx.suggest_window())' ELSE v END;
+    RETURN NEXT;
 END $$;
 
 -- Health checks for the CLI: one row per check, plain-language detail and the fix. Admin database only.
@@ -920,13 +1075,16 @@ REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgbx FROM PUBLIC;
 GRANT USAGE ON SCHEMA pgbx TO pgbx_viewer;
 
 -- viewer: read-only
-GRANT SELECT ON pgbx.config, pgbx.history, pgbx.backups, pgbx.server_overview, pgbx.server_queue, pgbx.server_capacity TO pgbx_viewer;
+GRANT SELECT ON pgbx.config, pgbx.history, pgbx.backups, pgbx.server_overview, pgbx.server_queue, pgbx.server_capacity,
+      pgbx.activity_hourly TO pgbx_viewer;
 GRANT EXECUTE ON FUNCTION pgbx.status(), pgbx.overview(), pgbx.to_cron(text),
       pgbx.next_run_epoch(text, double precision), pgbx._require_admin_db(),
       pgbx.rowless_tables(), pgbx._like(text), pgbx._dur(double precision) TO pgbx_viewer;
 -- job_eta() reads pg_database_size and the history: runs as the extension owner, viewers may call it
 ALTER FUNCTION pgbx.job_eta(bigint) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.job_eta(bigint) TO pgbx_viewer;
+ALTER FUNCTION pgbx.suggest_window(int) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.suggest_window(int) TO pgbx_viewer;
 -- doctor() reads server-wide settings and slots: runs as the extension owner, viewers may call it
 ALTER FUNCTION pgbx.doctor() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.doctor() TO pgbx_viewer;
@@ -946,7 +1104,7 @@ BEGIN
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pgbx_admin', f);
     END LOOP;
 END $lock$;
--- internals (_presign, _log, _check_days, _queue_manual, _estimate, _notice_eta): superuser only — no grants.
+-- internals (_presign, _log, _check_days, _queue_manual, _estimate, _notice_eta, _activity_add): superuser only — no grants.
 "#,
     name = "lockdown",
     finalize

@@ -173,6 +173,7 @@ fn api_db(cx: &Ctx, name: &str) -> Result<Value, String> {
     Ok(json!({
         "ok": true, "database": name,
         "status": one(&mut c, "SELECT * FROM pgbx.status()", &[])?,
+        "suggestion": one(&mut c, "SELECT * FROM pgbx.suggest_window()", &[]).unwrap_or(Value::Null),
         "backups": rows(&mut c, "SELECT id, taken_at, age::text, trigger, size, bytes, s3_key FROM pgbx.backups", &[])?,
         "history": rows(&mut c, &(history_sql("") + " LIMIT 200"), &[])?,
     }))
@@ -388,6 +389,7 @@ mod tests {
     fn page_is_self_contained() {
         assert!(PAGE.contains("/api/overview") && PAGE.contains("/api/timeline") && PAGE.contains("/api/health"));
         assert!(PAGE.contains("/api/queue") && PAGE.contains("cancel"));
+        assert!(PAGE.contains("Apply") && PAGE.contains("clipboard") && PAGE.contains("schedule suggest"));
         for bad in ["http://", "https://", "<form", "method=\"post\"", "POST"] {
             assert!(!PAGE.contains(bad), "page must not contain {bad}");
         }
