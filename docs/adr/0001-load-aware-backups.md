@@ -149,6 +149,30 @@ The worker tags its own children `application_name=pgbx_dump`/`pgbx_restore` (PG
   times: no dump, dump at default priority, dump with caps. Record TPS and p95 latency. Budget: **p95 latency
   +≤ 15 %, TPS −≤ 10 %** with caps on. Results committed to `bench/RESULTS.md` per release.
 
+### 4. Time estimates: tell people when a job will start and how long it will take
+
+Every job gets an estimate the moment it is created, from data pgbx already has:
+
+- **Duration.** Size: `pg_database_size()` for a backup, the dump's `bytes` (history) for a restore/verify.
+  Speed: median bytes/second of this database's last 5 `done` jobs of the same kind (`bytes` ÷ `finished-started`,
+  already in `pgbx.history`). No history yet → server-wide median for that kind → `pgbx.eta_default_mbps`
+  (default **20 MB/s**, deliberately slow so first estimates err long). Dump bytes vs DB size: per-DB compression
+  ratio from past backups, else 0.3.
+- **Start.** Queue position (§0 pick order) + sum of estimates of the jobs ahead + remaining time of the running
+  job; if the gate is `on` and the last sample was busy, add the current backoff, capped at the deadline.
+- **Confidence.** `high` (≥ 3 own samples, low variance), `medium` (server-wide data), `low` (default speed).
+- **Where it shows:**
+  - `backup_now()` / `restore()` / `verify_now()` raise a `NOTICE`: "job 42 queued, 2nd in line — starts ~14:05,
+    takes ~18 min (12 GB, medium confidence)". Return type stays `bigint` (no breaking change).
+  - `pgbx.job_eta(job_id)` → `(position, eta_start, eta_finish, est_bytes, done_bytes, confidence)`.
+  - Live progress: the worker writes `history.bytes` after each 16 MiB part (`src/transfer.rs:74`), so a running
+    job's ETA is recomputed from real throughput, not the guess. `pgbx status`, `pgbx jobs` and the UI show
+    "41 % · ~9 min left".
+  - New database: the first-backup `NOTICE` isn't possible inside `CREATE DATABASE`, so `pgbx.status()` shows
+    "first backup ~in 1 min, ~30 s" and "next scheduled 02:00 (≈ quiet window score)" for every database.
+  - `pgbx schedule suggest` adds expected duration, so the suggested window is long enough for the dump.
+- Accuracy is tracked: each finished job stores `params.eta_sec` and actual; `doctor()` reports median error.
+
 ### Config — every knob is a setting, every default is the safe one
 
 Every number in this ADR is a GUC; values quoted in the text above are its defaults. All are `PGC_SIGHUP`
@@ -191,6 +215,8 @@ the server value is a ceiling where noted.
 | `pgbx.dump_lock_timeout` | 5s | 0-10min | no | never queue behind DDL |
 | `pgbx.dump_lock_timeout_forced` | 60s | 0-10min | no | at the deadline, try harder then alert |
 | `pgbx.restore_synchronous_commit` | off | on/off | no | restore target is a NEW db, safe to redo |
+| `pgbx.eta_default_mbps` | 20 | 1-10000 | no | first estimates err long, not short |
+| `pgbx.eta_samples` | 5 | 1-50 | no | recent jobs only, adapts to growth |
 | `pgbx.doctor_long_job` | 1h | 0-24h | no | |
 
 `SHOW pgbx.*` and `pgbx.doctor()` list effective values and flag any non-default that weakens a safety rule.
@@ -238,6 +264,8 @@ the server value is a ceiling where noted.
 - e2e queue: 3-min dump in DB A, `restore()` in DB B starts within one tick (restore lane); with lane off it
   runs next, ahead of A's queued verify. `backup_now()` ×5 → one job id. Hourly schedule + slow dump →
   `skip` leaves a gap and records `skipped_slots`. `cancel()` on a running dump leaves no object in S3.
+- e2e ETA: `backup_now()` emits a NOTICE with start/duration; after 3 backups the estimate is within ±50 % of
+  actual on a 1 GB pgbench DB; running job shows rising `done_bytes`.
 - e2e: `shadow` mode never delays but records `would_defer`.
 - e2e: hold `ACCESS EXCLUSIVE` on a table → dump fails fast on lock_timeout, re-queues, succeeds after release.
 - e2e: child `nice` value is 10 (`ps -o ni`), `ioprio` on Linux (`/proc/<pid>/io` via `ionice -p`).
