@@ -110,21 +110,48 @@ The worker tags its own children `application_name=pgbx_dump`/`pgbx_restore` (PG
   times: no dump, dump at default priority, dump with caps. Record TPS and p95 latency. Budget: **p95 latency
   +≤ 15 %, TPS −≤ 10 %** with caps on. Results committed to `bench/RESULTS.md` per release.
 
-### Config (all `PGC_SIGHUP`, defined next to the others in `src/lib.rs:58-69`)
+### Config — every knob is a setting, every default is the safe one
 
-| GUC | default |
-|---|---|
-| `pgbx.load_gate` | `off` (→ `shadow` → `on`) |
-| `pgbx.busy_active_backends` | 4 |
-| `pgbx.busy_tps` | 200 |
-| `pgbx.busy_replica_lag` | 30s |
-| `pgbx.busy_loadavg` | 0.8 (0 = ignore) |
-| `pgbx.max_defer` | 4h |
-| `pgbx.job_nice` | 10 |
-| `pgbx.job_ionice` | best-effort-7 |
-| `pgbx.upload_kbps` | 0 |
-| `pgbx.dump_lock_timeout` | 5s |
-| `pgbx.activity_sampling` | on |
+Every number in this ADR is a GUC; values quoted in the text above are its defaults. All are `PGC_SIGHUP`
+(reload, no restart), defined next to the others in `src/lib.rs:58-69`, validated with min/max bounds so a typo
+cannot disable safety (e.g. `max_defer` can't exceed 24h, `job_nice` is clamped 0-19). Defaults follow one rule:
+**never lose a backup, never take more than one core, never wait behind app locks.**
+The `*_db` columns let a database override a server value in its own migration via `pgbx.configure()`;
+the server value is a ceiling where noted.
+
+| GUC | default | range | per-DB override | why this default is safe |
+|---|---|---|---|---|
+| **gate** | | | | |
+| `pgbx.load_gate` | `off` | off/shadow/on | `config.load_gate` | today's behaviour until shadow data proves thresholds |
+| `pgbx.busy_active_backends` | 4 | 0-10000 (0 = ignore) | yes | small servers rarely exceed 4 non-idle sessions when quiet |
+| `pgbx.busy_tps` | 200 | 0-10^7 (0 = ignore) | yes | |
+| `pgbx.busy_long_xact` | 30s | 0-1h (0 = ignore) | no | don't stack on a migration |
+| `pgbx.busy_replica_lag` | 30s | 0-1h (0 = ignore) | no | |
+| `pgbx.busy_loadavg` | 0.8 | 0-10 (0 = ignore) | no | per-core; ignored where `/proc` is absent |
+| `pgbx.defer_backoff` | `1,2,4,8,15` (min) | list, each 1-60 | no | last value repeats |
+| `pgbx.max_defer` | 4h | 0-24h, < schedule interval | yes, ≤ server | backups never skipped |
+| `pgbx.max_defer_first` | 15min | 0-24h | no | new DBs get protected fast |
+| `pgbx.gate_manual_jobs` | `warn` | warn/defer/off | yes | humans decide; `defer` for those who want it |
+| **suggestion** | | | | |
+| `pgbx.activity_sampling` | on | on/off | yes | one stats read per tick |
+| `pgbx.activity_decay` | 0.9 | 0.5-0.99 | no | adapts in ~2 weeks |
+| `pgbx.suggest_min_days` | 7 | 1-90 | no | below it, confidence = low |
+| `pgbx.suggest_auto_apply` | off | off/on | yes | never moves your schedule unless you say so |
+| `pgbx.doctor_busy_ratio` | 3.0 | 1-100 | no | when doctor warns "busy hour" |
+| **resource caps** | | | | |
+| `pgbx.job_nice` | 10 | 0-19 | no | lower than the app, never higher |
+| `pgbx.job_ionice` | `best-effort-7` | none/best-effort-0..7/idle | no | `idle` can starve forever |
+| `pgbx.max_concurrent_jobs` | 1 | 1-8 | no | today's behaviour, now enforced by advisory lock |
+| `pgbx.dump_compression` | `auto` (exists) | | no | |
+| `pgbx.dump_compression_busy` | `zstd:1` / gzip 1 | | no | cheaper when forced under load |
+| `pgbx.upload_kbps` | 0 (unlimited) | 0-10^7 | no | uploads already back-pressure pg_dump |
+| `pgbx.download_kbps` | 0 | 0-10^7 | no | |
+| `pgbx.dump_lock_timeout` | 5s | 0-10min | no | never queue behind DDL |
+| `pgbx.dump_lock_timeout_forced` | 60s | 0-10min | no | at the deadline, try harder then alert |
+| `pgbx.restore_synchronous_commit` | off | on/off | no | restore target is a NEW db, safe to redo |
+| `pgbx.doctor_long_job` | 1h | 0-24h | no | |
+
+`SHOW pgbx.*` and `pgbx.doctor()` list effective values and flag any non-default that weakens a safety rule.
 
 ### Surfacing
 
