@@ -10,14 +10,19 @@ All suites run against fresh containers. Check counts are **to be re-measured** 
 | `tests/e2e.sh` | to be re-measured | auto-install in new databases, first backup, schedules, retention, pause/resume, data scope, roles, one-database restore, verify, download links, against a real S3 bucket |
 | `tests/cli_e2e.sh` | to be re-measured | every `pgbx` command, `--json` shape, safety gates (`--yes`), `db-restore --from-s3` onto a plain Postgres container without the extension, Postgres-down paths, diagnose |
 | `tests/ui_e2e.sh` | to be re-measured | `pgbx ui`: pages, JSON, GET only, viewer role; no whole-server endpoint |
-| `tests/client_only_e2e.sh` | 28 passed | pgbx as a plain client: stock `postgres:16` with no extension and no S3, directly and over SSH to a host without pgbx; setup client, query, status, doctor, memories, skill exit 0; backup commands refuse plainly |
+| `tests/client_only_e2e.sh` | to be re-measured | pgbx as a plain client: stock `postgres:16` with no extension and no S3, directly and through the ssh adapter to a host without pgbx; setup client, query, status, doctor, memories, skill exit 0; backup commands refuse plainly |
+| `tests/ssh_e2e.sh` | to be re-measured | connections (ADR 0003) against a password-protected Postgres and an sshd: a url profile with `$PGPASSWORD` from the environment, a .env file and a secret handler; literal passwords refused; the ssh example adapter started and stopped per command; host-side commands refused; adapter errors shown; `profiles.json` migration; the query guard; the password never in output or on disk |
+| `tests/serve_e2e.sh` | to be re-measured | `pgbx serve`: token, Host guard, safe actions only with `--allow-safe`, client-only server, one adapter for the whole run and Ctrl-C stops it |
 | `tests/upgrade_e2e.sh` | to be re-measured | worker auto-update (`ALTER EXTENSION pgbx UPDATE`, incl. `template1`) |
 | `tests/diag_smoke.sh`, `tests/ui_smoke.sh` | to be re-measured | throwaway-container smokes: doctor/diagnose with pg_wal piling up; UI + audit retention |
 | `tests/bench_local.sh` | to be re-measured | ~1.2 GB against a local S3: backup and restore throughput, S3 outages, fast shutdown |
 
 `tests/run_all.sh` rebuilds, starts fresh containers, uses a unique S3 folder and runs the suites.
 Set `PG_MAJOR=13`…`18` to run them on another Postgres major (needs a dev image built with that `PG_MAJOR`).
-`cd cli && cargo test` covers the CLI's unit tests (argument parsing, safety levels, S3 key selection, diagnose classification).
+`cd cli && cargo test` covers the CLI's unit tests (argument parsing, safety levels, S3 key selection, diagnose
+classification, config.yaml and its migration, `$VAR` expansion and secret sources, the adapter protocol with a
+fake adapter, redaction) and `cli/tests/adapter_cli.rs` runs the binary (an adapter stopped after a command,
+seeing EOF when pgbx is killed, stopped on Ctrl-C). `cd adapters && npm test` tests the example adapters.
 
 ## Robustness built in
 

@@ -26,9 +26,12 @@ From a checkout: `sh skills/pgbx-skill/install.sh`; self-check: `sh skills/pgbx-
 
 - `pgbx … --json` first. SQL is the fallback when the CLI is missing.
 - Pick the server first: `pgbx profile list --json`, choose (or ask), then `--profile NAME` on every call.
-- No shell: read questions go through `pgbx query "SELECT ..." --json`; a server behind SSH is a profile with
-  `--ssh`, and pgbx opens and reuses the tunnel. The skill never runs `ssh` or `psql` itself and never tries to
-  get around the query guard.
+- No shell: read questions go through `pgbx query "SELECT ..." --json`; a server behind SSH or a cloud is a
+  profile with an [adapter](../../guides/adapters/), and pgbx starts and stops it. The skill never runs `ssh` or
+  `psql` itself and never tries to get around the query guard.
+- Never asks for, reads, echoes or stores a secret. When a profile needs a password it suggests a `$VAR`
+  reference (`--url 'postgres://app:$PGPASSWORD@host/db'`) and tells you to export the variable yourself. It
+  adds or edits a profile only when you ask.
 - Discover (`pgbx status --json`, `pgbx doctor --json`) before any change. Read questions skip that and work on
   servers without the pgbx extension too: `backups: "off"` is normal, and the skill does not push installing it.
 - Never read or print credentials. A `download_url` link is used, never pasted into chat.

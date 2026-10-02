@@ -1,6 +1,14 @@
 # ADR 0003: Connection adapters and profiles (and a marketplace note)
 
-Status: **Accepted, final shape (owner decisions, 2026-10-02). Build after the current merges.**
+Status: **Accepted, final shape (owner decisions, 2026-10-02). Built for 0.6.0 (branch `adr0003-impl`):**
+one `config.yaml` (YAML; the TOML below was the sketch) with `adapters`, `profiles` and `secrets`;
+`pgbx profile add | edit | remove | list | show | use` and `--url` / `PGBX_URL`; `$VAR` expansion from the
+environment, a .env file or a handler command; adapter protocol v1 (process group / Job Object, start and stop,
+one result line, timeouts, Ctrl-C); the ssh / aws / gcp / azure examples in `adapters/`; pgbx's built-in SSH
+(`tunnel.rs`, `pgbx tunnel`, `--ssh*`) removed and `profiles.json` migrated automatically. **Not built:** the
+`exec` action (Q1: host-side commands run on the host), the marketplace runner, and TLS for adapter URLs (the CLI
+still connects with NoTls, so servers that force TLS cannot be reached yet). Reference:
+`site/src/content/docs/reference/config.md`.
 Builds on ADR 0002 (profiles, SSH tunnels, read queries).
 
 ## Context
@@ -17,6 +25,9 @@ pgbx contains **no connection code** and **stores no secrets**. A connection is 
 string or an **adapter**: an external command, in any language, that hands pgbx a connection string.
 
 ### Config: adapters and profiles are separate
+
+(Sketch in TOML; as built, the file is `config.yaml` with the same `adapters:` and `profiles:` maps plus
+`default:` and `secrets:`.)
 
 ```toml
 [adapters]                        # defined once: name -> command (any executable; the defaults are examples)

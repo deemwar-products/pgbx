@@ -1,6 +1,6 @@
 ---
 name: pgbx-skill
-description: "Zero-touch PostgreSQL backups to S3 via `pgbx` (pgbx), and a plain Postgres client without them: read queries as JSON over SSH/jump-host profiles, per-database memory, status, backup now, restore a database (also from S3 onto a new server), verify, schedule, retention. Trigger: query the database, run a select, connect over ssh, is postgres backed up, take a backup, backup before deploy, restore the db, restore on a new server, backup failing, postgres is down, disk full, wal growing, pgbx."
+description: "Zero-touch PostgreSQL backups to S3 via `pgbx` (pgbx), and a plain Postgres client without them: read queries as JSON through profiles (a connection string, or an adapter for SSH/jump hosts, AWS, GCP, Azure), per-database memory, status, backup now, restore a database (also from S3 onto a new server), verify, schedule, retention. Trigger: query the database, run a select, connect over ssh, is postgres backed up, take a backup, backup before deploy, restore the db, restore on a new server, backup failing, postgres is down, disk full, wal growing, pgbx."
 ---
 
 <!-- version: 0.5.0 -->
@@ -11,7 +11,7 @@ A natural-language front door for pgbx, the PostgreSQL extension that backs
 every database up to S3 with no setup per database. `pgbx` is the engine; this
 skill owns intent routing and recipe knowledge.
 
-pgbx is also a plain Postgres client: profiles, SSH tunnels, `pgbx query` and the per-database memory work
+pgbx is also a plain Postgres client: profiles, adapters (SSH, AWS, GCP, Azure), `pgbx query` and the per-database memory work
 against ANY Postgres, with or without the extension. Many users never turn backups on.
 
 ## Core Rules
@@ -24,9 +24,14 @@ against ANY Postgres, with or without the extension. Many users never turn backu
   colours and `psql` borders are for humans, never for parsing.
 - **Pick the server first, then pin it.** Run `pgbx profile list --json` (step-00), choose or ask
   for the profile, and pass `--profile <name>` on every `pgbx` call. Never mix servers in one task.
-- **No shell needed: use the CLI.** Read questions → `pgbx query "SELECT ..." --json` (STAT-R-7); a remote
-  server → a profile with `--ssh` (pgbx opens and reuses the tunnel itself). Prefer these over `ssh`, `psql`
-  or any shell command; never try to get around `pgbx query`'s SELECT-only guard.
+- **No shell needed: use the CLI.** Read questions → `pgbx query "SELECT ..." --json` (STAT-R-7); a server
+  behind SSH or a cloud → a profile with an adapter (`--adapter ssh target=user@host ...`; pgbx starts and stops
+  it). Prefer these over `ssh`, `psql` or any shell command; never try to get around `pgbx query`'s SELECT-only
+  guard.
+- **Never ask for, read, echo or store a secret.** Profiles hold `$VAR` references: suggest
+  `--url 'postgres://app:$PGPASSWORD@host:5432/db'` (or `'password=$PGPASSWORD'` for an adapter) and tell the
+  user to export the variable in their own shell. Never type a password into a command, a profile or chat.
+  Add or edit a profile only when the user asks for it.
 - **Discover before acting.** Run `pgbx status --json` / `pgbx doctor --json`
   (step-00) before any mutation. A `failing` database fails the next backup too.
   Read-only questions (`pgbx query`, memory, profiles) skip doctor: pick the profile and ask.
@@ -34,7 +39,8 @@ against ANY Postgres, with or without the extension. Many users never turn backu
   (doctor) means pgbx is a client on that server: answer read questions normally and do not push installing it.
   Only a backup route (backup, restore from pgbx, verify, policy) needs it — then say backups are off on this
   server and give the optional step from `next_steps` once.
-- **Never print credentials.** S3 keys live in `pgbx.credentials_file`
+- **Never print credentials.** Do not `cat` `~/.config/pgbx/config.yaml` or a secrets `.env`; use
+  `pgbx profile list --json` (it masks passwords). S3 keys live in `pgbx.credentials_file`
   (or `sec`). Read setting NAMES only; never `cat` the file or echo a key.
   `download_url()` output is a bearer link: use it, never paste it into chat.
 - **Four safety tiers** (full table in `references/workflow.md`):

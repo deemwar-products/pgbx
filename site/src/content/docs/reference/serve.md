@@ -47,7 +47,10 @@ them on. The database list, queries and health still work.
 | `--allow-safe` | off | turn on the safe-tier actions (below) |
 | `--json` | off | print the start line as JSON: `{"ok", "url", "listen", "safety", "warnings"}` |
 
-Connection flags (`--host`, `--port`, `--user`, `--admin-db`, `--ssh`, ...) work as for every command.
+Connection flags (`--url`, `--host`, `--port`, `--user`, `--admin-db`, ...) work as for every command. A
+profile with an [adapter](../../guides/adapters/) starts it on first use and keeps that one adapter running for
+the whole `serve` run (switching away and back reuses it); Ctrl-C stops it. Passwords are masked in every API
+answer.
 
 ## Safety
 

@@ -10,7 +10,7 @@ Postgres and does the backups) and the **pgbx CLI** (`pgbx`, the client you run 
 optional agent skill. See [How it works](../../concepts/how-it-works/).
 
 pgbx is set up in two places. Do the server once; do the laptop part on every machine you run `pgbx` from.
-Only want a Postgres client (profiles, SSH, read queries as JSON, agent memory) and no backups? Skip the server
+Only want a Postgres client (profiles, adapters for SSH and clouds, read queries as JSON, agent memory) and no backups? Skip the server
 part: [Use pgbx as your Postgres client](../../guides/client-only/).
 
 ## On the database server
@@ -34,9 +34,10 @@ Install the pgbx CLI, then tell it how to reach the server. `setup client` needs
 
 ```sh
 curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh
-pgbx setup client prod --ssh ops@db.example.com --user postgres     # over SSH (recommended)
-# or, when Postgres is reachable directly:
-pgbx setup client prod --host db.example.com --user postgres
+# over SSH, with the ssh example adapter the installer put in ~/.config/pgbx/adapters (needs Node 18+)
+pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres 'password=$PGPASSWORD'
+# or, when Postgres is reachable directly, a connection string:
+pgbx setup client prod --url 'postgres://postgres:$PGPASSWORD@db.example.com:5432/postgres'
 ```
 
 </TabItem>
@@ -46,28 +47,33 @@ PowerShell:
 
 ```powershell
 powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"
-pgbx setup client prod --ssh ops@db.example.com --user postgres
+pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres 'password=$PGPASSWORD'
 ```
 
 cmd.exe:
 
 ```bat
 curl -fsSL https://deemwar-products.github.io/pgbx/install.cmd -o install.cmd && install.cmd
-pgbx setup client prod --ssh ops@db.example.com --user postgres
+pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres password=$PGPASSWORD
 ```
 
-On Windows you get the pgbx CLI, `pgbx.exe` (in `%LOCALAPPDATA%\pgbx\bin`, added to your user PATH), and the
-agent skill; the extension itself always runs on the Linux database server.
+On Windows you get the pgbx CLI, `pgbx.exe` (in `%LOCALAPPDATA%\pgbx\bin`, added to your user PATH), the
+example adapters (in `%APPDATA%\pgbx\adapters`) and the agent skill; the extension itself always runs on the
+Linux database server.
 
 </TabItem>
 </Tabs>
 
-`setup client` saves a profile named `prod` (the default if it is your first), then tests it: it connects
-(through an SSH tunnel when you gave `--ssh`), and prints the Postgres version, the pgbx extension version and a
-backup status summary. If something is missing it prints the one next step. A server without the extension is
-fine: `setup client` still succeeds and says backups are off there, while queries, profiles and tunnels work
+Run `setup client` with no flags on a terminal and it asks: a connection string, or an adapter name and that
+adapter's settings. It saves a profile named `prod` (the default if it is your first), then tests it: it
+connects (starting the adapter, if there is one, and stopping it afterwards), and prints the Postgres version,
+the pgbx extension version and a backup status summary. If something is missing it prints the one next step. A server without the extension is
+fine: `setup client` still succeeds and says backups are off there, while queries, profiles and adapters work
 (see [Use pgbx as your Postgres client](../../guides/client-only/) if that is all you want). Passwords are never stored in the profile:
-put them in `~/.pgpass`. Finally it offers to install the agent skill. After that, every command takes
+it holds a reference like `$PGPASSWORD`, which pgbx reads from your environment (or your
+[secrets source](../../reference/config/#secrets)) when a command runs; write it in single quotes so your shell
+leaves it alone. Finally it offers to install the agent skill. To reach Postgres through AWS, GCP, Azure or your
+own tooling, see [Connect through SSH, AWS, GCP, Azure or your own adapter](../../guides/adapters/). After that, every command takes
 `--profile prod`, or uses the default: `pgbx status`.
 
 ## Requirements

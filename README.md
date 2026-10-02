@@ -15,7 +15,7 @@ curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh
 sudo pgbx setup server                        # S3 settings; prints the ONE restart command
 sudo systemctl restart postgresql@16-main     # (the command setup printed)
 # on your laptop:
-pgbx setup client prod --ssh ops@db.example.com --user postgres
+pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres 'password=$PGPASSWORD'
 pgbx doctor
 ```
 Windows (CLI + agent skill): `powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"`.

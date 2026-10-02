@@ -1,12 +1,12 @@
 ---
 title: Use pgbx as your Postgres client, no backups needed
-description: Profiles, SSH and jump hosts, read queries as JSON and agent memory against any Postgres, without installing the pgbx extension.
+description: Profiles, SSH and cloud adapters, read queries as JSON and agent memory against any Postgres, without installing the pgbx extension.
 sidebar: { order: 0 }
 ---
 
 You do not need backups to use pgbx. The CLI is a good everyday Postgres client on its own: it remembers your
-servers, reaches them over SSH (jump hosts included), answers read queries as JSON, and gives your AI agent a
-notebook per database. None of that needs the pgbx extension on the server, and nothing needs S3 or sudo.
+servers, reaches them directly or through an adapter (SSH with jump hosts, AWS, GCP, Azure or your own),
+answers read queries as JSON, and gives your AI agent a notebook per database. None of that needs the pgbx extension on the server, and nothing needs S3 or sudo.
 
 ## Install the CLI only
 
@@ -14,15 +14,16 @@ notebook per database. None of that needs the pgbx extension on the server, and 
 curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh
 ```
 
-On your laptop that puts `pgbx` on your PATH and installs the agent skill. Do not run `pgbx setup server`;
+On your laptop that puts `pgbx` on your PATH, copies the example adapters to `~/.config/pgbx/adapters` and
+installs the agent skill. Do not run `pgbx setup server`;
 leave the database server alone.
 
 ## Save a server as a profile
 
 ```sh
-pgbx setup client prod --host db.example.com --user app_ro          # reachable directly
-pgbx setup client prod --ssh ops@db.example.com --user postgres     # only reachable over SSH
-pgbx setup client prod --ssh ops@db.internal --ssh-jump bastion.example.com --user postgres   # through a jump host
+pgbx setup client prod --url 'postgres://app_ro:$PGPASSWORD@db.example.com:5432/shop'           # reachable directly
+pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres                      # only reachable over SSH
+pgbx setup client prod --adapter ssh target=ops@db.internal jump=bastion.example.com user=postgres   # through a jump host
 ```
 
 `setup client` saves the profile (the first one becomes the default), connects once to test it, and reports:
@@ -33,7 +34,7 @@ test:
   backups: off
   connected: true
   extension: absent
-  info: pgbx extension not installed on this server: backups are off; queries, profiles and tunnels work
+  info: pgbx extension not installed on this server: backups are off; queries, profiles and adapters work
   postgres_version: 16.4
 next_steps:
   - optional, to turn on backups: on the database server run `curl ... | sh` and then `sudo pgbx setup server`
@@ -42,23 +43,28 @@ next_steps:
 `backups: off` is not an error, and the command exits 0. The next step is optional: ignore it until you want
 backups.
 
-Profiles hold where a server is, never a password: put passwords in `~/.pgpass` or `PGPASSWORD`. Manage them
-with `pgbx profile list | show | use | remove` ([CLI reference](../../reference/cli/#profiles)).
+Profiles hold where a server is and `$VAR` references, never a password: pgbx reads `$PGPASSWORD` from your
+environment (or your [secrets source](../../reference/config/#secrets)) when a command runs, and a profile
+without a password uses `PGPASSWORD` or `~/.pgpass`. Manage them with
+`pgbx profile list | show | edit | use | remove` ([CLI reference](../../reference/cli/#profiles)). For one run
+without a profile: `--url '...'` or `PGBX_URL`.
 
 ## SSH and jump hosts
 
-With `--ssh`, pgbx runs your own `ssh` program, so your keys, your agent, `~/.ssh/config` hosts and `-J` jump
-hosts all work and pgbx never sees a key. The first command opens a tunnel in the background, later commands
-reuse it, and it closes after 10 minutes unused (`--tunnel-idle 30m` to change that).
+The ssh adapter runs your own `ssh` program, so your keys, your agent, `~/.ssh/config` hosts and jump hosts all
+work and pgbx never sees a key. It needs Node 18+ on your machine. Each command starts it (`ssh -N -L` to a free
+local port), uses the connection, and stops it when the command ends; `pgbx serve` keeps it open while it runs.
+
+Postgres on the far side is reached as the SSH host sees it: `pg_host` (default `localhost`) and `pg_port`
+(default `5432`), so a database on another machine behind the bastion works too:
 
 ```sh
-pgbx tunnel              # open it now and print the local port (point a GUI at 127.0.0.1:<port>)
-pgbx tunnel list         # open tunnels
-pgbx tunnel close prod   # close one (--all for every one)
+pgbx profile add prod --adapter ssh target=ops@bastion.example.com pg_host=10.0.3.7 user=app 'password=$PGPASSWORD'
 ```
 
-Postgres on the far side is reached as the server sees it: `--host` is the address *from the SSH host*
-(default `localhost`), so a database on another machine behind the bastion works too.
+All the keys, the AWS, GCP and Azure adapters, and how to write your own:
+[Connect through SSH, AWS, GCP, Azure or your own adapter](../adapters/). Need a port for a GUI? Run
+`ssh -N -L 5433:localhost:5432 ops@db.example.com` yourself; pgbx no longer keeps tunnels open between commands.
 
 ## Read queries as JSON
 
@@ -90,13 +96,13 @@ orders today"). Move them between machines with `pgbx memories export` and `pgbx
 
 | command | without the extension |
 |---|---|
-| `setup client`, `profile`, `tunnel`, `query`, `memories`, `skill` | works |
+| `setup client`, `profile`, `query`, `memories`, `skill`, `serve` | works |
 | `status` | exit 0: `backups: off` and the sentence above |
-| `doctor` | exit 0: an `info` line for the extension; over SSH it checks through the tunnel when the server has no pgbx CLI |
+| `doctor` | exit 0: an `info` line for the extension; through an adapter it runs the SQL checks and says that disk and log checks run on the database host |
 | `now`, `verify`, `list`, `logs`, `overview`, `schedule`, `db-restore`, ... | refuse with "pgbx extension not installed on this server: backups are off ..." |
 | `backups --from-s3`, `db-restore --from-s3` | work (they read S3 directly), if you have backups in a bucket |
 
 ## Turning backups on later
 
 Nothing to migrate: run the [server install](../../getting-started/install/#on-the-database-server) on the
-database server. Your profiles, tunnels and memory stay as they are, and `pgbx status` starts showing backups.
+database server. Your profiles, adapters and memory stay as they are, and `pgbx status` starts showing backups.

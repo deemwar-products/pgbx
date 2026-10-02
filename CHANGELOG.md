@@ -2,6 +2,24 @@
 
 ## 0.6.0 (unreleased)
 
+- **Breaking: pgbx's built-in SSH is gone** (ADR 0003). `--ssh`, `--ssh-port`, `--ssh-jump`, `--tunnel-idle` and
+  `pgbx tunnel` are removed (they now fail with a pointer to the ssh adapter); doctor / logs / diagnose /
+  setup no longer run over SSH. Use the ssh example adapter:
+  `pgbx profile add prod --adapter ssh target=ops@db1 user=app 'password=$PGPASSWORD'`.
+- **Breaking: profiles live in `config.yaml`.** A `profiles.json` is migrated automatically on first use (SSH
+  profiles become `adapter: ssh` profiles, direct ones `url:` profiles); pgbx says so once and keeps the old file
+  as `profiles.json.migrated`.
+- **Connection adapters** (ADR 0003): a profile is a connection string or an adapter, any program that hands
+  pgbx a connection string over a two-message stdin protocol (own process group / Job Object, 30 s ready timeout,
+  stop + 5 s grace, Ctrl-C stops it). One-off commands start and stop it; `pgbx serve` keeps one per connection.
+  Examples for ssh, aws (SSM), gcp (Cloud SQL Auth Proxy) and azure in `adapters/`, shipped in the release
+  archives and copied to `<config dir>/adapters` by the installers.
+- **`config.yaml`** (0600) with `default`, `secrets`, `adapters`, `profiles`; `pgbx profile edit`;
+  `--adapter` / `--adapter-command` / `key=value` settings on `profile add`; `--url` / `PGBX_URL` for one run.
+- **`$VAR` / `${VAR}` references** anywhere in a profile or url, expanded at run time (`$$` = `$`) from the
+  environment, then the `secrets:` source (a .env file or a handler command run as `CMD NAME`). pgbx stores no
+  secrets: literal passwords are refused, and every output masks passwords and expanded secrets.
+  `pg_restore` gets the password through its environment.
 - **Resource caps** (ADR 0001 §3): pg_dump / pg_restore run at `pgbx.job_nice` (10) and, on Linux, IO priority
   `pgbx.job_ionice` (best-effort-7), set before exec; their connections are named `pgbx_dump` / `pgbx_restore` /
   `pgbx_verify`.

@@ -43,33 +43,41 @@ Postgres servers like any client and calls the extension's SQL for you: `pgbx st
 If you work with several servers, save each one as a **profile** and pick it with `--profile`:
 
 ```sh
-pgbx profile add prod --host db.prod.example.com --user ops
-pgbx status --profile prod --db shop
+pgbx profile add prod --url 'postgres://ops:$PGPASSWORD@db.prod.example.com:5432/shop'
+pgbx status --profile prod
 ```
 
-Profiles store where a server is, never passwords or S3 keys (use `~/.pgpass` / `PGPASSWORD`, and a
-credentials file for S3). See [CLI reference](../../reference/cli/#profiles).
+Profiles live in one file, `~/.config/pgbx/config.yaml`, and hold `$VAR` references, never passwords or S3
+keys: pgbx reads `$PGPASSWORD` from your environment (or your secrets source) when a command runs. S3 keys stay
+in a credentials file. See [Configuration](../../reference/config/).
 
-### Servers you reach over SSH
+### Servers behind SSH or a cloud: adapters
 
-Many database servers only accept connections from inside their network. Add `--ssh` to the profile and the
-CLI goes through SSH for you, using your normal `ssh` program (your keys, agent, `~/.ssh/config` and jump
-hosts all work; pgbx never sees a key):
+Many database servers only accept connections from inside their network, or through cloud tooling. pgbx has
+no connection code of its own for that. A profile names an **adapter** instead: any program that hands pgbx a
+connection string. Examples ship for SSH, AWS (SSM), GCP (Cloud SQL Auth Proxy) and Azure, and you can write
+your own in any language:
 
 ```sh
-pgbx profile add prod --ssh ops@db.prod.example.com --user postgres
-pgbx status --profile prod --db shop      # first command opens the tunnel
-pgbx query "SELECT now()" --profile prod  # later commands reuse it
+pgbx profile add prod --adapter ssh target=ops@db.prod.example.com user=postgres 'password=$PGPASSWORD'
+pgbx status --profile prod                  # starts the adapter, uses it, stops it
+pgbx query "SELECT now()" --profile prod    # the next command starts it again
 ```
 
 ```
- pgbx CLI ──▶ 127.0.0.1:<free port> ══ ssh -L ══▶ db server ──▶ Postgres (localhost:5432)
-               └─ kept open by a small background pgbx helper; closes after 10 minutes unused
+ pgbx CLI ── start (stdin) ──▶ adapter (e.g. node ssh-adapter.js)
+          ◀── {"url": ..., "state": "ready"} (one stdout line)
+                                 └─ ssh -N -L 127.0.0.1:<free port> ══▶ db server ──▶ Postgres
+ pgbx CLI ── SQL to the url ──▶ 127.0.0.1:<free port>
+ pgbx CLI ── stop ──▶ adapter exits; pgbx kills what is left of its process group
 ```
 
-Commands that need the machine itself (`doctor`, `logs`, `diagnose`, `setup server`) run there as
-`ssh ops@db... pgbx <command> --json`, so the server needs the pgbx CLI too (the install one-liner puts it
-there). Without it, `doctor` checks what it can through the tunnel instead. `pgbx tunnel list` shows open tunnels; `pgbx tunnel close prod` closes one.
+The URL stays in pgbx's memory and every output masks its password. `pgbx serve` keeps one adapter running
+for its whole run. See [Connect through SSH, AWS, GCP, Azure or your own adapter](../../guides/adapters/).
+
+Commands that need the machine itself (`diagnose`, `setup server`) run on the database host: with an adapter
+profile pgbx says so instead of guessing. `doctor` runs its SQL checks through the adapter and leaves the disk
+and log checks to a `pgbx doctor` on the host.
 
 ### Looking around without a shell
 
@@ -98,7 +106,7 @@ See [For AI agents](../../agents/skill/).
 | part | runs on | needs Postgres up? |
 |---|---|---|
 | pgbx extension | the database server, inside Postgres | yes (it *is* part of Postgres) |
-| pgbx CLI | anywhere: laptop, CI, the server (also over SSH) | for most commands; not for the ones below |
+| pgbx CLI | anywhere: laptop, CI, the server (reaching Postgres directly or through an adapter) | for most commands; not for the ones below |
 | agent skill | wherever the agent runs | no, it only calls the CLI |
 
 ## When Postgres is down

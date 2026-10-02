@@ -14,10 +14,15 @@ With Postgres up, `pgbx` calls the pgbx extension's SQL. With Postgres down, `pg
 |---|---|
 | `--json` | one JSON object on stdout |
 | `--profile NAME` | a saved server (see [Profiles](#profiles)); also `PGBX_PROFILE`; else the default profile |
-| `--db X` | the database to act on |
-| `--host` / `--port` / `--user` | `/var/run/postgresql`, `5432`, `postgres` (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` honoured) |
+| `--url URL` | a connection string for this run, no profile (`$VAR`s expanded); also `PGBX_URL` |
+| `--db X` | the database to act on (default: the one in the connection string, else `postgres`) |
+| `--host` / `--port` / `--user` | direct, no profile: `/var/run/postgresql`, `5432`, `postgres` (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` honoured) |
 | `--admin-db` | `postgres` |
 | `--timeout SECS` | for `--wait` |
+
+Which connection a command uses: `--url` > `--profile` > `--host`/`--port` > `PGBX_URL` > `PGBX_PROFILE` > the
+default profile > `PGHOST`/`PGPORT`/`PGUSER` and the defaults above. A connection string without a password
+uses `PGPASSWORD`. Output never shows a password (`postgres://user:***@...`).
 
 `--time` must carry a UTC offset (`+00`, `Z`). Policy commands show the current value when given no arguments.
 Exit code is non-zero on failure.
@@ -40,8 +45,8 @@ Every `--json` reply is one object with at least:
 | `list [--db X]` | readonly | `database`, `database_backups[]` (`id, taken_at, age, trigger, size, s3_key`) |
 | `backups --from-s3 --db X <s3 flags>` | readonly | `prefix`, `backups[]` (`key, taken_at, bytes`), newest first |
 | `overview` | readonly | `databases[]` (rows of `overview()`) |
-| `doctor` | readonly | `healthy`, `postgres_up`, `checks[]` (`name, ok, detail, fix`); `diagnosis` when Postgres is down |
-| `diagnose [--log F] [--pgdata DIR]` | readonly | `postgres`, `probable_cause`, `evidence[]`, `steps[]`, `facts` |
+| `doctor` | readonly | `healthy`, `postgres_up`, `checks[]` (`name, ok, detail, fix`); `diagnosis` when Postgres is down (not through an adapter: an `info` row says to run it on the host) |
+| `diagnose [--log F] [--pgdata DIR]` | readonly | `postgres`, `probable_cause`, `evidence[]`, `steps[]`, `facts`; on the database host only (refused with an adapter profile) |
 | `ui [--listen 127.0.0.1:8432] [--strict]` | readonly | serves the read-only [audit UI](../../guides/audit-ui/); `GET` only |
 | `serve [--listen 127.0.0.1:0] [--no-open] [--allow-safe]` | readonly / safe (`--allow-safe`) | the local [web app](../serve/): overview, database detail, restore helper, read-only query, health; per-run token; safe actions only with `--allow-safe`; start line: `url`, `listen`, `warnings` |
 | `logs [--lines N]` | readonly | `recent_failures[]` |
@@ -66,9 +71,9 @@ Every `--json` reply is one object with at least:
 | `memories export [FILE\|-] [--db D]` | readonly | `file`, `connection`, `databases[]`, `files`; one JSON bundle of `~/pgbx/<connection>/<db>/{memories,tables}.md` |
 | `memories import FILE [--as C] [--overwrite]` | safe | `written[]`, `unchanged[]`, `conflicts[]` (differing local files are kept unless `--overwrite`) |
 | `memories path` | readonly | `root`, `connection`, `dir` |
-| `tunnel [open]` / `tunnel list` / `tunnel close NAME\|--all` | readonly | `local_port`, `connect`, `tunnel` / `tunnels[]` / `closed[]` |
-| `profile add NAME [flags]` | safe | `profile` (`name, default, settings`), `replaced`, `file` |
-| `profile list` / `profile show NAME` | readonly | `default`, `profiles[]` / `profile` |
+| `profile add NAME --url URL \| --adapter A [--adapter-command CMD] [key=value ...]` | safe | `profile` (`name, default, connection, adapter, runs, settings`), `replaced`, `file`, `notices` |
+| `profile edit NAME [key=value \| key= \| --url \| --adapter \| --s3-...]` | safe | same as `add` |
+| `profile list` / `profile show NAME` | readonly | `default`, `profiles[]`, `adapters`, `secrets` / `profile` (passwords masked) |
 | `profile remove NAME` / `profile use NAME` | safe | `removed` / `default` |
 | `--version` | — | `{"ok": true, "version": "..."}` |
 
@@ -82,60 +87,54 @@ Every `--json` reply is one object with at least:
 | `--server-name S` | the old server's folder (`pgbx.server_name`) |
 | `--credentials-file F` | `access_key_id=` / `secret_access_key=` lines; never printed |
 
-`db-restore --from-s3` creates `--into` (refusing if it exists) on the server given by `--host/--port/--user`,
-then streams the dump into `pg_restore --no-owner`, resuming downloads with HTTP Range.
+`db-restore --from-s3` creates `--into` (refusing if it exists) on the server of the current connection
+(profile, `--url` or `--host/--port/--user`), then streams the dump into `pg_restore --no-owner`, resuming
+downloads with HTTP Range. `pg_restore` gets the password through its environment, never its arguments.
 Example: [Disaster recovery](../../guides/disaster-recovery/).
 
 ## Profiles
 
-A profile is a named server, so you do not retype `--host/--port/--user` and the S3 flags:
+A profile is a named connection, so you do not retype it and the S3 flags. It is either a connection string or
+an adapter (a program that hands pgbx a connection string: SSH, AWS, GCP, Azure or your own; see
+[the adapters guide](../../guides/adapters/)). All of it lives in `config.yaml`: see
+[Configuration](../config/).
 
 ```sh
-pgbx profile add prod --host db.prod.example.com --port 5432 --user ops --admin-db postgres \
+pgbx profile add prod --url 'postgres://ops:$PGPASSWORD@db.prod.example.com:5432/shop' \
   --s3-endpoint https://s3.eu-central-1.amazonaws.com --s3-bucket my-backups --s3-region eu-central-1 \
   --server-name db-prod-1 --credentials-file ~/.config/pgbx/prod.credentials
-pgbx profile add local --host localhost
+pgbx profile add bastion --adapter ssh target=ops@bastion.example.com pg_host=10.0.3.7 user=app 'password=$PGPASSWORD'
+pgbx profile add corp --adapter corp --adapter-command '/usr/local/bin/corp-pg' env=prod   # your own adapter
+pgbx profile edit bastion pg_port=6432 jump=     # set one setting, remove another
 pgbx profile use prod            # the default when no --profile is given (the first profile added is the default)
-pgbx status --profile local --db shop
-PGBX_PROFILE=local pgbx list --db shop
+pgbx status --profile bastion --db shop
+PGBX_PROFILE=bastion pgbx list --db shop
 pgbx profile list --json
-pgbx profile remove local
+pgbx profile remove corp
 ```
 
-- Fields: `host`, `port`, `user`, `admin-db`, `s3-endpoint`, `s3-bucket`, `s3-region`, `server-name`,
-  `credentials-file`, `ssh`, `ssh-port`, `ssh-jump`, `tunnel-idle` (each is also a flag). `add` on an existing
-  name replaces it.
-- Precedence for each value: **flag > environment** (`PGHOST`, `PGPORT`, `PGUSER`) **> profile > built-in
-  default**. With no profile saved and none asked for, behaviour is unchanged.
-- Chosen by `--profile NAME`, else `PGBX_PROFILE`, else the default. Every `--json` reply then carries
-  `profile_used`. An unknown name is an error, never a silent fallback.
-- Stored in `~/.config/pgbx/profiles.json` (`$XDG_CONFIG_HOME/pgbx`; `%APPDATA%\pgbx` on Windows;
-  `PGBX_CONFIG_DIR` overrides), mode 0600.
-- **Never stores passwords or S3 keys.** Passwords: `~/.pgpass` or `PGPASSWORD`. S3 keys: the
-  `--credentials-file` (only its path is saved).
+- `--url URL` or `--adapter NAME` plus `key=value` settings for that adapter (free-form: the adapter decides
+  what it reads). `--host/--port/--user` on `add` are a shortcut for a `--url`. pgbx's own keys: `admin-db`,
+  `s3-endpoint`, `s3-bucket`, `s3-region`, `server-name`, `credentials-file` (each also a flag) and
+  `ready_timeout` (`ready_timeout=60s`).
+- `--adapter-command CMD` defines the adapter in `config.yaml` and the reply says exactly what it will run.
+  Without it, `--adapter ssh` (or `aws`, `gcp`, `azure`) registers the example the installer copied to
+  `~/.config/pgbx/adapters` (`PGBX_ADAPTERS_DIR` overrides).
+- **Never stores a secret.** Write `$VAR` references (single quotes in the shell); pgbx expands them when a
+  command runs, from the environment, then the [secrets source](../config/#secrets). A literal password in a
+  url, or in a setting named like `password`, `secret` or `token`, is refused. `show`/`list` mask passwords.
+- Chosen by `--profile NAME`, else `PGBX_PROFILE`, else the default (see the order under
+  [Common flags](#common-flags)). Every `--json` reply then carries `profile_used`. An unknown name is an error,
+  never a silent fallback.
+- An adapter starts on the command's first connection and stops when the command ends; Ctrl-C stops it too.
+  `pgbx serve` keeps one per connection for its whole run.
+- With an adapter profile, `diagnose` and `setup server` refuse and say to run them on the database host;
+  `doctor` runs its SQL checks through the adapter.
+- A `profiles.json` from pgbx 0.5 is moved into `config.yaml` on first use (SSH profiles become `adapter: ssh`);
+  the old file is kept as `profiles.json.migrated`.
 
-## SSH (`--ssh`)
-
-| flag / profile field | meaning |
-|---|---|
-| `--ssh user@host` | reach the server through SSH (a `~/.ssh/config` Host name works too) |
-| `--ssh-port N`, `--ssh-jump J` | `ssh -p`, `ssh -J` |
-| `--tunnel-idle 10m` | close the shared tunnel after this long unused (`30s`, `10m`, `1h`) |
-| `--host`, `--port` | where Postgres listens **as seen from the SSH host** (default `localhost:5432`) |
-
-- Uses the system `ssh` (OpenSSH, also on Windows) with `BatchMode=yes`: keys, agent, `~/.ssh/config` and
-  ProxyJump are ssh's; pgbx never handles a key or a password prompt.
-- Postgres commands go through `ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L
-  127.0.0.1:<free port>:<pg host>:<pg port>`, owned by a detached pgbx helper. Later commands for the same
-  profile reuse it (the helper is alive and the port answers) and refresh its idle timer; otherwise a new one
-  starts. A lock file stops two commands starting two. State: `~/.cache/pgbx/tunnels/<profile>.json`
-  (`$XDG_CACHE_HOME`; `%LOCALAPPDATA%\pgbx\tunnels` on Windows; `PGBX_STATE_DIR` overrides), mode 0600.
-- `pgbx tunnel` opens (or reuses) the tunnel and prints the local port, for psql or a GUI.
-  `pgbx tunnel list` / `close NAME` / `close --all`.
-- `doctor`, `logs`, `diagnose` and `setup` run on the host: `ssh target pgbx <command> ... --json` (setup as
-  `sudo -n`), output and exit code relayed, plus `remote`. If pgbx is not installed there, the error gives the
-  install one-liner.
-- `PGBX_SSH` names another ssh binary or wrapper (the test suite uses it to add `-F config`).
+The built-in SSH of 0.5 (`--ssh`, `--ssh-port`, `--ssh-jump`, `--tunnel-idle`, `pgbx tunnel`) is gone; those
+flags now fail with a pointer to the ssh adapter.
 
 ## `pgbx query`
 

@@ -26,8 +26,8 @@
     </route>
 
     <route id="query" mode="read-only">
-      <when>how big is the database, table sizes, how many connections, run a select, run a query, query the database, how many rows, show me the tables, which tables, connect to the database, connect over ssh, through the jump host, via the bastion, postgres client, pgbx query</when>
-      <goal>Answer a read question with `pgbx query` JSON through the profile (ssh tunnel included); works without the pgbx extension.</goal>
+      <when>how big is the database, table sizes, how many connections, run a select, run a query, query the database, how many rows, show me the tables, which tables, connect to the database, connect over ssh, through the jump host, via the bastion, through ssm, cloud sql, azure bastion, postgres client, pgbx query</when>
+      <goal>Answer a read question with `pgbx query` JSON through the profile (adapter included: ssh, aws, gcp, azure or the user's own); works without the pgbx extension.</goal>
       <steps>
         <step ref="steps/step-00-preflight.md">Pick the profile; read the database memory. No doctor.</step>
         <step ref="status.md">STAT-R-7.</step>
