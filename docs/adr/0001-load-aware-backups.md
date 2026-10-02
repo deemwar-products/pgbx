@@ -137,12 +137,18 @@ The worker tags its own children `application_name=pgbx_dump`/`pgbx_restore` (PG
   `pg_restore -j` / `pg_dump -j` stay unused (they need directory format anyway).
 - **Compression:** keep `pgbx.dump_compression` default; under a forced (deadline) run or when the gate saw load,
   use `zstd:1` / gzip 1. Never use zstd `workers=` (multi-threaded) — one core max.
-- **Upload bandwidth:** `pgbx.upload_kbps` (default **0** = unlimited) — token bucket in `upload_stream` /
+- **Upload bandwidth:** `pgbx.upload_kbps` (KiB/s, like Barman's `bandwidth_limit`; default **0** = unlimited) — token bucket in `upload_stream` /
   `download_resumable` (`src/transfer.rs:56`, `:126`) sleeping between 16 MiB parts / reads. Back-pressure on the
   pipe slows pg_dump naturally.
-- **Never block app writes:** pg_dump runs with `PGOPTIONS='-c lock_timeout=5s -c statement_timeout=0
-  -c idle_in_transaction_session_timeout=0'`: the initial lock acquisition fails fast if a migration holds
-  AccessExclusive, the job is re-queued with backoff (counts toward the deadline) instead of queueing behind DDL.
+- **Never block app writes:** pg_dump runs with `--lock-wait-timeout=<pgbx.dump_lock_timeout>` (5s). Not
+  `PGOPTIONS='-c lock_timeout=…'`: pg_dump itself runs `SET lock_timeout = 0` (and statement_timeout,
+  idle_in_transaction_session_timeout = 0) on connect, which would override it; `--lock-wait-timeout` puts a
+  statement_timeout around its `LOCK TABLE`s instead. `PGOPTIONS='-c lc_messages=C'` keeps the error recognisable.
+  The initial lock acquisition fails fast if a migration holds
+  AccessExclusive, the job is re-queued with backoff (counts toward the deadline) instead of queueing behind DDL:
+  `params.deferred_until`, `deferrals`, `lock_timeouts`, `defer_reason='lock_timeout'`, `deadline`. A job that was
+  deferred and reached its deadline runs `forced` (`--lock-wait-timeout=<pgbx.dump_lock_timeout_forced>`,
+  `pgbx.dump_compression_busy`); if that still times out it fails and alerts.
   Its ongoing ACCESS SHARE locks still block DDL; documented, and `doctor()` reports a running dump older than 1h.
   pg_restore into the NEW database: `lock_timeout` irrelevant; `synchronous_commit=off` to cut WAL fsync pressure.
 - **Measuring overhead:** `bench/load_overhead.sh` — pgbench `-c 16 -T 300` against a scale-50 DB, run three
@@ -223,7 +229,7 @@ the server value is a ceiling where noted.
 | `pgbx.overrun_max_gap` | 1.5 | 1.0-10 (× interval) | yes | skipping never stretches RPO by more than half an interval |
 | `pgbx.coalesce_manual` | on | on/off | no | spamming backup_now() costs one dump |
 | `pgbx.dump_compression` | `auto` (exists) | | no | |
-| `pgbx.dump_compression_busy` | `zstd:1` / gzip 1 | | no | cheaper when forced under load |
+| `pgbx.dump_compression_busy` | `auto` = `zstd:1` / gzip 1 | | no | cheaper when forced under load |
 | `pgbx.upload_kbps` | 0 (unlimited) | 0-10^7 | no | uploads already back-pressure pg_dump |
 | `pgbx.download_kbps` | 0 | 0-10^7 | no | |
 | `pgbx.dump_lock_timeout` | 5s | 0-10min | no | never queue behind DDL |

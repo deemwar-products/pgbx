@@ -155,6 +155,41 @@ echo "  $(P -d scoped -c "SELECT pgbx.set_data_scope()")"
 check "reset: every row is back" "$(scoped_round r3)" "100/500/50/30"
 check "admin may set the scope" "$(AS admin_user -d scoped -c "SELECT left(pgbx.set_data_scope(), 22)")" "backups keep every tab"
 
+echo "## 16. resource caps: niced pg_dump, never queued behind DDL (lock_timeout -> retried later)"
+P -c "ALTER SYSTEM SET pgbx.dump_lock_timeout = '10s'" -c "ALTER SYSTEM SET pgbx.doctor_long_job = '2s'" -c "SELECT pg_reload_conf()" >/dev/null
+P -c "DROP DATABASE IF EXISTS locked WITH (FORCE)" -c "CREATE DATABASE locked"
+for _ in $(seq 120); do st=$(P -d locked -c "SELECT state FROM pgbx.history WHERE kind='backup' AND trigger='first'" 2>/dev/null); case "$st" in done|failed) break;; esac; sleep 1; done
+P -d locked -c "CREATE TABLE t AS SELECT g AS id FROM generate_series(1,1000) g"
+# a migration holds ACCESS EXCLUSIVE on t for 25 s
+docker compose -f compose.test.yml exec -T db psql -U postgres -d locked -qAt -c "BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(25); COMMIT;" >/dev/null 2>&1 & holder=$!
+sleep 2; id=$(P -d locked -c "SELECT pgbx.backup_now()")
+# the pg_dump waiting for its lock: nice / IO class as set between fork and exec (/proc: the image has no ps)
+caps=$(docker compose -f compose.test.yml exec -T db sh -c 'for _ in $(seq 150); do for p in /proc/[0-9]*; do
+  [ "$(cat $p/comm 2>/dev/null)" = pg_dump ] && { echo "$(cut -d" " -f19 $p/stat)|$(ionice -p ${p#/proc/})"; exit 0; }; done; sleep 0.1; done')
+check "pg_dump runs at nice 10" "${caps%%|*}" 10
+check "pg_dump IO class best-effort 7" "${caps#*|}" "best-effort: prio 7"
+check "its connection is tagged pgbx_dump" "$(P -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='pgbx_dump'")" 1
+sleep 3; check "doctor(): long_running_job sees it" "$(P -c "SELECT ok||' '||(detail LIKE '%pgbx_dump in locked%') FROM pgbx.doctor() WHERE name='long_running_job'")" "false true"
+for _ in $(seq 30); do r=$(P -d locked -c "SELECT state||' '||coalesce(params->>'lock_timeouts','-')||' '||(params ? 'deferred_until') FROM pgbx.history WHERE id=$id"); [ "$r" = "queued 1 true" ] && break; sleep 1; done
+check "lock timeout re-queues the backup (not failed)" "$r" "queued 1 true"
+check "logged once" "$(docker compose -f compose.test.yml logs db 2>&1 | grep -c "locked: backup #$id could not get its table locks")" 1
+wait $holder
+for _ in $(seq 120); do r=$(P -d locked -c "SELECT state FROM pgbx.history WHERE id=$id"); case "$r" in done|failed) break;; esac; sleep 1; done
+check "runs after the lock is released" "$r" done
+check "not forced (deadline far away)" "$(P -d locked -c "SELECT coalesce(params->>'forced','no') FROM pgbx.history WHERE id=$id")" no
+check "doctor(): long_running_job ok again" "$(P -c "SELECT ok FROM pgbx.doctor() WHERE name='long_running_job'")" t
+# deadline reached while DDL still holds the lock (max_defer = 0): one forced try with dump_lock_timeout_forced, then failed + alert
+P -c "ALTER SYSTEM SET pgbx.max_defer = 0" -c "ALTER SYSTEM SET pgbx.dump_lock_timeout = '2s'" -c "ALTER SYSTEM SET pgbx.dump_lock_timeout_forced = '3s'" -c "SELECT pg_reload_conf()" >/dev/null
+docker compose -f compose.test.yml exec -T -u postgres db sh -c ': > /var/lib/postgresql/alerts.log'
+docker compose -f compose.test.yml exec -T db psql -U postgres -d locked -qAt -c "BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(30); COMMIT;" >/dev/null 2>&1 & holder=$!
+sleep 2; id=$(P -d locked -c "SELECT pgbx.backup_now()")
+for _ in $(seq 60); do r=$(P -d locked -c "SELECT state FROM pgbx.history WHERE id=$id"); case "$r" in done|failed) break;; esac; sleep 1; done
+check "at the deadline: one forced try, then failed" "$(P -d locked -c "SELECT state||' '||coalesce(params->>'forced','-')||' '||(error LIKE '%LOCK TABLE%') FROM pgbx.history WHERE id=$id")" "failed true true"
+sleep 1; check "and alerted" "$(docker compose -f compose.test.yml exec -T db cat /var/lib/postgresql/alerts.log | grep -c "\"job_id\":$id,")" 1
+wait $holder
+P -c "ALTER SYSTEM RESET pgbx.max_defer" -c "ALTER SYSTEM RESET pgbx.dump_lock_timeout_forced" -c "SELECT pg_reload_conf()" >/dev/null
+P -c "ALTER SYSTEM RESET pgbx.dump_lock_timeout" -c "ALTER SYSTEM RESET pgbx.doctor_long_job" -c "SELECT pg_reload_conf()" >/dev/null
+
 echo "## 17. bandwidth caps (token bucket): pgbx.upload_kbps / download_kbps = 2048 (2 MiB/s)"
 P -c "ALTER SYSTEM SET pgbx.upload_kbps = 2048" -c "ALTER SYSTEM SET pgbx.download_kbps = 2048" -c "SELECT pg_reload_conf()" >/dev/null
 P -c "DROP DATABASE IF EXISTS big_capped WITH (FORCE)"

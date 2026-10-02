@@ -1,6 +1,6 @@
 [package]
 name = "pgbx"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [lib]
@@ -21,6 +21,7 @@ pg_bench = ["dep:pgrx-bench"]
 [dependencies]
 pgrx = "=0.19.3"
 postgres = "0.19"
+libc = "0.2"
 rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls"] }
 croner = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

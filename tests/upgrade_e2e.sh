@@ -10,9 +10,11 @@
 #    anyone else's is never touched.
 # 3. migration from the old product (only when PGBX_OLD_IMAGE names an image of it, e.g. the 0.4-era test image):
 #    its per-database dumps are restored with `pgbx db-restore --from-s3`, and its extension can be dropped.
+# 5. real schema update (only when PGBX_PREV_IMAGE names an image of the previous pgbx release, e.g. 0.5.0):
+#    its databases are updated by sql/pgbx--<prev>--<current>.sql and end up identical to a fresh install.
 set -u
 cd "$(dirname "$0")/../docker"
-NEW=${PGBX_NEW_IMAGE:-pgbx:test}; OLD=${PGBX_OLD_IMAGE:-}
+NEW=${PGBX_NEW_IMAGE:-pgbx:test}; OLD=${PGBX_OLD_IMAGE:-}; PREV=${PGBX_PREV_IMAGE:-}
 OLDNAME="pgbackrest""x"   # the product's previous name (split so a grep for it stays clean)
 C=pgbx-upgrade; VOL=pgbx-upgrade-data; SERVER="pgbx-upgrade-$(date -u +%Y%m%d%H%M%S)"
 : "${S3_ENDPOINT:?set S3_ENDPOINT (as for compose.test.yml)}" "${S3_BUCKET:?}" "${S3_REGION:?}"
@@ -96,6 +98,29 @@ if [ -n "$OLD" ]; then
   for _ in $(seq 30); do [ -n "$(ver shop)" ] && break; sleep 1; done
   check "pgbx present in the migrated database" "$(ver shop)" "$want"
   id=$(P -d shop -c "SELECT pgbx.backup_now()"); check "pgbx backup after migration" "$(wait_job shop "$id" pgbx)" done
+fi
+
+if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
+  echo "## 5. previous release ($PREV) -> $want: the update script"
+  cleanup; start "$PREV" pgbx || { echo "previous server not up"; exit 1; }
+  for _ in $(seq 60); do [ -n "$(ver postgres)" ] && break; sleep 2; done
+  P -c "CREATE DATABASE prev" >/dev/null
+  for _ in $(seq 60); do [ -n "$(ver prev)" ] && break; sleep 1; done
+  old=$(ver prev); echo "  databases at $old"
+  docker stop -t 60 "$C" >/dev/null
+  start "$NEW" pgbx || { echo "server not up"; exit 1; }
+  for _ in $(seq 60); do [ "$(ver prev)" = "$want" ] && [ "$(ver template1)" = "$want" ] && break; sleep 1; done
+  check "worker updated prev $old -> $want" "$(ver prev)" "$want"
+  check "template1 updated" "$(ver template1)" "$want"
+  P -c "CREATE DATABASE fresh" >/dev/null
+  for _ in $(seq 60); do [ -n "$(ver fresh)" ] && break; sleep 1; done
+  defs="SELECT md5(string_agg(pg_get_functiondef(p.oid), '' ORDER BY p.proname, p.oid::regprocedure::text))
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pgbx'"
+  check "updated functions = fresh install" "$(P -d prev -c "$defs")" "$(P -d fresh -c "$defs")"
+  check "doctor() has long_running_job after the update" "$(P -c "SELECT count(*) FROM pgbx.doctor() WHERE name='long_running_job'")" 1
+  id=$(P -d prev -c "SELECT pgbx.backup_now()"); check "backup after the update" "$(wait_job prev "$id" pgbx)" done
+else
+  echo "## 5. skipped (set PGBX_PREV_IMAGE to an image of the previous pgbx release to test the update script)"
 fi
 
 echo "== upgrade_e2e: $pass passed, $fail failed (S3 folder $SERVER)"

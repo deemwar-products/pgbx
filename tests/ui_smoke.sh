@@ -23,8 +23,8 @@ check() { if [ "$2" = "$3" ]; then echo "  PASS $1"; pass=$((pass+1)); else echo
 for _ in $(seq 30); do [ "$(P "SELECT count(*) FROM pgbx.server_overview" 2>/dev/null)" -ge 1 ] 2>/dev/null && break; sleep 1; done
 P "CREATE DATABASE shop" >/dev/null; sleep 5
 
-echo "--- schema 0.5.0"
-check "extension version" "$(P "SELECT extversion FROM pg_extension WHERE extname='pgbx'")" "0.5.0"
+echo "--- schema 0.6.0"
+check "extension version" "$(P "SELECT extversion FROM pg_extension WHERE extname='pgbx'")" "0.6.0"
 check "history.who exists" "$(P "SELECT count(*) FROM information_schema.columns WHERE table_name='history' AND column_name='who'")" "1"
 check "audit_days GUC" "$(P "SHOW pgbx.audit_days")" "30"
 

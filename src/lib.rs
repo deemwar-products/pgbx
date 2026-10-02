@@ -56,6 +56,18 @@ pub static ADMIN_DB: GucSetting<Option<CString>> = GucSetting::<Option<CString>>
 // bandwidth caps per job (ADR 0001 §3)
 pub static UPLOAD_KBPS: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub static DOWNLOAD_KBPS: GucSetting<i32> = GucSetting::<i32>::new(0);
+// resource caps on pg_dump / pg_restore (ADR 0001 §3)
+pub static JOB_NICE: GucSetting<i32> = GucSetting::<i32>::new(10);
+pub static JOB_IONICE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"best-effort-7"));
+pub static DUMP_COMPRESSION_BUSY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"auto"));
+pub static DUMP_LOCK_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(5_000); // ms
+pub static DUMP_LOCK_TIMEOUT_FORCED: GucSetting<i32> = GucSetting::<i32>::new(60_000); // ms
+pub static RESTORE_SYNCHRONOUS_COMMIT: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static DOCTOR_LONG_JOB: GucSetting<i32> = GucSetting::<i32>::new(3600); // s
+// deferring a backup (lock timeout now, the load gate later): backoff and the deadline it never passes
+pub static DEFER_BACKOFF: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"1,2,4,8,15"));
+pub static MAX_DEFER: GucSetting<i32> = GucSetting::<i32>::new(4 * 3600); // s
+pub static MAX_DEFER_FIRST: GucSetting<i32> = GucSetting::<i32>::new(15 * 60); // s
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.s3_endpoint", c"S3 endpoint URL", c"e.g. https://hel1.your-objectstorage.com", &S3_ENDPOINT, GucContext::Sighup, GucFlags::default());
@@ -72,6 +84,16 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(c"pgbx.poll_seconds", c"How often the worker looks for new databases and due/queued jobs", c"", &POLL_SECONDS, 1, 3600, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.upload_kbps", c"Upload bandwidth cap per job in KiB/s", c"0 = unlimited", &UPLOAD_KBPS, 0, 10_000_000, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.download_kbps", c"Download (restore) bandwidth cap per job in KiB/s", c"0 = unlimited", &DOWNLOAD_KBPS, 0, 10_000_000, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.job_nice", c"CPU niceness of pg_dump / pg_restore", c"0-19; never raises priority above the worker's own", &JOB_NICE, 0, 19, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.job_ionice", c"IO priority of pg_dump / pg_restore (Linux)", c"none, idle, or best-effort-0 .. best-effort-7; anything else means best-effort-7", &JOB_IONICE, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.dump_compression_busy", c"pg_dump --compress for a backup forced to run while the server is busy", c"auto (default: zstd:1 with pg_dump 16+, gzip level 1 before), or a pg_dump --compress value", &DUMP_COMPRESSION_BUSY, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.dump_lock_timeout", c"How long pg_dump waits for its table locks before the backup is retried later", c"0 = wait forever; never queue behind DDL", &DUMP_LOCK_TIMEOUT, 0, 600_000, GucContext::Sighup, GucFlags::UNIT_MS);
+    GucRegistry::define_int_guc(c"pgbx.dump_lock_timeout_forced", c"pg_dump lock wait once a deferred backup reached its deadline", c"if it still times out, the backup fails and alerts", &DUMP_LOCK_TIMEOUT_FORCED, 0, 600_000, GucContext::Sighup, GucFlags::UNIT_MS);
+    GucRegistry::define_bool_guc(c"pgbx.restore_synchronous_commit", c"synchronous_commit for pg_restore", c"off by default: the target is a new database, a crash just means restoring again", &RESTORE_SYNCHRONOUS_COMMIT, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.doctor_long_job", c"doctor() warns about a backup/restore process running longer than this", c"0 = never", &DOCTOR_LONG_JOB, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_string_guc(c"pgbx.defer_backoff", c"Minutes between retries of a deferred backup", c"comma list, each 1-60; the last value repeats", &DEFER_BACKOFF, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.max_defer", c"A deferred backup runs anyway this long after it was queued", c"capped at the schedule interval; backups are never skipped", &MAX_DEFER, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_int_guc(c"pgbx.max_defer_first", c"max_defer for a new database's first backup", c"", &MAX_DEFER_FIRST, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
 
     // Only register the worker when loaded at server start (shared_preload_libraries),
     // not when a backend loads the library for CREATE EXTENSION.
@@ -489,6 +511,23 @@ BEGIN
                      THEN 'consider max_slot_wal_keep_size (e.g. ''10GB'') so a dead consumer cannot fill the disk' END
            ELSE '(destructive, needs human approval: a dropped slot cannot be recreated at the same position and its consumer must be rebuilt) drop the slot only if its consumer is gone for good: SELECT pg_drop_replication_slot(''<name>''); '
                 || 'and set max_slot_wal_keep_size (e.g. ''10GB'') so a dead consumer cannot fill the disk' END;
+    RETURN NEXT;
+
+    -- a running dump holds ACCESS SHARE on every table it reads until it ends: DDL on them waits for it
+    name := 'long_running_job';
+    lim := make_interval(secs => coalesce((SELECT s.setting::int FROM pg_settings s WHERE s.name = 'pgbx.doctor_long_job'), 3600));
+    SELECT string_agg(format('%s in %s for %s (pid %s)', a.application_name, a.datname,
+                             date_trunc('second', now() - a.backend_start), a.pid), ', ' ORDER BY a.backend_start)
+      INTO v FROM pg_stat_activity a
+     WHERE a.application_name IN ('pgbx_dump', 'pgbx_restore', 'pgbx_verify')
+       AND lim > interval '0' AND now() - a.backend_start > lim;
+    ok := v IS NULL;
+    detail := CASE WHEN lim = interval '0' THEN 'check off (pgbx.doctor_long_job = 0)'
+                   WHEN ok THEN format('no backup or restore process running longer than %s', lim)
+                   ELSE format('running longer than %s: %s', lim, v) END;
+    fix := CASE WHEN ok THEN NULL
+                ELSE 'a running dump blocks DDL (ALTER TABLE, migrations) on the tables it reads; move the schedule to a quiet hour, '
+                     || 'or skip the rows of big tables with pgbx.set_data_scope()' END;
     RETURN NEXT;
 END $$;
 

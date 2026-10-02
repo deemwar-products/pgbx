@@ -321,18 +321,28 @@ fn serve_db(c: &Ctx, admin: &mut Client, db: &str) -> Result<(), String> {
         }
     }
 
-    // run queued jobs, oldest first
+    // run queued jobs, oldest first; a deferred one waits for its deferred_until
     let jobs = cl
         .query(
-            "SELECT id, kind, params::text FROM pgbx.history WHERE state='queued' ORDER BY id",
+            "SELECT id, kind, params::text, trigger, requested_at FROM pgbx.history WHERE state='queued'
+               AND coalesce((params->>'deferred_until')::timestamptz, '-infinity') <= now() ORDER BY id",
             &[],
         )
         .map_err(pe)?;
     for j in jobs {
-        let (id, kind, params): (i64, String, String) = (j.get(0), j.get(1), j.get(2));
-        cl.execute("UPDATE pgbx.history SET state='running', started=now() WHERE id=$1", &[&id]).map_err(pe)?;
+        let (id, kind, params, trigger): (i64, String, String, String) = (j.get(0), j.get(1), j.get(2), j.get(3));
+        let requested = DateTime::<Utc>::from(j.get::<_, std::time::SystemTime>(4));
+        let deadline = defer_deadline(requested, trigger == "first", &schedule);
+        let deferred = parse_flat_json(&params).contains_key("deferrals");
+        let forced = kind == "backup" && deferred && Utc::now() >= deadline;
+        cl.execute(
+            "UPDATE pgbx.history SET state='running', started=now(),
+                    params = CASE WHEN $2 THEN params || '{\"forced\":true}' ELSE params END WHERE id=$1",
+            &[&id, &forced],
+        )
+        .map_err(pe)?;
         let res: Result<Done, String> = match kind.as_str() {
-            "backup" => backup(c, db, &path),
+            "backup" => backup(c, db, &path, forced),
             "restore" => restore(c, admin, &path, &params),
             "verify" => verify(c, admin, &mut cl, &path),
             "prune" => Ok(Done::default()),
@@ -363,6 +373,25 @@ fn serve_db(c: &Ctx, admin: &mut Client, db: &str) -> Result<(), String> {
                 )
                 .map_err(pe)?;
                 log(&format!("{db}: {kind} #{id} done ({}, {} bytes)", done.key.as_deref().unwrap_or("-"), done.bytes));
+            }
+            // a lock held by DDL/a migration: never queue behind it; try again later, until the deadline
+            Err(e) if kind == "backup" && !forced && is_lock_timeout(&e) => {
+                let p = parse_flat_json(&params);
+                let n = |k: &str| p.get(k).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+                let (deferrals, locks) = (n("deferrals"), n("lock_timeouts"));
+                let wait = backoff_minutes(setting(&DEFER_BACKOFF).as_deref(), deferrals as usize);
+                let until = (Utc::now() + chrono::Duration::minutes(wait as i64)).min(deadline);
+                cl.execute(
+                    "UPDATE pgbx.history SET state='queued', started=NULL, params = params || jsonb_build_object(
+                        'deferrals', $2::int, 'lock_timeouts', $3::int, 'deferred_until', $4::timestamptz,
+                        'defer_reason', 'lock_timeout', 'deadline', $5::timestamptz) WHERE id=$1",
+                    &[&id, &(deferrals + 1), &(locks + 1), &std::time::SystemTime::from(until), &std::time::SystemTime::from(deadline)],
+                )
+                .map_err(pe)?;
+                log(&format!(
+                    "{db}: backup #{id} could not get its table locks within pgbx.dump_lock_timeout (DDL holds one); retry at {}, runs anyway from {}",
+                    until.format("%H:%M:%S"), deadline.format("%Y-%m-%d %H:%M:%S UTC")
+                ));
             }
             Err(e) => {
                 cl.execute("UPDATE pgbx.history SET state='failed', finished=now(), error=$2 WHERE id=$1", &[&id, &e])
@@ -503,7 +532,7 @@ fn user_tables(cl: &mut Client) -> Result<i64, String> {
 
 /// pg_dump (custom format) streamed straight into a multipart S3 upload — no temp file, no full copy in memory.
 /// Key: s3://bucket/<server>/<path>/<UTC timestamp>.dump. Records how many user tables it saw (for verify).
-fn backup(c: &Ctx, db: &str, path: &str) -> Result<Done, String> {
+fn backup(c: &Ctx, db: &str, path: &str, forced: bool) -> Result<Done, String> {
     let mut src = connect(c, db)?;
     let tables = user_tables(&mut src)?;
     // data scope: definitions of every table are dumped; rows are skipped for these (resolved now, so new tables count)
@@ -513,9 +542,17 @@ fn backup(c: &Ctx, db: &str, path: &str) -> Result<Done, String> {
     let b = bucket()?;
     let key = format!("{}{}.dump", prefix(c, path), Utc::now().format("%Y-%m-%dT%H-%M-%SZ"));
     let (pg_dump, major) = client_tool(c, "pg_dump");
-    let compress = compression(setting(&DUMP_COMPRESSION).as_deref(), major);
-    let mut child = Command::new(&pg_dump)
+    let compress = if forced {
+        compression_busy(setting(&DUMP_COMPRESSION_BUSY).as_deref(), major)
+    } else {
+        compression(setting(&DUMP_COMPRESSION).as_deref(), major)
+    };
+    // pg_dump SETs lock_timeout=0 itself, so its own --lock-wait-timeout is the knob; C messages so a timeout is recognised
+    let lock_ms = if forced { DUMP_LOCK_TIMEOUT_FORCED.get() } else { DUMP_LOCK_TIMEOUT.get() };
+    let mut child = job_command(&pg_dump, "pgbx_dump")
+        .env("PGOPTIONS", "-c lc_messages=C")
         .args(["-Fc", "--compress", &compress, "-h", &c.socket, "-p", &c.port.to_string(), "-U", "postgres", "-d", db])
+        .args((lock_ms > 0).then(|| format!("--lock-wait-timeout={lock_ms}ms")))
         .args(rowless.iter().map(|t| format!("--exclude-table-data={t}")))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -556,6 +593,105 @@ pub(crate) fn compression(setting: Option<&str>, pg_dump_major: Option<u32>) -> 
         _ if pg_dump_major.unwrap_or(0) >= 16 => "zstd:3".into(),
         _ => "6".into(),
     }
+}
+
+/// pgbx.dump_compression_busy: 'auto' (or unset) = zstd:1 when pg_dump is 16+, else gzip level 1. Single-threaded
+/// either way (no zstd workers=): one core at most.
+pub(crate) fn compression_busy(setting: Option<&str>, pg_dump_major: Option<u32>) -> String {
+    match setting.map(str::trim) {
+        Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("auto") => s.to_string(),
+        _ if pg_dump_major.unwrap_or(0) >= 16 => "zstd:1".into(),
+        _ => "1".into(),
+    }
+}
+
+/// Did pg_dump give up waiting for a table lock (--lock-wait-timeout)? It runs the LOCK TABLEs under a
+/// statement_timeout; with NOWAIT the server says "could not obtain lock".
+pub(crate) fn is_lock_timeout(err: &str) -> bool {
+    err.contains("LOCK TABLE")
+        && (err.contains("statement timeout") || err.contains("lock timeout") || err.contains("could not obtain lock"))
+}
+
+/// pgbx.defer_backoff ("1,2,4,8,15", minutes, each 1-60): wait before retry number `n` (0-based); the last value
+/// repeats. A list that does not parse falls back to the default.
+pub(crate) fn backoff_minutes(setting: Option<&str>, n: usize) -> u32 {
+    const DEFAULT: [u32; 5] = [1, 2, 4, 8, 15];
+    let parsed: Option<Vec<u32>> = setting.map(|s| {
+        s.split(',').map(|x| x.trim().parse::<u32>().ok().filter(|m| (1..=60).contains(m))).collect::<Option<Vec<_>>>()
+    })
+    .flatten()
+    .filter(|v| !v.is_empty());
+    let list = parsed.as_deref().unwrap_or(&DEFAULT);
+    list[n.min(list.len() - 1)]
+}
+
+/// When a deferred job runs anyway: queued + pgbx.max_defer (first backup: pgbx.max_defer_first), never later than
+/// one schedule interval, so a deferred backup and the next scheduled one never pile up.
+pub(crate) fn defer_deadline(requested: DateTime<Utc>, first: bool, cron: &str) -> DateTime<Utc> {
+    let max = if first { MAX_DEFER_FIRST.get() } else { MAX_DEFER.get() };
+    requested + chrono::Duration::seconds(defer_secs(max as i64, schedule_interval(cron, requested)))
+}
+
+fn defer_secs(max_defer: i64, interval: Option<i64>) -> i64 {
+    interval.map_or(max_defer, |i| max_defer.min(i)).max(0)
+}
+
+/// Seconds between the two schedule slots after `at` (None when the schedule cannot be read).
+pub(crate) fn schedule_interval(cron: &str, at: DateTime<Utc>) -> Option<i64> {
+    let a = schedule::next_after(cron, at).ok()?;
+    let b = schedule::next_after(cron, a).ok()?;
+    Some((b - a).num_seconds())
+}
+
+/// pgbx.job_ionice -> the ioprio_set value: None = leave alone ('none'), else class << 13 | level
+/// ('idle' = class 3; 'best-effort-N' = class 2, level N 0-7).
+pub(crate) fn parse_ionice(s: &str) -> Result<Option<i32>, String> {
+    const BE: i32 = 2 << 13;
+    const IDLE: i32 = 3 << 13;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(None),
+        "idle" => Ok(Some(IDLE)),
+        v => v
+            .strip_prefix("best-effort-")
+            .and_then(|n| n.parse::<i32>().ok())
+            .filter(|n| (0..=7).contains(n))
+            .map(|n| Some(BE | n))
+            .ok_or(format!("pgbx.job_ionice '{s}' not understood (none, idle, best-effort-0..7); using best-effort-7")),
+    }
+}
+
+/// pg_dump / pg_restore as a polite child: lower CPU priority (pgbx.job_nice) and, on Linux, IO priority
+/// (pgbx.job_ionice), set between fork and exec so they hold from its first read. PGAPPNAME tags its connection
+/// so load checks skip it and doctor() can see how long it runs. Never raises priority.
+fn job_command(prog: &std::path::Path, app: &str) -> Command {
+    let mut cmd = Command::new(prog);
+    cmd.env("PGAPPNAME", app);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let nice = JOB_NICE.get().clamp(0, 19);
+        let ioprio = parse_ionice(setting(&JOB_IONICE).as_deref().unwrap_or("best-effort-7")).unwrap_or_else(|e| {
+            log(&e);
+            Some((2 << 13) | 7)
+        });
+        let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        // SAFETY: only async-signal-safe syscalls between fork and exec; failures are ignored (best effort)
+        unsafe {
+            cmd.pre_exec(move || {
+                if nice > current {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(p) = ioprio {
+                    libc::syscall(libc::SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, p);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = ioprio;
+                Ok(())
+            });
+        }
+    }
+    cmd
 }
 
 /// The newest installed copy of a client tool (pg_dump / pg_restore): newer clients dump and restore older
@@ -630,12 +766,15 @@ fn pick_backup(c: &Ctx, b: &Bucket, path: &str, at: DateTime<Utc>) -> Result<Str
 }
 
 /// CREATE DATABASE <into> TEMPLATE template0, then stream the S3 object straight into pg_restore's stdin.
-fn restore_key_into(c: &Ctx, admin: &mut Client, b: &Bucket, key: &str, into: &str) -> Result<i64, String> {
+fn restore_key_into(c: &Ctx, admin: &mut Client, b: &Bucket, key: &str, into: &str, app: &str) -> Result<i64, String> {
     // template0: the dump brings its own CREATE EXTENSION pgbx, so start from a database without it
     admin
         .batch_execute(&format!("CREATE DATABASE \"{into}\" TEMPLATE template0"))
         .map_err(|e| format!("create {into}: {}", pe(e)))?;
-    let mut child = Command::new(client_tool(c, "pg_restore").0)
+    // the target is a NEW database: losing the tail of it in a crash just means restoring again
+    let sync = if RESTORE_SYNCHRONOUS_COMMIT.get() { "on" } else { "off" };
+    let mut child = job_command(&client_tool(c, "pg_restore").0, app)
+        .env("PGOPTIONS", format!("-c synchronous_commit={sync}"))
         .args(["-h", &c.socket, "-p", &c.port.to_string(), "-U", "postgres", "--no-owner", "-d", into])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -669,7 +808,7 @@ fn restore(c: &Ctx, admin: &mut Client, path: &str, params: &str) -> Result<Done
         .unwrap_or_else(Utc::now);
     let b = bucket()?;
     let key = pick_backup(c, &b, path, at)?;
-    let bytes = restore_key_into(c, admin, &b, &key, &into)?;
+    let bytes = restore_key_into(c, admin, &b, &key, &into, "pgbx_restore")?;
     // the copy must not back up into the original's folder: give it its own path (= its own name)
     let mut copy = connect(c, &into)?;
     copy.batch_execute("UPDATE pgbx.config SET path = NULL").map_err(pe)?;
@@ -682,7 +821,7 @@ fn verify(c: &Ctx, admin: &mut Client, source: &mut Client, path: &str) -> Resul
     let key = pick_backup(c, &b, path, Utc::now())?;
     let scratch = format!("{VERIFY_PREFIX}{}", Utc::now().format("%Y%m%d%H%M%S"));
     let result = (|| {
-        let bytes = restore_key_into(c, admin, &b, &key, &scratch)?;
+        let bytes = restore_key_into(c, admin, &b, &key, &scratch, "pgbx_verify")?;
         let mut sc = connect(c, &scratch)?;
         let got = user_tables(&mut sc)?;
         let ok = sc.query_one("SELECT 1", &[]).is_ok();
@@ -757,5 +896,70 @@ mod t {
     #[test]
     fn prune_job_extra_is_valid_json() {
         assert_eq!(Done::default().extra, "{}");
+    }
+
+    #[test]
+    fn ionice_values() {
+        assert_eq!(parse_ionice("best-effort-7"), Ok(Some((2 << 13) | 7)));
+        assert_eq!(parse_ionice(" Best-Effort-0 "), Ok(Some(2 << 13)));
+        assert_eq!(parse_ionice("idle"), Ok(Some(3 << 13)));
+        assert_eq!(parse_ionice("none"), Ok(None));
+        for bad in ["best-effort-8", "best-effort--1", "best-effort", "realtime-0", "", "7"] {
+            assert!(parse_ionice(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn busy_compression_is_cheap() {
+        assert_eq!(compression_busy(Some("auto"), Some(16)), "zstd:1");
+        assert_eq!(compression_busy(None, Some(15)), "1");
+        assert_eq!(compression_busy(Some("lz4"), Some(16)), "lz4");
+    }
+
+    #[test]
+    fn lock_timeout_detected() {
+        // what pg_dump --lock-wait-timeout prints when a table is held ACCESS EXCLUSIVE (lc_messages=C)
+        let e = "backup failed: pg_dump: error: query failed: ERROR:  canceling statement due to statement timeout\n\
+                 pg_dump: detail: Query was: LOCK TABLE public.t IN ACCESS SHARE MODE";
+        assert!(is_lock_timeout(e));
+        assert!(is_lock_timeout("ERROR:  could not obtain lock on relation \"t\"\nQuery was: LOCK TABLE public.t IN ACCESS SHARE MODE NOWAIT"));
+        assert!(!is_lock_timeout("backup failed: pg_dump: error: connection to server failed"));
+        assert!(!is_lock_timeout("ERROR:  canceling statement due to statement timeout\nQuery was: SELECT 1"));
+    }
+
+    #[test]
+    fn backoff_schedule() {
+        let b = |s: Option<&str>| (0..7).map(|n| backoff_minutes(s, n)).collect::<Vec<_>>();
+        assert_eq!(b(None), [1, 2, 4, 8, 15, 15, 15]);
+        assert_eq!(b(Some("1,2,4,8,15")), [1, 2, 4, 8, 15, 15, 15]);
+        assert_eq!(b(Some(" 5 , 10 ")), [5, 10, 10, 10, 10, 10, 10]);
+        assert_eq!(b(Some("0,5")), [1, 2, 4, 8, 15, 15, 15]); // each 1-60, else the default
+        assert_eq!(b(Some("61")), [1, 2, 4, 8, 15, 15, 15]);
+        assert_eq!(b(Some("")), [1, 2, 4, 8, 15, 15, 15]);
+    }
+
+    #[test]
+    fn deadline_capped_by_schedule_interval() {
+        let at = DateTime::parse_from_rfc3339("2026-10-02T02:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(schedule_interval("0 2 * * *", at), Some(86_400));
+        assert_eq!(schedule_interval("0 * * * *", at), Some(3_600));
+        assert_eq!(schedule_interval("not cron", at), None);
+        assert_eq!(defer_secs(4 * 3600, Some(86_400)), 4 * 3600); // daily: 4h
+        assert_eq!(defer_secs(4 * 3600, Some(3_600)), 3_600); // hourly: never past the next slot
+        assert_eq!(defer_secs(900, None), 900);
+        assert_eq!(defer_secs(0, Some(3_600)), 0);
+    }
+
+    #[test]
+    fn update_script_matches_install() {
+        // each function the update script replaces must read exactly as the install script creates it
+        let lib = include_str!("lib.rs");
+        let upd = include_str!("../sql/pgbx--0.5.0--0.6.0.sql");
+        let fns: Vec<&str> = upd.split("CREATE OR REPLACE FUNCTION ").skip(1).collect();
+        assert!(!fns.is_empty());
+        for f in fns {
+            let body = &f[..f.find("END $$;").expect("plpgsql body")];
+            assert!(lib.contains(&format!("CREATE FUNCTION {body}")), "update script differs from lib.rs: {}", &body[..40]);
+        }
     }
 }
