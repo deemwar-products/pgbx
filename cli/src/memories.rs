@@ -153,7 +153,7 @@ pub fn run(a: &Args, profile: Option<String>, env: Env) -> Result<Value, String>
         }
         "" | "path" => {
             let conn = profile.or_else(|| a.get("host").map(String::from)).unwrap_or_else(|| "localhost".into());
-            Ok(json!({"root": root.display().to_string(), "connection": conn, "dir": root.join(&conn).display().to_string()}))
+            Ok(json!({"ok": true, "root": root.display().to_string(), "connection": conn, "dir": root.join(&conn).display().to_string()}))
         }
         x => Err(format!("unknown 'memories {x}' (pgbx memories export [FILE|-] | import FILE [--as C] [--overwrite] | path)")),
     }
@@ -223,5 +223,13 @@ mod tests {
         assert!(parse_bundle(&json!({"pgbx_memories": 1, "connection": "p", "files": {"shop/memories.md": 5}})).is_err());
         assert!(check_part("connection", "a/b").is_err());
         assert!(check_part("connection", "..").is_err());
+    }
+
+    #[test]
+    fn path_is_a_successful_reply() {
+        let env = |k: &str| (k == "PGBX_MEMORY_DIR").then(|| "/m".to_string());
+        let a = crate::parse_args(["memories", "path"].iter().map(|x| x.to_string())).unwrap();
+        let v = run(&a, Some("prod".into()), &env).unwrap();
+        assert_eq!((v["ok"].clone(), v["dir"].as_str()), (json!(true), Some("/m/prod")));
     }
 }
