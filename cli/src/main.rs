@@ -409,6 +409,9 @@ fn cmd_db_restore(cx: &mut Ctx) -> Out {
     queue(cx, &db, "SELECT pgbx.restore($1, coalesce(($2::text)::timestamptz, now()))", &[&into, &time])
 }
 
+/// doctor() rows that give advice (a better schedule, estimates still settling) rather than report a fault
+const ADVISORY_CHECKS: &[&str] = &["schedule_in_quiet_window", "eta_accuracy"];
+
 fn check(name: &str, ok: bool, detail: impl Into<String>, fix: &str) -> Value {
     json!({"name": name, "ok": ok, "detail": detail.into(), "fix": if ok { "" } else { fix }})
 }
@@ -428,7 +431,13 @@ fn cmd_doctor(cx: &mut Ctx) -> Out {
         match cx.connect(&admin).and_then(|mut a| rows(&mut a, "SELECT * FROM pgbx.doctor()", &[])) {
             Ok(v) => {
                 for r in v {
-                    ch.push(check(r["name"].as_str().unwrap_or("?"), r["ok"] == true, scalar(&r["detail"]), r["fix"].as_str().unwrap_or("")));
+                    let name = r["name"].as_str().unwrap_or("?");
+                    let mut c = check(name, r["ok"] == true, scalar(&r["detail"]), r["fix"].as_str().unwrap_or(""));
+                    // advice, not breakage: shown as [warn], never makes the server unhealthy
+                    if ADVISORY_CHECKS.contains(&name) {
+                        c["warning"] = json!(true);
+                    }
+                    ch.push(c);
                 }
             }
             Err(_) if client_only::ext(&mut c) == Ok(client_only::Ext::Absent) => {

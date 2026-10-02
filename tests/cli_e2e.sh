@@ -27,9 +27,11 @@ P -c "DROP DATABASE IF EXISTS cli_copy_dummy" >/dev/null
 P -d shop -c "SELECT 1" >/dev/null 2>&1 || { P -c "CREATE DATABASE shop"; sleep 10; }
 
 echo "## a. doctor"
+# databases restored by e2e.sh get their first backup within a minute; wait for that before judging health
+for _ in $(seq 90); do [ "$(P -c "SELECT count(*) FROM pgbx.doctor() WHERE name='database backups' AND NOT ok")" = 0 ] && break; sleep 2; done
 out=$(J doctor); rc=$?
 check "doctor --json healthy, exit 0" "$(onejson "$out")|$(jq1 "$out" .healthy)|$rc" "yes|true|0"
-check "doctor(): every check ok" "$(P -c "SELECT count(*) FILTER (WHERE NOT ok) FROM pgbx.doctor()")" 0
+check "doctor(): every check ok (advice rows aside)" "$(P -c "SELECT count(*) FILTER (WHERE NOT ok AND name NOT IN ('schedule_in_quiet_window','eta_accuracy')) FROM pgbx.doctor()")" 0
 P -c "DROP ROLE IF EXISTS cli_viewer" -c "CREATE ROLE cli_viewer LOGIN IN ROLE pgbx_viewer" >/dev/null
 check "doctor() callable as a viewer" "$(X psql -U cli_viewer -d postgres -qAt -c "SELECT count(*) > 0 FROM pgbx.doctor()" 2>&1)" t
 
