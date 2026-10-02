@@ -7,7 +7,10 @@
 //!   safe        now, verify, db-restore (NEW db only, also --from-s3), resume, link, schedule, skill
 //!   guarded     pause, lowering retention, narrowing scope, verify-schedule never — require --yes
 
+mod adapter;
 mod client_only;
+mod config;
+mod conn;
 mod diagnose;
 mod jobs;
 mod load;
@@ -20,20 +23,21 @@ mod serve;
 mod setup;
 mod setup_client;
 mod skill;
-mod tunnel;
 mod ui;
+mod vars;
 
 use postgres::types::ToSql;
-use postgres::{Client, NoTls};
+use postgres::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Unix: the Debian/RHEL socket dir. Windows has no unix socket default, so TCP to localhost.
 #[cfg(unix)]
-const DEFAULT_HOST: &str = "/var/run/postgresql";
+pub(crate) const DEFAULT_HOST: &str = "/var/run/postgresql";
 #[cfg(not(unix))]
-const DEFAULT_HOST: &str = "localhost";
+pub(crate) const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
@@ -41,12 +45,15 @@ const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset",
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
-    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
-    "ssh-jump", "tunnel-idle", "max-rows", "serve", "as", "hours", "gate",
+    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "url", "adapter", "adapter-command",
+    "max-rows", "as", "hours", "gate",
 ];
+/// Removed in 0.6 (ADR 0003): pgbx has no built-in SSH any more.
+const REMOVED_SSH: &str = "pgbx has no built-in SSH any more (0.6, ADR 0003): use the ssh adapter, e.g. \
+    pgbx profile add prod --adapter ssh target=user@host  (see pgbx help, and the guide \"Connect through SSH, AWS, GCP, Azure or your own adapter\")";
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
-    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel", "memories",
+    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "memories",
     "jobs", "load", "serve",
 ];
 
@@ -86,12 +93,17 @@ pub fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Result<Args, String>
                     None => it.next().ok_or(format!("--{name} needs a value"))?,
                 };
                 a.flags.insert(name, v);
+            } else if ["ssh", "ssh-port", "ssh-jump", "tunnel-idle"].contains(&name.as_str()) {
+                return Err(format!("--{name}: {REMOVED_SSH}"));
             } else {
                 return Err(format!("unknown option --{name} (see pgbx help)"));
             }
         } else if s == "-h" {
             a.flags.insert("help".into(), String::new());
         } else if a.cmd.is_empty() {
+            if s == "tunnel" {
+                return Err(format!("pgbx tunnel: {REMOVED_SSH}"));
+            }
             if !COMMANDS.contains(&s.as_str()) {
                 return Err(format!("unknown command '{s}' (see pgbx help)"));
             }
@@ -154,16 +166,23 @@ setup (guarded: shows the plan; --yes writes):
       what is loaded) and the credentials file (0600, owner postgres; keys read from env vars, default
       AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY); prints the ONE restart command, never restarts Postgres.
       `pgbx setup` alone is the same as `pgbx setup server`.
-  pgbx setup client [NAME] [--host H --port P | --ssh T [--ssh-port N --ssh-jump J]] [--user U] [--db D]
+  pgbx setup client [NAME] [--url URL | --adapter A [key=value ...] | --host H --port P --user U] [--db D]
               [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F] [--no-skill] [--yes]
       on your laptop, no sudo: asks (or takes flags), saves the profile (default if first), tests it
       (connect, extension version, status()), prints next steps, offers `pgbx skill install` on a terminal
-profiles (one per server; never stores passwords or S3 keys):
-  pgbx profile add NAME [--host H --port P --user U --admin-db D --s3-endpoint U --s3-bucket B --s3-region R
-                         --server-name S --credentials-file F --ssh T --ssh-port N --ssh-jump J
-                         --tunnel-idle 10m]   (the first profile becomes the default)
-  pgbx profile list | show NAME | remove NAME | use NAME          (use = set the default)
-  --profile NAME or PGBX_PROFILE on any command; precedence: flag > PGHOST/PGPORT/PGUSER > profile > default
+connections and profiles (<config dir>/config.yaml, 0600; profiles hold $VAR references, never secrets):
+  a profile is a connection string or an adapter (any command that hands pgbx a connection string:
+  ssh, aws, gcp, azure examples ship in the repo's adapters/, or your own)
+  pgbx profile add NAME --url 'postgres://user:$PGPASSWORD@host:5432/db'
+  pgbx profile add NAME --adapter A [--adapter-command CMD] [key=value ...]   (the adapter's own settings)
+               [--admin-db D --s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F]
+  pgbx profile edit NAME [key=value | key= | --url U | --adapter A | --s3-... ]   (key= removes a setting)
+  pgbx profile list | show NAME | remove NAME | use NAME   (the first profile, or `use`, is the default)
+  $VAR / ${VAR} anywhere in a profile or url is expanded at run time ($$ = a literal $) from the environment,
+  then the `secrets:` source in config.yaml (env | a .env file | a handler command run as `CMD NAME`)
+  which connection: --url > --profile > --host/--port > PGBX_URL > PGBX_PROFILE > default profile > PGHOST/...
+  an adapter starts with the command and stops when it ends (pgbx serve keeps it for its whole run);
+  doctor checks over SQL through it; diagnose and setup server run on the database host itself
 agent memory (${PGBX_MEMORY_DIR:-~/pgbx}/<connection>/<db>/memories.md + tables.md; connection = profile):
   pgbx memories export [FILE | -] [--db D]    one JSON bundle (default pgbx-memories-<connection>.json)
   pgbx memories import FILE [--as CONNECTION] [--overwrite]   differing local files are kept unless --overwrite
@@ -175,11 +194,8 @@ read queries (one statement, inside BEGIN READ ONLY, then ROLLBACK):
       SELECT/WITH/TABLE/VALUES/SHOW/EXPLAIN only; refuses writes, row locks and side-effect functions
       (a best-effort guard for agents, not a security boundary: give the user a read-only role yourself)
       -> columns[{name,type}], rows[], row_count, truncated
-over ssh (system ssh; keys/agent/~/.ssh/config are ssh's business):
-  --ssh user@host [--ssh-port N] [--ssh-jump J]   tunnels Postgres; doctor/logs/diagnose/setup run there
-  pgbx tunnel [open] | list | close [NAME | --all]
-      the forward is shared by later commands and closes after --tunnel-idle (default 10m) unused
-common: --json --profile NAME --host --port --user --admin-db --timeout SECS (PGHOST/PGPORT/PGUSER/PGPASSWORD honoured)
+common: --json --profile NAME --url URL --host --port --user --admin-db --timeout SECS
+        (PGBX_URL, PGBX_PROFILE, PGHOST/PGPORT/PGUSER honoured; PGPASSWORD when the url has no password)
 TS always carries a UTC offset: '2026-01-31 14:00:00+00'";
 
 // ---------------------------------------------------------------- safety
@@ -197,7 +213,7 @@ pub fn level(cmd: &str, a: &Args) -> Level {
     match cmd {
         "now" | "verify" | "db-restore" | "resume" | "link" | "skill" => Level::Safe,
         "setup" if a.pos.first().map(String::as_str) == Some("client") => Level::Safe,
-        "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "remove" | "use")) => Level::Safe,
+        "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "edit" | "remove" | "use")) => Level::Safe,
         "memories" if a.pos.first().map(String::as_str) == Some("import") => Level::Safe,
         "schedule" if shows => Level::ReadOnly,
         "schedule" if a.pos.first().map(String::as_str) == Some("suggest") && !a.has("apply") => Level::ReadOnly,
@@ -250,39 +266,22 @@ pub fn check_new_db(src: &str, into: &str, exists: bool) -> Result<(), String> {
 struct Ctx {
     a: Args,
     admin_db: Option<String>,
-    tunnel: std::sync::OnceLock<u16>,
+    /// how this command reaches Postgres (a url, an adapter, or flags/env); shared, so an adapter starts once
+    conn: Arc<conn::Conn>,
 }
 
 impl Ctx {
-    fn db(&self) -> String {
-        self.a.get("db").unwrap_or("postgres").to_string()
+    fn new(a: Args, conn: Arc<conn::Conn>) -> Ctx {
+        Ctx { a, admin_db: None, conn }
     }
 
-    /// host, port, user to connect to: flags/env/defaults, or the local end of the ssh tunnel (opened once).
-    fn target(&self) -> Result<(String, u16, String), String> {
-        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-        let user = self.a.get("user").map(String::from).or(env("PGUSER")).unwrap_or("postgres".into());
-        if self.a.has("ssh") {
-            if self.tunnel.get().is_none() {
-                let _ = self.tunnel.set(tunnel::ensure(&self.a, self.a.get("profile"))?);
-            }
-            return Ok(("127.0.0.1".into(), *self.tunnel.get().unwrap(), user));
-        }
-        let host = self.a.get("host").map(String::from).or(env("PGHOST")).unwrap_or(DEFAULT_HOST.into());
-        let port: u16 = self.a.get("port").map(String::from).or(env("PGPORT")).unwrap_or("5432".into())
-            .parse().map_err(|_| "bad --port".to_string())?;
-        Ok((host, port, user))
+    /// --db, else the database named in the connection string, else postgres.
+    fn db(&self) -> String {
+        self.a.get("db").map(String::from).or_else(|| self.conn.default_db()).unwrap_or("postgres".into())
     }
 
     fn connect(&self, db: &str) -> Result<Client, String> {
-        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-        let (host, port, user) = self.target()?;
-        let mut c = postgres::Config::new();
-        c.host(&host).port(port).user(&user).dbname(db).application_name("pgbx").connect_timeout(Duration::from_secs(5));
-        if let Some(pw) = env("PGPASSWORD") {
-            c.password(pw);
-        }
-        c.connect(NoTls).map_err(|e| format!("cannot connect to Postgres ({host}:{port}, db {db}): {e}"))
+        self.conn.connect(db)
     }
 
     fn admin_db(&mut self) -> String {
@@ -455,8 +454,8 @@ fn cmd_doctor(cx: &mut Ctx) -> Out {
             Err(e) => ch.push(check("server checks", false, e,
                 "make sure pgbx is in shared_preload_libraries (the worker creates the extension in the admin database)")),
         }
-        // over ssh the data directory is on the server, not on this machine
-        if let Some(d) = c.query_one("SHOW data_directory", &[]).ok().filter(|_| !cx.a.has("ssh")).and_then(|r| r.get::<_, Option<String>>(0)) {
+        // through an adapter the data directory is on the server, not on this machine
+        if let Some(d) = c.query_one("SHOW data_directory", &[]).ok().filter(|_| !cx.conn.is_adapter()).and_then(|r| r.get::<_, Option<String>>(0)) {
             data_dir = Some(d);
         }
     }
@@ -472,9 +471,14 @@ fn cmd_doctor(cx: &mut Ctx) -> Out {
                 "free disk space or grow the volume; a full disk stops Postgres"));
         }
     }
+    if cx.conn.is_adapter() {
+        let mut i = check("host-side checks", true, "skipped: this profile reaches Postgres through an adapter", "");
+        i["info"] = json!(host_side("doctor"));
+        ch.push(i);
+    }
     let healthy = ch.iter().all(|c| c["ok"] == true || c["warning"] == true);
     let mut v = json!({"ok": healthy, "healthy": healthy, "postgres_up": pg_up, "checks": ch});
-    if !pg_up {
+    if !pg_up && !cx.conn.is_adapter() {
         let d = run_diagnose(cx, false);
         v["checks"].as_array_mut().unwrap().insert(1, check("why postgres is down", false,
             format!("{} ({}); {} evidence line(s)", scalar(&d["probable_cause"]), scalar(&d["postgres"]),
@@ -483,6 +487,12 @@ fn cmd_doctor(cx: &mut Ctx) -> Out {
         v["diagnosis"] = d;
     }
     Ok(v)
+}
+
+/// Host-side work (disk, logs, config files) is not reachable through an adapter: no remote exec in v1 (ADR 0003).
+fn host_side(cmd: &str) -> String {
+    format!("run `pgbx {cmd}` on the database host: disk, log and config checks need the host itself, \
+             and this profile reaches Postgres through an adapter (pgbx runs nothing remotely)")
 }
 
 fn run_diagnose(cx: &mut Ctx, probe: bool) -> Value {
@@ -609,22 +619,27 @@ fn main() {
     let mut a = a;
     let cmd = a.cmd.clone();
     let lvl = level(&cmd, &a);
-    if cmd == "tunnel" && a.has("serve") {
-        std::process::exit(tunnel::serve(&a)); // the detached helper: its flags are complete, no profile lookup
-    }
     let setup_sub = if cmd == "setup" { a.pos.first().cloned() } else { None };
-    let prof = if cmd == "profile" || setup_sub.as_deref() == Some("client") { Ok(None) } else { profile::apply_from_disk(&mut a) };
-    let mut cx = Ctx { a, admin_db: None, tunnel: Default::default() };
+    let sel = if cmd == "profile" || setup_sub.as_deref() == Some("client") {
+        Ok(Arc::new(conn::Conn::direct(None, None, None)))
+    } else {
+        profile::select_sys(&mut a).map(|(c, notes)| {
+            for n in notes {
+                eprintln!("pgbx: {n}");
+            }
+            c
+        })
+    };
+    let prof = sel.as_ref().ok().and_then(|c| c.profile().map(String::from));
+    let mut cx = Ctx::new(a, sel.clone().unwrap_or_else(|_| Arc::new(conn::Conn::direct(None, None, None))));
+    // host-side commands read this machine's files: with an adapter profile the database is elsewhere
+    let host_cmd = cmd == "diagnose" || (cmd == "setup" && setup_sub.as_deref() != Some("client"));
     let r = match cmd.as_str() {
-        _ if prof.is_err() => Err(prof.clone().unwrap_err()),
+        _ if sel.is_err() => Err(sel.as_ref().err().cloned().unwrap_or_default()),
+        _ if host_cmd && cx.conn.is_adapter() => Err(format!("`pgbx {cmd}` is host-side: {}", host_side(&cmd))),
         "profile" => profile::run_sys(&cx.a),
-        "memories" => memories::run_sys(&cx.a, prof.clone().ok().flatten()),
-        // no pgbx on the ssh host (client-only use): doctor checks what it can through the tunnel instead
-        "doctor" if tunnel::runs_remotely("doctor", &cx.a) => tunnel::run_remote("doctor", &cx.a)
-            .or_else(|e| if e.contains("not installed on") { cmd_doctor(&mut cx) } else { Err(e) }),
-        c if tunnel::runs_remotely(c, &cx.a) => tunnel::run_remote(c, &cx.a),
+        "memories" => memories::run_sys(&cx.a, Some(cx.conn.memory_name())),
         "query" => query::run(&mut cx),
-        "tunnel" => tunnel::run(&cx.a, cx.a.get("profile")),
         "status" => cmd_status(&mut cx),
         "list" => cmd_list(&mut cx),
         "now" => cmd_now(&mut cx),
@@ -655,6 +670,7 @@ fn main() {
         _ => unreachable!(),
     };
     let mut v = r.unwrap_or_else(|e| json!({"ok": false, "error": client_only::friendly(&cmd, e)}));
+    adapter::stop_all(); // a one-off command's adapter stops when the command is done
     v["command"] = json!(cmd);
     v["safety"] = json!(format!("{lvl:?}").to_lowercase());
     if cmd == "setup" && setup_sub.is_none() {
@@ -663,9 +679,10 @@ fn main() {
             eprintln!("pgbx setup: same as pgbx setup server");
         }
     }
-    if let Ok(Some(p)) = &prof {
+    if let Some(p) = &prof {
         v["profile_used"] = json!(p);
     }
+    let v = vars::scrub_value(&v); // no password or expanded secret ever reaches output
     let ok = v["ok"] == true;
     if as_json {
         println!("{v}");
@@ -694,7 +711,7 @@ fn main() {
         human(&v, 0, &mut s);
         print!("{s}");
     }
-    std::process::exit(if ok { 0 } else { 1 });
+    adapter::exit(if ok { 0 } else { 1 });
 }
 
 // ---------------------------------------------------------------- tests

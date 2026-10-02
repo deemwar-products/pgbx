@@ -8,17 +8,19 @@
 //!     fragment, which is never sent to the server or written to a log;
 //!   - the foreign-Host 403 of `pgbx ui` (DNS rebinding);
 //!   - one kept-open, read-only admin connection per profile; a connection switcher over `pgbx profile list`;
+//!     a profile with an adapter keeps ONE adapter running for the whole serve run (started on first use,
+//!     stopped on exit / Ctrl-C);
 //!   - reads go through the read-only functions of ui.rs; `pgbx query` through the same guard as the CLI;
 //!   - actions are OFF unless `--allow-safe`, and then only the safe tier (backup now, verify now, restore into a
 //!     NEW database, cancel a queued job), through the CLI's own code paths. Never guarded or destructive ones.
 
-use crate::{client_only, memories, profile, query, rows, ui, Args, Ctx, Level};
+use crate::{client_only, conn, memories, profile, query, rows, ui, Args, Ctx, Level};
 use postgres::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:0";
@@ -161,9 +163,9 @@ struct Session {
 }
 
 impl Session {
-    fn new(a: Args) -> Session {
-        let mut cx = Ctx { a, admin_db: None, tunnel: Default::default() };
-        let _ = cx.admin_db(); // resolves pgbx.admin_db once (and opens an ssh tunnel when the profile has one)
+    fn new(a: Args, conn: Arc<conn::Conn>) -> Session {
+        let mut cx = Ctx::new(a, conn);
+        let _ = cx.admin_db(); // resolves pgbx.admin_db once (and starts the adapter when the profile has one)
         Session { cx, admin: Mutex::new(None) }
     }
 
@@ -186,25 +188,20 @@ impl Session {
         Err("lost the connection to Postgres".into())
     }
 
-    /// A Ctx for one CLI code path: this connection's flags plus `extra`, the tunnel already open.
+    /// A Ctx for one CLI code path: this connection's flags plus `extra`, sharing the connection (and its adapter).
     fn ctx_for(&self, cmd: &str, pos: Vec<String>, extra: &[(&str, &str)]) -> Ctx {
         let mut flags: HashMap<String, String> = self.cx.a.flags.iter()
-            .filter(|(k, _)| k.as_str() == "profile" || profile::KEYS.iter().any(|(p, _)| p == k))
+            .filter(|(k, _)| k.as_str() == "profile" || profile::FLAG_KEYS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone())).collect();
         for (k, v) in extra {
             flags.insert(k.to_string(), v.to_string());
         }
-        let tunnel = OnceLock::new();
-        if let Some(p) = self.cx.tunnel.get() {
-            let _ = tunnel.set(*p);
-        }
-        Ctx { a: Args { cmd: cmd.into(), pos, flags }, admin_db: self.cx.admin_db.clone(), tunnel }
+        Ctx { a: Args { cmd: cmd.into(), pos, flags }, admin_db: self.cx.admin_db.clone(), conn: Arc::clone(&self.cx.conn) }
     }
 
     /// The memory folder name for this connection: the profile, else the host (as `pgbx memories path`).
     fn connection(&self) -> String {
-        let a = &self.cx.a;
-        a.get("profile").or(a.get("host")).filter(|h| !h.starts_with('/')).unwrap_or("localhost").to_string()
+        self.cx.conn.memory_name()
     }
 }
 
@@ -225,8 +222,8 @@ impl App {
             return Ok(Arc::clone(s));
         }
         profile::check_name(&key)?;
-        let a = profile::args_for(&key, &profile::load_sys()?)?;
-        let s = Arc::new(Session::new(a));
+        let (a, c) = profile::args_for(&key, &profile::load_sys()?)?;
+        let s = Arc::new(Session::new(a, Arc::new(c)));
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert_with(|| Arc::clone(&s));
         Ok(s)
     }
@@ -243,7 +240,7 @@ fn api_session(app: &App) -> Value {
         Ok(st) => {
             let p: Vec<Value> = st.profiles.iter().map(|(n, v)| json!({
                 "name": n, "default": st.default.as_deref() == Some(n.as_str()),
-                "host": v.get("host"), "port": v.get("port"), "user": v.get("user"), "ssh": v.get("ssh"),
+                "adapter": v.get("adapter"), "url": v.get("url").and_then(|u| u.as_str()).map(conn::redact),
             })).collect();
             (p, st.default, Value::Null)
         }
@@ -434,12 +431,12 @@ fn respond(s: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) {
 }
 
 fn json_err(s: &mut TcpStream, code: u16, e: &str) {
-    respond(s, code, "application/json", json!({"ok": false, "error": e}).to_string().as_bytes());
+    respond(s, code, "application/json", json!({"ok": false, "error": crate::vars::scrub(e)}).to_string().as_bytes());
 }
 
 fn json_resp(s: &mut TcpStream, r: Result<Value, String>) {
     match r {
-        Ok(v) => respond(s, 200, "application/json", v.to_string().as_bytes()),
+        Ok(v) => respond(s, 200, "application/json", crate::vars::scrub_value(&v).to_string().as_bytes()),
         Err(e) => json_err(s, 502, &e),
     }
 }
@@ -576,7 +573,7 @@ pub fn run(cx: &mut Ctx) -> Result<Value, String> {
     let start = cx.a.get("profile").unwrap_or("").to_string();
     let mut a = ui::clone_args(&cx.a);
     a.cmd = "serve".into();
-    let first = Session::new(a);
+    let first = Session::new(a, Arc::clone(&cx.conn));
     let mut warnings = vec![];
     match ui::check_role(&first.cx, false) {
         // with --allow-safe the role is meant to run backups; without it, say so like pgbx ui does

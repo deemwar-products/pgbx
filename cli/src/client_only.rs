@@ -1,4 +1,4 @@
-//! pgbx as a plain Postgres client: profiles, ssh tunnels, `pgbx query` and agent memory all work against a
+//! pgbx as a plain Postgres client: profiles, adapters, `pgbx query` and agent memory all work against a
 //! server WITHOUT the pgbx extension. This module tells "the extension is simply not there" (client-only use,
 //! fine: backups are off) apart from "pgbx is on the server but broken here" (a real failure), and turns the
 //! raw `schema "pgbx" does not exist` errors of backup commands into one friendly sentence.
@@ -7,9 +7,10 @@ use crate::one;
 use postgres::Client;
 use serde_json::{json, Value};
 
-pub const OFF: &str = "pgbx extension not installed on this server: backups are off; queries, profiles and tunnels work";
+pub const INSTALL: &str = "curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh";
+pub const OFF: &str = "pgbx extension not installed on this server: backups are off; queries, profiles and adapters work";
 pub fn turn_on() -> String {
-    format!("optional, to turn on backups: on the database server run `{}` and then `sudo pgbx setup server`", crate::tunnel::INSTALL)
+    format!("optional, to turn on backups: on the database server run `{}` and then `sudo pgbx setup server`", INSTALL)
 }
 
 #[derive(Debug, PartialEq)]
@@ -78,7 +79,7 @@ mod tests {
         assert!(status_without(&Ext::Here, "d").is_none());
         let v = status_without(&Ext::Absent, "shop").unwrap();
         assert_eq!((v["ok"].clone(), v["backups"].as_str()), (json!(true), Some("off")));
-        assert!(v["info"].as_str().unwrap().contains("queries, profiles and tunnels work"));
+        assert!(v["info"].as_str().unwrap().contains("queries, profiles and adapters work"));
         let v = status_without(&Ext::NotInDb, "shop").unwrap();
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("not in database shop"));

@@ -71,7 +71,7 @@ export interface Session {
   safety: string;
   start: string;
   default: string | null;
-  profiles: { name: string; default: boolean; host?: string; port?: string; user?: string; ssh?: string }[];
+  profiles: { name: string; default: boolean; adapter?: string; url?: string }[];
   profiles_error: string | null;
   memory: boolean;
   warnings: string[];

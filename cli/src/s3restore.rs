@@ -280,13 +280,15 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
         .map_err(|e| format!("create database {into}: {}", pe(e)))?;
     drop(admin);
 
-    let (host, port, user) = cx.target()?;
+    let (host, port, user, password) = cx.conn.tool_target()?;
     let port = port.to_string();
     let skipped: Vec<&str> = EXT_NAMES.iter().copied().filter(|n| !available.iter().any(|a| a == n)).collect();
     let exe = pg_restore_bin();
     let mut child = Command::new(&exe)
         .args(["--no-owner", "-h", &host, "-p", &port, "-U", &user, "-d", &into])
         .args(skipped.iter().map(|n| format!("--exclude-schema={n}")))
+        // the password reaches pg_restore through its environment, never its argv (ADR 0003)
+        .envs(password.map(|p| ("PGPASSWORD", p)))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
