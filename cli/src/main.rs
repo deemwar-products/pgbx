@@ -10,9 +10,11 @@
 mod diagnose;
 mod policy;
 mod profile;
+mod query;
 mod s3restore;
 mod setup;
 mod skill;
+mod tunnel;
 mod ui;
 
 use postgres::types::ToSql;
@@ -29,15 +31,16 @@ const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict"];
+const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all"];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
-    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile",
+    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
+    "ssh-jump", "tunnel-idle", "max-rows", "serve",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
-    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile",
+    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -131,11 +134,21 @@ first-time server setup (guarded: shows the plan; --yes writes; never restarts P
       credentials file (0600, owner postgres; keys read from env vars, default AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
 profiles (one per server; never stores passwords or S3 keys):
   pgbx profile add NAME [--host H --port P --user U --admin-db D --s3-endpoint U --s3-bucket B --s3-region R
-                         --server-name S --credentials-file F]   (the first profile becomes the default)
+                         --server-name S --credentials-file F --ssh T --ssh-port N --ssh-jump J
+                         --tunnel-idle 10m]   (the first profile becomes the default)
   pgbx profile list | show NAME | remove NAME | use NAME          (use = set the default)
   --profile NAME or PGBX_PROFILE on any command; precedence: flag > PGHOST/PGPORT/PGUSER > profile > default
 agent skill:
   pgbx skill install [--no-codex] | uninstall | where
+read queries (one statement, inside BEGIN READ ONLY, then ROLLBACK):
+  pgbx query \"SQL\" [--db D] [--max-rows 1000] [--timeout 30s]
+      SELECT/WITH/TABLE/VALUES/SHOW/EXPLAIN only; refuses writes, row locks and side-effect functions
+      (a best-effort guard for agents, not a security boundary: give the user a read-only role yourself)
+      -> columns[{name,type}], rows[], row_count, truncated
+over ssh (system ssh; keys/agent/~/.ssh/config are ssh's business):
+  --ssh user@host [--ssh-port N] [--ssh-jump J]   tunnels Postgres; doctor/logs/diagnose/setup run there
+  pgbx tunnel [open] | list | close [NAME | --all]
+      the forward is shared by later commands and closes after --tunnel-idle (default 10m) unused
 common: --json --profile NAME --host --port --user --admin-db --timeout SECS (PGHOST/PGPORT/PGUSER/PGPASSWORD honoured)
 TS always carries a UTC offset: '2026-01-31 14:00:00+00'";
 
@@ -201,6 +214,7 @@ pub fn check_new_db(src: &str, into: &str, exists: bool) -> Result<(), String> {
 struct Ctx {
     a: Args,
     admin_db: Option<String>,
+    tunnel: std::sync::OnceLock<u16>,
 }
 
 impl Ctx {
@@ -208,12 +222,25 @@ impl Ctx {
         self.a.get("db").unwrap_or("postgres").to_string()
     }
 
-    fn connect(&self, db: &str) -> Result<Client, String> {
+    /// host, port, user to connect to: flags/env/defaults, or the local end of the ssh tunnel (opened once).
+    fn target(&self) -> Result<(String, u16, String), String> {
         let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let user = self.a.get("user").map(String::from).or(env("PGUSER")).unwrap_or("postgres".into());
+        if self.a.has("ssh") {
+            if self.tunnel.get().is_none() {
+                let _ = self.tunnel.set(tunnel::ensure(&self.a, self.a.get("profile"))?);
+            }
+            return Ok(("127.0.0.1".into(), *self.tunnel.get().unwrap(), user));
+        }
         let host = self.a.get("host").map(String::from).or(env("PGHOST")).unwrap_or(DEFAULT_HOST.into());
         let port: u16 = self.a.get("port").map(String::from).or(env("PGPORT")).unwrap_or("5432".into())
             .parse().map_err(|_| "bad --port".to_string())?;
-        let user = self.a.get("user").map(String::from).or(env("PGUSER")).unwrap_or("postgres".into());
+        Ok((host, port, user))
+    }
+
+    fn connect(&self, db: &str) -> Result<Client, String> {
+        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let (host, port, user) = self.target()?;
         let mut c = postgres::Config::new();
         c.host(&host).port(port).user(&user).dbname(db).application_name("pgbx").connect_timeout(Duration::from_secs(5));
         if let Some(pw) = env("PGPASSWORD") {
@@ -526,11 +553,17 @@ fn main() {
     let mut a = a;
     let cmd = a.cmd.clone();
     let lvl = level(&cmd, &a);
+    if cmd == "tunnel" && a.has("serve") {
+        std::process::exit(tunnel::serve(&a)); // the detached helper: its flags are complete, no profile lookup
+    }
     let prof = if cmd == "profile" { Ok(None) } else { profile::apply_from_disk(&mut a) };
-    let mut cx = Ctx { a, admin_db: None };
+    let mut cx = Ctx { a, admin_db: None, tunnel: Default::default() };
     let r = match cmd.as_str() {
         _ if prof.is_err() => Err(prof.clone().unwrap_err()),
         "profile" => profile::run_sys(&cx.a),
+        c if tunnel::runs_remotely(c, &cx.a) => tunnel::run_remote(c, &cx.a),
+        "query" => query::run(&mut cx),
+        "tunnel" => tunnel::run(&cx.a, cx.a.get("profile")),
         "status" => cmd_status(&mut cx),
         "list" => cmd_list(&mut cx),
         "now" => cmd_now(&mut cx),

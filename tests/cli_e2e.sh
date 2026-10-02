@@ -66,6 +66,11 @@ out=$(J db-restore --db shop --into shop_x --time '2026-01-01 00:00:00'); rc=$?;
 out=$(J frobnicate); rc=$?; check "unknown command: JSON usage error, exit 2" "$(onejson "$out")|$(jq1 "$out" .ok)|$rc" "yes|false|2"
 out=$(J now --bogus-flag); rc=$?; check "unknown flag: JSON usage error, exit 2" "$(onejson "$out")|$(jq1 "$out" .ok)|$rc" "yes|false|2"
 
+echo "## d. pgbx query (read ones of pgbx.* allowed; the rest refused; more in tests/ssh_e2e.sh)"
+out=$(J query "SELECT state FROM pgbx.status()" --db shop); check "query pgbx.status()" "$(jq1 "$out" .ok)|$(jq1 "$out" .row_count)" "true|1"
+out=$(J query "SELECT pgbx.backup_now()" --db shop); rc=$?; refused "query pgbx.backup_now() refused" "$out" $rc 1 "side effects"
+out=$(J query "DELETE FROM pgbx.history" --db shop); rc=$?; refused "query DELETE refused" "$out" $rc 1 "SELECT-style"
+
 echo "## h. agent skill"
 X sh -c 'rm -rf /tmp/skh; mkdir -p /tmp/skh/claude; ln -s /tmp /tmp/skh/claude/foreign'
 SK() { $DC exec -T -u postgres -e HOME=/tmp/skh -e CLAUDE_SKILLS_DIR=/tmp/skh/claude db pgbx skill "$@" --no-codex --json 2>/dev/null; }

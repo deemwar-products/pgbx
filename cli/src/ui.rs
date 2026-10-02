@@ -284,7 +284,7 @@ pub fn run(cx: &mut Ctx) -> Result<Value, String> {
     let listen = cx.a.get("listen").unwrap_or(DEFAULT_LISTEN).to_string();
     let addr: SocketAddr = listen.parse().map_err(|_| format!("--listen '{listen}' must be IP:PORT, e.g. 127.0.0.1:8432"))?;
     let admin_db = cx.admin_db();
-    let ctx = Arc::new(Ctx { a: clone_args(&cx.a), admin_db: Some(admin_db) });
+    let ctx = Arc::new(Ctx { a: clone_args(&cx.a), admin_db: Some(admin_db), tunnel: Default::default() });
     let (role, priv_warn) = check_role(&ctx, cx.a.has("strict"))?;
     let mut warnings: Vec<String> = priv_warn.into_iter().collect();
     warnings.extend(bind_warning(&addr));

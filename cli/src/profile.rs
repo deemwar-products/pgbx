@@ -22,6 +22,10 @@ pub const KEYS: &[(&str, Option<&str>)] = &[
     ("s3-region", None),
     ("server-name", None),
     ("credentials-file", None),
+    ("ssh", None),
+    ("ssh-port", None),
+    ("ssh-jump", None),
+    ("tunnel-idle", None),
 ];
 
 type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -129,6 +133,7 @@ pub fn apply(a: &mut Args, st: &Store, env: Env) -> Result<Option<String>, Strin
         }
         a.flags.insert(k.to_string(), v.to_string());
     }
+    a.flags.insert("profile".into(), name.clone()); // names the shared ssh tunnel
     Ok(Some(name))
 }
 
@@ -175,8 +180,10 @@ pub fn run(a: &Args, env: Env) -> Result<Value, String> {
                     m.insert(k.to_string(), json!(v));
                 }
             }
-            if let Some(p) = m.get("port").and_then(|v| v.as_str()) {
-                p.parse::<u16>().map_err(|_| format!("bad --port '{p}'"))?;
+            for k in ["port", "ssh-port"] {
+                if let Some(p) = m.get(k).and_then(|v| v.as_str()) {
+                    p.parse::<u16>().map_err(|_| format!("bad --{k} '{p}'"))?;
+                }
             }
             if m.is_empty() {
                 return Err(format!("pgbx profile add {n} needs at least one of: {}",
