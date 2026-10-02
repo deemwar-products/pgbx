@@ -16,9 +16,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// The extension's schema names whose objects pg_restore skips when the target cannot install that extension:
-/// the current one and the product's old name (dumps taken before the rename stay restorable).
-const EXT_NAMES: [&str; 2] = ["pgbx", concat!("pgbackrest", "x")];
+/// The extension's schema names whose objects pg_restore skips when the target cannot install that extension.
+const EXT_NAMES: [&str; 1] = ["pgbx"];
 
 pub struct S3Flags {
     pub endpoint: String,
@@ -397,8 +396,6 @@ mod tests {
                    Command was: COMMENT ON EXTENSION pgbx IS 'x';\n\
                    pg_restore: warning: errors ignored on restore: 2\n";
         assert!(only_extension_errors(ext));
-        let old = ext.replace("pgbx", concat!("pgbackrest", "x"));
-        assert!(only_extension_errors(&old));
         let real = format!("{ext}pg_restore: error: could not execute query: ERROR:  relation \"orders\" already exists\n");
         assert!(!only_extension_errors(&real));
         assert!(!only_extension_errors("pg_restore: error: input file appears to be a text format dump\n"));
