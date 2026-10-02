@@ -114,6 +114,8 @@ older than `pgbx.audit_days` (default 30) is pruned except kept backups, open ga
 
 **When to use:** any question the other recipes do not answer and that a SELECT can: table sizes, row counts,
 connections, settings, replication, "what is in pgbx.history". Prefer this over ssh + psql or any shell.
+First check the database's memory (MEM-R-1): a saved question in `memories.md` is reused as written, and table and
+column names come from `tables.md`; if neither has them, look them up in `information_schema` instead of guessing.
 
 **Command:**
 ```bash

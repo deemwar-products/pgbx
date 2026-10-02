@@ -63,6 +63,10 @@ corpus = [
     ("who paused backups last week?", "audit-ui"),
     ("open the audit ui", "audit-ui"),
     ("pgbx ui", "audit-ui"),
+    ("remember this as orders today", "memory"),
+    ("save this query as daily signups", "memory"),
+    ("note the tables", "memory"),
+    ("what do you remember", "memory"),
 ]
 for text, want in corpus:
     got = route(text)

@@ -36,12 +36,19 @@ skill owns intent routing and recipe knowledge.
 - **The guarded gate is enforced in code — never bypass it.**
   `--yes`, the admin-database check and superuser are the human's signature.
   Never add them on your own, never retry with them after the error, never escalate roles.
+- **Every database has its own memory: read it first, write it only when asked.**
+  `${PGBX_MEMORY_DIR:-~/pgbx}/<connection>/<db>/memories.md` (facts, named questions + SQL) and `tables.md`
+  (tables and columns). Read both before any `pgbx query` or action on that database (MEM-R-1); reuse a saved
+  question's SQL instead of inventing one. Never create these files on your own: only when the user says
+  "remember", "put it here", "save this query" (MEM-W-1/2). Never store rows, credentials or links.
+  `PGBX_MEMORY=off` turns it off.
 - **Restore one database = into a NEW database, never in place.** The live
   database is untouched; swapping names afterwards is destructive and needs approval.
 
 ## Session Context
 
-Held in conversation memory only — no file writes.
+Held in conversation memory only. The per-database memory files (`references/memory.md`) are the user's,
+and are written only when the user asks.
 
 ```
 pgbx_available:   true | false      # from step-00
@@ -49,6 +56,7 @@ profile:          prod               # from `pgbx profile list --json`; --profil
 target_db:        myapp             # database the user means
 admin_db:         postgres          # pgbx.admin_db, for overview()/doctor()
 last_job_id:      1234              # history id of the job we just queued
+memory_dir:       ~/pgbx/prod/myapp # ${PGBX_MEMORY_DIR:-~/pgbx}/<profile>/<db>; read at start (MEM-R-1)
 ```
 
 ## Process
@@ -83,4 +91,5 @@ Runs:
 | Verify | restore tests, verify schedule, failures | `references/verify.md` |
 | Policy | schedule, retention, pause/resume, data scope | `references/policy.md` |
 | Access | roles, download links | `references/access.md` |
+| Memory | per-database memories.md / tables.md: read first, write only when asked | `references/memory.md` |
 | Diagnose | postgres down, disk full, WAL growing, OOM, corruption — cause + tiered steps | `references/diagnose.md` |

@@ -54,3 +54,6 @@ Stop on unhealthy and give the plain-language fix, e.g.:
 | Postgres not reachable | "Postgres is down — only the CLI can help; see step-04 (or step-03 if the server is lost)." |
 
 Read-only intents may continue past warnings; mutations may not continue past failures.
+
+Once the profile and the database are known, read that database's memory (`references/memory.md`, MEM-R-1):
+`${PGBX_MEMORY_DIR:-~/pgbx}/<profile>/<db>/memories.md` and `tables.md`. Missing files are normal; do not create them.

@@ -19,7 +19,7 @@ const asks = [
 	{ you: 'Is my database backed up?', cmd: 'pgbx status --json' },
 	{ you: "Why did last night's backup fail?", cmd: 'pgbx doctor --json' },
 	{ you: "Restore yesterday's copy of shop so I can check it", cmd: 'pgbx db-restore --db shop --into shop_check --time 2026-10-01T23:00:00Z' },
-	{ you: 'How many orders came in today?', cmd: `pgbx query "SELECT count(*) FROM orders WHERE created_at > now() - interval '1 day'"` },
+	{ you: 'How many orders came in today?', note: 'reuses the query you saved in ~/pgbx/prod/shop/memories.md', cmd: `pgbx query "SELECT count(*) FROM orders WHERE created_at > now() - interval '1 day'"` },
 ];
 ---
 
@@ -60,9 +60,13 @@ const asks = [
 					<li>
 						<span class="you">“{a.you}”</span>
 						<code>{a.cmd}</code>
+						{a.note && <span class="note">{a.note}</span>}
 					</li>
 				))}
 			</ul>
+			<p class="skill">Each database gets its own memory, <code>~/pgbx/&lt;connection&gt;/&lt;db&gt;/memories.md</code> and
+				<code>tables.md</code>: the agent reads it first and writes to it only when you say "remember this".
+				<a href={`${base}/agents/skill/#memory-one-folder-per-database`}>How memory works</a>.</p>
 			<p class="skill">Add it with <code>pgbx skill install</code> (the installer offers it too).</p>
 		</div>
 	</section>
@@ -210,6 +214,10 @@ const asks = [
 		color: var(--sl-color-accent-high);
 		overflow-x: auto;
 		white-space: nowrap;
+	}
+	.asks .note {
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-3);
 	}
 	.agent .skill {
 		margin-top: 0.875rem;

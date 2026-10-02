@@ -34,6 +34,26 @@ From a checkout: `sh skills/pgbx-skill/install.sh`; self-check: `sh skills/pgbx-
 - One-database restore always lands in a **new** database.
 - Every job is waited on; success is never claimed from `queued`.
 
+## Memory: one folder per database
+
+The agent keeps what it should know about each database in plain Markdown files on your machine:
+
+```
+~/pgbx/<connection>/<db>/memories.md   # facts and named questions with their SQL ("orders today")
+~/pgbx/<connection>/<db>/tables.md     # tables, columns and what they mean
+```
+
+`<connection>` is the profile name (`prod`), `<db>` the database. Before it writes a query or acts on a
+database, the agent reads both files, so "how many orders came in today?" reuses the SQL you saved instead of
+guessing table names. It **never creates or changes these files on its own**: only when you say "remember
+this", "put it here", "save this query as …" or "note the tables". It never stores rows, passwords, keys or
+download links. They are your files: edit them by hand, keep them in git, or delete them.
+
+| setting | default | |
+|---|---|---|
+| `PGBX_MEMORY_DIR` | `~/pgbx` | where the per-database folders live |
+| `PGBX_MEMORY` | `on` | `off`: the agent neither reads nor writes memory |
+
 ## Safety tiers
 
 | tier | examples | agent rule |

@@ -24,6 +24,15 @@
       </steps>
     </route>
 
+    <route id="memory" mode="read-only">
+      <when>remember this, remember that, put it here, save this query, save the query as, note the tables, remember the schema, what do you remember, forget that, clear the memory</when>
+      <goal>Read or append the database's own memory files; create them only because the user asked.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Pick the profile and database.</step>
+        <step ref="memory.md">MEM recipes.</step>
+      </steps>
+    </route>
+
     <route id="backup" mode="safe-mutation">
       <when>take a backup, backup now, back up the database, backup the server, snapshot the database, pgbx now</when>
       <goal>Queue a backup, wait for it, return the backup id and S3 key.</goal>
