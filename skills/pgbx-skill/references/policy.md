@@ -99,3 +99,25 @@ first, listing `rowless_tables()`. Resetting with `set_data_scope()` is safe.
 **Common errors:** bare names mean `public.<name>`; `*` and `?` are wildcards.
 
 **User-visible formatting:** "Rows skipped for: <tables>."
+
+### POL-R-6: Quietest time to back up (suggest, never auto-apply)
+
+**When to use:** "when should backups run", "backups slow the app down", "move backups to a quiet time",
+"suggest a schedule", "pgbx schedule suggest", doctor's `schedule_in_quiet_window` warning.
+
+**Command:**
+```bash
+pgbx schedule suggest --db myapp --json                    # read-only: the suggestion + apply_sql
+pgbx schedule suggest --db myapp --apply --yes --json      # only after the human agreed to the new time
+```
+Fallback (SQL): `psql -XAtq -d myapp -c "SELECT row_to_json(w) FROM pgbx.suggest_window() w"`
+
+**Expected response:** `suggestion` = `start_at` ('daily 03:00 UTC'), `cron`, `score` vs `current_score` (activity
+relative to an average hour), `confidence` (`none` | `low` | `high`), `est_duration`, `days_sampled`; `apply_sql` =
+`SELECT pgbx.configure(schedule => '...')` to copy into a migration; `applied`.
+
+**Common errors:** `confidence: none` → no activity learned yet (hours of sampling needed); do not apply. `low` → say
+so and prefer waiting a week. `refusing without --yes` → the schedule is never changed without the human.
+
+**User-visible formatting:** "Quietest: <start_at> (<score>x vs <current_score>x now, <confidence> confidence); apply
+with: <apply_sql>". Never apply on your own.

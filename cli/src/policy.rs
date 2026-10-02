@@ -64,6 +64,9 @@ fn text_call(cx: &mut Ctx, sql: &str, p: &[&(dyn postgres::types::ToSql + Sync)]
 
 pub fn schedule(cx: &mut Ctx) -> Out {
     let db = cx.db();
+    if cx.a.pos.first().map(String::as_str) == Some("suggest") {
+        return suggest(cx);
+    }
     match cx.a.pos.first().cloned() {
         None => {
             let mut c = cx.connect(&db)?;
@@ -72,6 +75,44 @@ pub fn schedule(cx: &mut Ctx) -> Out {
         }
         Some(s) => text_call(cx, "SELECT pgbx.set_schedule($1)", &[&s]),
     }
+}
+
+/// `pgbx schedule suggest [--hours N] [--apply [--yes]]`: the quietest window learned from activity, with the
+/// configure() call to copy. Never applied by itself: --apply asks first on a terminal; otherwise it needs --yes.
+pub fn suggest(cx: &mut Ctx) -> Out {
+    let db = cx.db();
+    let hours: i32 = match cx.a.get("hours") {
+        Some(h) => h.parse().ok().filter(|n| (1..=12).contains(n)).ok_or("--hours must be 1-12")?,
+        None => 1,
+    };
+    let mut c = cx.connect(&db)?;
+    let w = one(&mut c, "SELECT * FROM pgbx.suggest_window($1)", &[&hours])?;
+    let mut out = json!({"ok": true, "database": db, "suggestion": w.clone(),
+        "apply_sql": w["apply_sql"], "applied": false,
+        "note": "never applied by itself: run apply_sql in a migration, or pgbx schedule suggest --apply"});
+    if !cx.a.has("apply") {
+        return Ok(out);
+    }
+    let cron = w["cron"].as_str().ok_or("nothing to apply: no activity samples yet (the worker learns them hour by hour)")?.to_string();
+    let what = format!("set the backup schedule of {db} to '{cron}' ({}; now {})", crate::scalar(&w["start_at"]), crate::scalar(&w["current_schedule"]));
+    if !cx.a.has("yes") {
+        use std::io::IsTerminal;
+        if cx.a.has("json") || !std::io::stdin().is_terminal() {
+            return Err(format!("refusing without --yes: {what}"));
+        }
+        eprint!("{what}? [y/N] ");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            out["note"] = json!("not applied (answered no)");
+            return Ok(out);
+        }
+    }
+    let r = one(&mut c, "SELECT schedule, schedule_label FROM pgbx.configure(schedule => $1)", &[&cron])?;
+    out["applied"] = json!(true);
+    out["schedule"] = r;
+    out["note"] = json!(what);
+    Ok(out)
 }
 
 fn current_retention(cx: &mut Ctx, db: &str) -> Result<(i64, i64), String> {

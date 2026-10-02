@@ -25,7 +25,7 @@ check "viewer starts under --strict" "$(X cat /tmp/pgbx-ui.out | jq -r '"\(.ok) 
 
 check "GET /" "$(status GET /)" "200"
 check "page has no external fetches" "$(body / | grep -c 'https\?://')" "0"
-for e in /api/overview /api/db/postgres "/api/timeline?days=30" /api/health; do check "GET $e" "$(status GET "$e")" "200"; done
+for e in /api/overview /api/db/postgres "/api/timeline?days=30" /api/health /api/queue; do check "GET $e" "$(status GET "$e")" "200"; done
 check "overview: databases, read-only" "$(body /api/overview | jq -r '"\(.ok) \(.connection.read_only) \(.databases|length>0)"')" "true on true"
 check "timeline: rows with who/when/what" "$(body '/api/timeline?days=30' | jq -r '(.rows|length>0) and (.rows[0]|has("who") and has("at") and has("kind") and has("database"))')" "true"
 check "timeline: has backups" "$(body '/api/timeline?days=30' | jq -r '[.rows[]|select(.kind=="backup")]|length>0')" "true"

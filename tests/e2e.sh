@@ -170,7 +170,9 @@ check "its connection is tagged pgbx_dump" "$(P -c "SELECT count(*) FROM pg_stat
 sleep 3; check "doctor(): long_running_job sees it" "$(P -c "SELECT ok||' '||(detail LIKE '%pgbx_dump in locked%') FROM pgbx.doctor() WHERE name='long_running_job'")" "false true"
 for _ in $(seq 30); do r=$(P -d locked -c "SELECT state||' '||coalesce(params->>'lock_timeouts','-')||' '||(params ? 'deferred_until') FROM pgbx.history WHERE id=$id"); [ "$r" = "queued 1 true" ] && break; sleep 1; done
 check "lock timeout re-queues the backup (not failed)" "$r" "queued 1 true"
-check "logged once" "$(docker compose -f compose.test.yml logs --since "$since" db 2>&1 | grep -c "locked: backup #$id could not get its table locks")" 1
+# job threads hand their log lines to the worker's main loop, which writes them within a second
+for _ in $(seq 10); do n=$(docker compose -f compose.test.yml logs --since "$since" db 2>&1 | grep -c "locked: backup #$id could not get its table locks"); [ "$n" -ge 1 ] && break; sleep 1; done
+check "logged once" "$n" 1
 wait $holder
 for _ in $(seq 120); do r=$(P -d locked -c "SELECT state FROM pgbx.history WHERE id=$id"); case "$r" in done|failed) break;; esac; sleep 1; done
 check "runs after the lock is released" "$r" done
@@ -192,7 +194,7 @@ echo "## 17. bandwidth caps (token bucket): pgbx.upload_kbps / download_kbps = 2
 P -c "ALTER SYSTEM SET pgbx.upload_kbps = 2048" -c "ALTER SYSTEM SET pgbx.download_kbps = 2048" -c "SELECT pg_reload_conf()" >/dev/null
 P -c "DROP DATABASE IF EXISTS big_capped WITH (FORCE)"
 capped() { # id -> "<state> <MiB/s>" once finished
-  for _ in $(seq 240); do r=$(P -d big -c "SELECT state||' '||coalesce(round(bytes / extract(epoch FROM finished - started) / 1048576, 2)::text, '-') FROM pgbx.history WHERE id=$1");
+  for _ in $(seq 240); do r=$(P -d big -c "SELECT state||' '||coalesce(round((bytes / extract(epoch FROM finished - started) / 1048576)::numeric, 2)::text, '-') FROM pgbx.history WHERE id=$1");
     case "$r" in done*|failed*) break;; esac; sleep 1; done; echo "$r"; }
 within() { awk -v r="${1#* }" -v s="${1%% *}" 'BEGIN { print (s == "done" && r >= 1.8 && r <= 2.2) ? "yes" : "no (" s ", " r " MiB/s)" }'; }
 r=$(capped "$(P -d big -c "SELECT pgbx.backup_now()")"); echo "  backup: $r MiB/s"; check "upload at 2 MiB/s ±10%" "$(within "$r")" yes
@@ -218,7 +220,7 @@ check "2x verify_now() = one job" "$(echo "$r" | wc -l | tr -d ' ')" 1
 P -d shop -c "SELECT pgbx.cancel($r)" >/dev/null
 check "queued restore test cancelled" "$(P -d shop -c "SELECT state FROM pgbx.history WHERE id=$r")" cancelled
 sleep 3; check "a cancelled job never starts" "$(P -d shop -c "SELECT state||'|'||(started IS NULL) FROM pgbx.history WHERE id=$r")" "cancelled|true"
-bad=$(P -d shop -c "SELECT pgbx.cancel($r)" 2>&1); case "$bad" in *"only a queued job can be cancelled"*) echo "  PASS cancel of a finished job refused"; pass=$((pass+1));; *) echo "  FAIL: $bad"; fail=$((fail+1));; esac
+bad=$(P -d shop -c "SELECT pgbx.cancel($r)" 2>&1); case "$bad" in *"only a queued or running job can be cancelled"*) echo "  PASS cancel of a finished job refused"; pass=$((pass+1));; *) echo "  FAIL: $bad"; fail=$((fail+1));; esac
 P -c "ALTER SYSTEM SET pgbx.coalesce_manual = off" -c "SELECT pg_reload_conf()" >/dev/null; sleep 1
 r=$(P -d shop -c "BEGIN" -c "SELECT pgbx.backup_now()" -c "SELECT pgbx.backup_now()" -c "COMMIT" 2>/dev/null | sort -u)
 check "coalesce_manual=off queues each call" "$(echo "$r" | wc -l | tr -d ' ')" 2

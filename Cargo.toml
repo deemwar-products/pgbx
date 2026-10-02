@@ -24,6 +24,7 @@ libc = "0.2"
 rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls"] }
 croner = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+miniz_oxide = "0.8"
 
 [dev-dependencies]
 [dev-dependencies.pgrx-tests]

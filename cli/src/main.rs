@@ -9,6 +9,8 @@
 
 mod client_only;
 mod diagnose;
+mod jobs;
+mod load;
 mod memories;
 mod policy;
 mod profile;
@@ -34,16 +36,17 @@ const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite"];
+const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite", "apply"];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
     "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
-    "ssh-jump", "tunnel-idle", "max-rows", "serve", "as",
+    "ssh-jump", "tunnel-idle", "max-rows", "serve", "as", "hours", "gate",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
     "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel", "memories",
+    "jobs", "load",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -111,6 +114,9 @@ read-only:
   pgbx diagnose [--log FILE] [--pgdata DIR]  why Postgres is down / disk full / pg_wal growing: cause, evidence,
                                              and steps tagged readonly/safe/guarded/destructive (never run by pgbx)
   pgbx logs     [--lines N]                  recent failed jobs
+  pgbx jobs                                  the server-wide job queue: what runs (slot / restore lane), what waits and why
+  pgbx load     [--db X]                     the load gate: last load sample, thresholds, per database what it would
+                                             defer (shadow, the default), deferred (on) or forced
   pgbx ui       [--listen 127.0.0.1:8432] [--strict]
                                              read-only audit web UI (overview, 30-day timeline, health);
                                              --strict refuses a role that could change backups
@@ -126,10 +132,15 @@ new server / disaster (no extension needed on the target; needs pg_restore):
       newest dump at or before TS (default: newest) -> CREATE DATABASE NEWDB (refused if it exists) -> pg_restore
 policy / access (show with no arguments; changes that reduce protection need --yes):
   pgbx schedule [TEXT]            pgbx retention [--max-backups N] [--max-days N]
+  pgbx schedule suggest [--db X] [--hours N] [--apply [--yes]]
+                                  the quietest window learned from activity + the configure() call to copy;
+                                  never applied by itself (--apply asks y/N on a terminal, else needs --yes)
   pgbx pause --reason TEXT --yes  pgbx resume
   pgbx scope [--include P1,P2] [--exclude P1,P2] [--reset]
   pgbx verify-schedule TEXT|never pgbx link [--backup-id N] [--expires '1 hour']
   pgbx overview                   (admin database: every database on the server)
+  pgbx jobs cancel ID [--db X] --yes        cancel a queued or running job (a running one is stopped, nothing left in S3)
+  pgbx load --gate off|shadow|on|default --db X   the load gate for one database (on needs --yes)
 setup (guarded: shows the plan; --yes writes):
   pgbx setup server [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
               --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
@@ -183,11 +194,14 @@ pub fn level(cmd: &str, a: &Args) -> Level {
         "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "remove" | "use")) => Level::Safe,
         "memories" if a.pos.first().map(String::as_str) == Some("import") => Level::Safe,
         "schedule" if shows => Level::ReadOnly,
+        "schedule" if a.pos.first().map(String::as_str) == Some("suggest") && !a.has("apply") => Level::ReadOnly,
         "schedule" => Level::Safe,
         "retention" | "scope" if shows => Level::ReadOnly,
         "retention" | "scope" | "pause" | "setup" => Level::Guarded,
         "verify-schedule" if a.pos.first().and_then(|s| policy::verify_schedule_risk(s)).is_some() => Level::Guarded,
         "verify-schedule" => Level::Safe,
+        "jobs" if a.pos.first().map(String::as_str) == Some("cancel") => Level::Guarded,
+        "load" => load::level_of(a),
         _ => Level::ReadOnly,
     }
 }
@@ -312,7 +326,7 @@ fn wait_job(c: &mut Client, id: i64, timeout: Duration) -> Result<Value, String>
     loop {
         let r = one(c, "SELECT id, kind, state, started, finished, s3_key, bytes, error, params FROM pgbx.history WHERE id = $1", &[&id])?;
         match r["state"].as_str() {
-            Some("done") | Some("failed") | Some("expired") => return Ok(r),
+            Some("done") | Some("failed") | Some("expired") | Some("cancelled") => return Ok(r),
             None => return Err(format!("job {id} not found in pgbx.history")),
             _ => {}
         }
@@ -603,6 +617,8 @@ fn main() {
         "db-restore" => cmd_db_restore(&mut cx),
         "doctor" => cmd_doctor(&mut cx),
         "logs" => cmd_logs(&mut cx),
+        "jobs" => jobs::run(&mut cx),
+        "load" => load::run(&mut cx),
         "schedule" => policy::schedule(&mut cx),
         "retention" => policy::retention(&mut cx),
         "pause" => policy::pause(&mut cx),
@@ -643,6 +659,10 @@ fn main() {
         if v.get("diagnosis").is_some() {
             print!("\n{}", diagnose::text(&v["diagnosis"]));
         }
+    } else if cmd == "load" && ok && v.get("sample").is_some() {
+        print!("{}", load::text(&v));
+    } else if cmd == "jobs" && ok && v.get("jobs").is_some() {
+        print!("{}", jobs::text(&v));
     } else if cmd == "diagnose" && ok {
         print!("{}", diagnose::text(&v));
     } else if let Some(e) = v.get("error").filter(|_| !ok) {
@@ -749,6 +769,13 @@ mod tests {
         assert_eq!(level("schedule", &p(&["schedule"])), Level::ReadOnly);
         assert_eq!(level("profile", &p(&["profile", "list"])), Level::ReadOnly);
         assert_eq!(level("profile", &p(&["profile", "add", "x", "--host", "h"])), Level::Safe);
+        assert_eq!(level("jobs", &p(&["jobs"])), Level::ReadOnly);
+        assert_eq!(level("load", &p(&["load"])), Level::ReadOnly);
+        assert_eq!(level("load", &p(&["load", "--gate", "on", "--db", "x"])), Level::Guarded);
+        assert_eq!(level("load", &p(&["load", "--gate", "shadow", "--db", "x"])), Level::Safe);
+        assert_eq!(level("schedule", &p(&["schedule", "suggest"])), Level::ReadOnly);
+        assert_eq!(level("schedule", &p(&["schedule", "suggest", "--apply"])), Level::Safe);
+        assert_eq!(level("jobs", &p(&["jobs", "cancel", "7"])), Level::Guarded);
     }
 
     #[test]

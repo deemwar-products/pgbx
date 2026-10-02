@@ -44,6 +44,11 @@ Every `--json` reply is one object with at least:
 | `diagnose [--log F] [--pgdata DIR]` | readonly | `postgres`, `probable_cause`, `evidence[]`, `steps[]`, `facts` |
 | `ui [--listen 127.0.0.1:8432] [--strict]` | readonly | serves the read-only [audit UI](../../guides/audit-ui/); `GET` only |
 | `logs [--lines N]` | readonly | `recent_failures[]` |
+| `jobs` | readonly | `jobs[]` (`database, job_id, kind, trigger, state, position, slot, detail, progress, eta_start, eta_finish, est_bytes, done_bytes`), `slots`; text mode: one line per job |
+| `jobs cancel ID [--db X] --yes` | guarded | `database`, `job_id`, `message`; `--db` may be left out when the id is unique in the queue |
+| `load [--db X]` | readonly | `sample` (last load sample: `load_busy`, `load_reasons`, `load_active`, `load_tps`), `settings` (gate and thresholds), `databases[]` (`load_gate, would_defer_7d, deferred_7d, forced_7d`), `deferred_jobs[]`; with `--db`: `recent_jobs` |
+| `load --gate off\|shadow\|on\|default --db X [--yes]` | safe / guarded (`on`) | `database`, `load_gate` |
+| `schedule suggest [--db X] [--hours N] [--apply [--yes]]` | readonly / safe (`--apply`) | `suggestion` (row of `suggest_window()`), `apply_sql`, `applied`; never applied unless asked: `--apply` asks y/N on a terminal, else needs `--yes` |
 | `now [--db X] [--wait]` | safe | `database`, `job_id`, `state`, `watch`; with `--wait`: `job` |
 | `verify [--db X] [--wait]` | safe | same as `now` |
 | `db-restore --db X --into NEWDB [--time TS] [--wait]` | safe | same as `now`; refuses an existing database or the source |

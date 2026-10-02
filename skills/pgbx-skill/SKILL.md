@@ -95,11 +95,11 @@ Runs:
 
 | Family | Covers | Reference |
 |---|---|---|
-| Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries (STAT-R-7, also with no extension) | `references/status.md` |
+| Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries (STAT-R-7, also with no extension), job queue + ETA + cancel (`pgbx jobs`), server load / gate (`pgbx load`) | `references/status.md` |
 | Backup | backup now, wait, backup id | `references/backup.md` |
 | Restore | db into a new database, from S3 onto a new server | `references/restore.md` |
 | Verify | restore tests, verify schedule, failures | `references/verify.md` |
-| Policy | schedule, retention, pause/resume, data scope | `references/policy.md` |
+| Policy | schedule, quietest time to back up (`pgbx schedule suggest`, never auto-applied), retention, pause/resume, data scope | `references/policy.md` |
 | Access | roles, download links | `references/access.md` |
 | Memory | per-database memories.md / tables.md: read first, write only when asked | `references/memory.md` |
 | Diagnose | postgres down, disk full, WAL growing, OOM, corruption — cause + tiered steps | `references/diagnose.md` |

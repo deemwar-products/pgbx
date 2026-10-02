@@ -16,6 +16,7 @@ header h1{font-size:16px;margin:0}
 nav{display:flex;gap:4px;flex-wrap:wrap}
 nav a{padding:6px 10px;border-radius:6px;color:var(--fg);text-decoration:none}
 nav a.on{background:var(--chip);font-weight:600}
+button.apply{background:var(--chip);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:4px 10px;cursor:pointer}
 #theme{margin-left:auto;background:none;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:4px 8px;cursor:pointer}
 main{padding:16px;max-width:1300px;margin:0 auto}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:14px}
@@ -27,7 +28,7 @@ td.wrap{white-space:normal;min-width:220px}
 th{font-size:12px;color:var(--mute);font-weight:600}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--mute)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.info{color:var(--info)}
-.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}.dot.info{background:var(--info)}
+.dot.mute{background:var(--line)}.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}.dot.info{background:var(--info)}
 .mute{color:var(--mute)}
 .chip{display:inline-block;padding:1px 7px;border-radius:10px;background:var(--chip);font-size:12px}
 .filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
@@ -57,6 +58,7 @@ const ago = v => { if (!v) return ""; const s = (Date.now() - Date.parse(v)) / 1
   const a = Math.abs(s), f = a < 3600 ? Math.round(a/60) + " min" : a < 172800 ? Math.round(a/3600) + " h" : Math.round(a/86400) + " d";
   return s >= 0 ? f + " ago" : "in " + f; };
 function tone(s) { s = String(s || "").toLowerCase();
+  if (/^cancel/.test(s)) return "mute";
   if (/fail|error|problem|overdue|open|never|worker error/.test(s)) return "bad";
   if (/pause|inactive|running|queued|starting|expired/.test(s)) return "warn";
   if (/ok|done|backed|healthy|closed|scheduled|idle/.test(s)) return "ok";
@@ -71,10 +73,34 @@ function table(cols, rows, empty) {
     rows.map(r => `<tr>${cols.map(c => `<td${c[2] ? ' class="wrap"' : ""}>${c[1](r)}</td>`).join("")}</tr>`).join("") + "</tbody></table></div>";
 }
 
+function queueCard(q) {
+  return `<div class="card"><h2>Job queue (${q.jobs.length}) <span class=mute>· slots ${esc(q.slots.max_concurrent_jobs)}, restore lane ${esc(q.slots.restore_lane)}</span></h2>` + table([
+    ["database", r => `<a class="db" href="#db/${encodeURIComponent(r.database)}">${esc(r.database)}</a>`],
+    ["job", r => esc(r.job_id)], ["kind", r => `<span class=chip>${esc(r.kind)}</span>`], ["state", r => st(r.state)],
+    ["where", r => r.position != null ? `#${esc(r.position)} in line` : r.slot === 0 ? "restore lane" : r.slot != null ? `slot ${esc(r.slot)}` : ""],
+    ["since", r => `${ts(r.started_at || r.requested_at)} <span class=mute>${ago(r.started_at || r.requested_at)}</span>`],
+    ["progress / estimate", r => esc(r.progress || ""), 1],
+    ["why / what", r => esc(r.detail), 1],
+  ], q.jobs, "nothing running or queued") + "</div>";
+}
+
+function loadCard(l) {
+  const s = l.sample || {}, g = l.settings || {};
+  const now = s.load_busy === true ? `<span class=warn>busy: ${esc(s.load_reasons)}</span>` : s.load_busy === false ? "<span class=ok>quiet</span>" : "<span class=mute>no sample yet</span>";
+  return `<div class="card"><h2>Load gate <span class=mute>· pgbx.load_gate = ${esc(g.load_gate)} · manual jobs: ${esc(g.gate_manual_jobs)}</span></h2>
+    <p>${now} <span class=mute>at ${ts(s.load_at)} · ${esc(s.load_active)} active · ${esc(s.load_tps)} tps · busy when active &gt; ${esc(g.busy_active_backends)},
+       tps &gt; ${esc(g.busy_tps)} · max_defer ${esc(g.max_defer)}</span></p>` + table([
+    ["database", r => `<a class="db" href="#db/${encodeURIComponent(r.database)}">${esc(r.database)}</a>`],
+    ["gate", r => esc(r.load_gate)], ["would have waited (7 d)", r => esc(r.would_defer_7d)],
+    ["deferred (7 d)", r => esc(r.deferred_7d)], ["forced (7 d)", r => esc(r.forced_7d)],
+  ], l.databases || [], "no database reported yet") +
+  `<p class="mute">shadow records what it would defer and never delays; turn it on per database: pgbx load --gate on --db NAME --yes</p></div>`;
+}
+
 async function overview() {
-  const j = await get("/api/overview");
+  const [j, q, l] = await Promise.all([get("/api/overview"), get("/api/queue").catch(() => null), get("/api/load").catch(() => null)]);
   $("#who").textContent = `read-only · role ${j.connection.role} · ${j.connection.server_name || ""}`;
-  return `<div class="card"><h2>Every database (${j.databases.length})</h2>` + table([
+  return (q ? queueCard(q) : "") + (l ? loadCard(l) : "") + `<div class="card"><h2>Every database (${j.databases.length})</h2>` + table([
     ["database", r => `<a class="db" href="#db/${encodeURIComponent(r.database)}">${esc(r.database)}</a>`],
     ["state", r => st(r.state)], ["schedule", r => esc(r.schedule)],
     ["last backup", r => `${ts(r.last_backup_at)} <span class=mute>${ago(r.last_backup_at)}</span>`],
@@ -130,9 +156,28 @@ async function health() {
   ], j.checks) + "</div>";
 }
 
+function suggestCard(name, w) {
+  if (!w || !w.cron) return w ? `<div class="card"><h2>Quietest time to back up</h2><p class="mute">${esc(w.start_at)}</p></div>` : "";
+  const cli = `pgbx schedule suggest --db ${name} --apply`;
+  return `<div class="card"><h2>Quietest time to back up</h2>
+    <p><b>${esc(w.start_at)}</b> <code>${esc(w.cron)}</code> · ${esc(w.score)}x average activity vs ${esc(w.current_score)}x for the
+       current schedule (${esc(w.current_schedule)}) · ${esc(w.confidence)} confidence, ${esc(w.days_sampled)} days sampled ·
+       backup takes ~${esc(w.est_duration)}</p>
+    <p class="mute">Never applied by itself. This page is read-only: Apply copies the call; run it in a migration or with the CLI.</p>
+    <p><button type="button" class="apply" data-sql="${esc(w.apply_sql)}">Apply (copy SQL)</button>
+       <button type="button" class="apply" data-sql="${esc(cli)}">Apply (copy CLI)</button>
+       <code>${esc(w.apply_sql)}</code> <span class="mute" id="copied"></span></p></div>`;
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("button.apply"); if (!b) return;
+  const done = m => { const c = $("#copied"); if (c) c.textContent = m; };
+  try { navigator.clipboard.writeText(b.dataset.sql).then(() => done("copied: " + b.dataset.sql), () => done("copy this: " + b.dataset.sql)); }
+  catch (err) { done("copy this: " + b.dataset.sql); }
+});
+
 async function db(name) {
   const j = await get("/api/db/" + encodeURIComponent(name)), s = j.status || {};
-  return `<div class="card"><h2>${esc(name)}</h2><p class="big">${st(s.state)}</p>
+  return suggestCard(name, j.suggestion) + `<div class="card"><h2>${esc(name)}</h2><p class="big">${st(s.state)}</p>
       <div class="scroll"><table><tbody>${Object.entries(s).map(([k, v]) => `<tr><th>${esc(k)}</th><td class=wrap>${esc(typeof v === "object" && v ? JSON.stringify(v) : v)}</td></tr>`).join("")}</tbody></table></div></div>
     <div class="card"><h2>Backups kept (${j.backups.length})</h2>` + table([
       ["id", r => esc(r.id)], ["taken", r => ts(r.taken_at)], ["age", r => esc(r.age)], ["trigger", r => esc(r.trigger)],
