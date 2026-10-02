@@ -9,9 +9,13 @@
 
 mod diagnose;
 mod policy;
+mod profile;
+mod query;
 mod s3restore;
 mod setup;
+mod setup_client;
 mod skill;
+mod tunnel;
 mod ui;
 
 use postgres::types::ToSql;
@@ -28,15 +32,16 @@ const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict"];
+const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill"];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
-    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf",
+    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
+    "ssh-jump", "tunnel-idle", "max-rows", "serve",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
-    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup",
+    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -123,14 +128,35 @@ policy / access (show with no arguments; changes that reduce protection need --y
   pgbx scope [--include P1,P2] [--exclude P1,P2] [--reset]
   pgbx verify-schedule TEXT|never pgbx link [--backup-id N] [--expires '1 hour']
   pgbx overview                   (admin database: every database on the server)
-first-time server setup (guarded: shows the plan; --yes writes; never restarts Postgres):
-  pgbx setup [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
+setup (guarded: shows the plan; --yes writes):
+  pgbx setup server [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
               --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
-      writes <config dir>/conf.d/pgbx.conf (shared_preload_libraries merged with what is loaded) and the
-      credentials file (0600, owner postgres; keys read from env vars, default AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
+      on the DB host, with sudo: writes <config dir>/conf.d/pgbx.conf (shared_preload_libraries merged with
+      what is loaded) and the credentials file (0600, owner postgres; keys read from env vars, default
+      AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY); prints the ONE restart command, never restarts Postgres.
+      `pgbx setup` alone is the same as `pgbx setup server`.
+  pgbx setup client [NAME] [--host H --port P | --ssh T [--ssh-port N --ssh-jump J]] [--user U] [--db D]
+              [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F] [--no-skill] [--yes]
+      on your laptop, no sudo: asks (or takes flags), saves the profile (default if first), tests it
+      (connect, extension version, status()), prints next steps, offers `pgbx skill install` on a terminal
+profiles (one per server; never stores passwords or S3 keys):
+  pgbx profile add NAME [--host H --port P --user U --admin-db D --s3-endpoint U --s3-bucket B --s3-region R
+                         --server-name S --credentials-file F --ssh T --ssh-port N --ssh-jump J
+                         --tunnel-idle 10m]   (the first profile becomes the default)
+  pgbx profile list | show NAME | remove NAME | use NAME          (use = set the default)
+  --profile NAME or PGBX_PROFILE on any command; precedence: flag > PGHOST/PGPORT/PGUSER > profile > default
 agent skill:
   pgbx skill install [--no-codex] | uninstall | where
-common: --json --host --port --user --admin-db --timeout SECS (PGHOST/PGPORT/PGUSER/PGPASSWORD honoured)
+read queries (one statement, inside BEGIN READ ONLY, then ROLLBACK):
+  pgbx query \"SQL\" [--db D] [--max-rows 1000] [--timeout 30s]
+      SELECT/WITH/TABLE/VALUES/SHOW/EXPLAIN only; refuses writes, row locks and side-effect functions
+      (a best-effort guard for agents, not a security boundary: give the user a read-only role yourself)
+      -> columns[{name,type}], rows[], row_count, truncated
+over ssh (system ssh; keys/agent/~/.ssh/config are ssh's business):
+  --ssh user@host [--ssh-port N] [--ssh-jump J]   tunnels Postgres; doctor/logs/diagnose/setup run there
+  pgbx tunnel [open] | list | close [NAME | --all]
+      the forward is shared by later commands and closes after --tunnel-idle (default 10m) unused
+common: --json --profile NAME --host --port --user --admin-db --timeout SECS (PGHOST/PGPORT/PGUSER/PGPASSWORD honoured)
 TS always carries a UTC offset: '2026-01-31 14:00:00+00'";
 
 // ---------------------------------------------------------------- safety
@@ -147,6 +173,8 @@ pub fn level(cmd: &str, a: &Args) -> Level {
     let shows = a.pos.is_empty() && !["max-backups", "max-days", "include", "exclude", "reset"].iter().any(|f| a.has(f));
     match cmd {
         "now" | "verify" | "db-restore" | "resume" | "link" | "skill" => Level::Safe,
+        "setup" if a.pos.first().map(String::as_str) == Some("client") => Level::Safe,
+        "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "remove" | "use")) => Level::Safe,
         "schedule" if shows => Level::ReadOnly,
         "schedule" => Level::Safe,
         "retention" | "scope" if shows => Level::ReadOnly,
@@ -194,6 +222,7 @@ pub fn check_new_db(src: &str, into: &str, exists: bool) -> Result<(), String> {
 struct Ctx {
     a: Args,
     admin_db: Option<String>,
+    tunnel: std::sync::OnceLock<u16>,
 }
 
 impl Ctx {
@@ -201,12 +230,25 @@ impl Ctx {
         self.a.get("db").unwrap_or("postgres").to_string()
     }
 
-    fn connect(&self, db: &str) -> Result<Client, String> {
+    /// host, port, user to connect to: flags/env/defaults, or the local end of the ssh tunnel (opened once).
+    fn target(&self) -> Result<(String, u16, String), String> {
         let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let user = self.a.get("user").map(String::from).or(env("PGUSER")).unwrap_or("postgres".into());
+        if self.a.has("ssh") {
+            if self.tunnel.get().is_none() {
+                let _ = self.tunnel.set(tunnel::ensure(&self.a, self.a.get("profile"))?);
+            }
+            return Ok(("127.0.0.1".into(), *self.tunnel.get().unwrap(), user));
+        }
         let host = self.a.get("host").map(String::from).or(env("PGHOST")).unwrap_or(DEFAULT_HOST.into());
         let port: u16 = self.a.get("port").map(String::from).or(env("PGPORT")).unwrap_or("5432".into())
             .parse().map_err(|_| "bad --port".to_string())?;
-        let user = self.a.get("user").map(String::from).or(env("PGUSER")).unwrap_or("postgres".into());
+        Ok((host, port, user))
+    }
+
+    fn connect(&self, db: &str) -> Result<Client, String> {
+        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let (host, port, user) = self.target()?;
         let mut c = postgres::Config::new();
         c.host(&host).port(port).user(&user).dbname(db).application_name("pgbx").connect_timeout(Duration::from_secs(5));
         if let Some(pw) = env("PGPASSWORD") {
@@ -516,10 +558,21 @@ fn main() {
         println!("{HELP}");
         return;
     }
+    let mut a = a;
     let cmd = a.cmd.clone();
     let lvl = level(&cmd, &a);
-    let mut cx = Ctx { a, admin_db: None };
+    if cmd == "tunnel" && a.has("serve") {
+        std::process::exit(tunnel::serve(&a)); // the detached helper: its flags are complete, no profile lookup
+    }
+    let setup_sub = if cmd == "setup" { a.pos.first().cloned() } else { None };
+    let prof = if cmd == "profile" || setup_sub.as_deref() == Some("client") { Ok(None) } else { profile::apply_from_disk(&mut a) };
+    let mut cx = Ctx { a, admin_db: None, tunnel: Default::default() };
     let r = match cmd.as_str() {
+        _ if prof.is_err() => Err(prof.clone().unwrap_err()),
+        "profile" => profile::run_sys(&cx.a),
+        c if tunnel::runs_remotely(c, &cx.a) => tunnel::run_remote(c, &cx.a),
+        "query" => query::run(&mut cx),
+        "tunnel" => tunnel::run(&cx.a, cx.a.get("profile")),
         "status" => cmd_status(&mut cx),
         "list" => cmd_list(&mut cx),
         "now" => cmd_now(&mut cx),
@@ -539,12 +592,25 @@ fn main() {
         "skill" => cmd_skill(&mut cx),
         "diagnose" => cmd_diagnose(&mut cx),
         "ui" => ui::run(&mut cx),
-        "setup" => setup::run(&mut cx),
+        "setup" => match setup_sub.as_deref() {
+            Some("client") => setup_client::run(&mut cx),
+            Some("server") | None => setup::run(&mut cx),
+            Some(x) => Err(format!("unknown setup '{x}' (pgbx setup server | pgbx setup client)")),
+        },
         _ => unreachable!(),
     };
     let mut v = r.unwrap_or_else(|e| json!({"ok": false, "error": e}));
     v["command"] = json!(cmd);
     v["safety"] = json!(format!("{lvl:?}").to_lowercase());
+    if cmd == "setup" && setup_sub.is_none() {
+        v["hint"] = json!("same as pgbx setup server");
+        if !as_json {
+            eprintln!("pgbx setup: same as pgbx setup server");
+        }
+    }
+    if let Ok(Some(p)) = &prof {
+        v["profile_used"] = json!(p);
+    }
     let ok = v["ok"] == true;
     if as_json {
         println!("{v}");
@@ -659,6 +725,14 @@ mod tests {
         assert_eq!(level("resume", &p(&["resume"])), Level::Safe);
         assert_eq!(level("verify-schedule", &p(&["verify-schedule", "never"])), Level::Guarded);
         assert_eq!(level("schedule", &p(&["schedule"])), Level::ReadOnly);
+        assert_eq!(level("profile", &p(&["profile", "list"])), Level::ReadOnly);
+        assert_eq!(level("profile", &p(&["profile", "add", "x", "--host", "h"])), Level::Safe);
+    }
+
+    #[test]
+    fn profile_flag_parses() {
+        let a = p(&["status", "--profile", "prod", "--json"]);
+        assert_eq!(a.get("profile"), Some("prod"));
     }
 
 }

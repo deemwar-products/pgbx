@@ -109,3 +109,26 @@ newest first (kinds include backup, restore, verify, config, pause, resume, scop
 older than `pgbx.audit_days` (default 30) is pruned except kept backups, open gaps and the newest row of each kind.
 
 **User-visible formatting:** the URL, then one line per relevant row: "<at> <database> <kind> <state> by <who>".
+
+### STAT-R-7: Inspect the server with a read query
+
+**When to use:** any question the other recipes do not answer and that a SELECT can: table sizes, row counts,
+connections, settings, replication, "what is in pgbx.history". Prefer this over ssh + psql or any shell.
+
+**Command:**
+```bash
+pgbx query "SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database" --profile prod --json
+pgbx query "SHOW max_connections" --profile prod --json
+pgbx query "SELECT state, count(*) FROM pg_stat_activity GROUP BY 1" --db myapp --max-rows 200 --timeout 10s --profile prod --json
+```
+Fallback (SQL): `psql -XAtq -d myapp -c "SELECT json_agg(t) FROM (<the SELECT>) t"`
+
+**Expected response:** `{columns:[{name,type}], rows:[{...}], row_count, truncated, database, user, profile_used}`.
+Numbers, booleans and nulls are typed; SHOW/EXPLAIN values are text. `truncated: true` → narrow the query or raise `--max-rows`.
+
+**Common errors:** `runs SELECT-style statements only` / `refuses 'INSERT'` / `refuses pg_terminate_backend(): it has
+side effects` / `exactly one statement` → the guard; do NOT try to get around it (no rewording, no other
+function, no psql) — use the matching pgbx command or ask the human. The guard is best-effort, not a security
+boundary: never run anything that changes data through it. `statement timeout` → narrow it or raise `--timeout`.
+
+**User-visible formatting:** the answer in one or two sentences, then a small table of the rows that matter.

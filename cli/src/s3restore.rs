@@ -280,10 +280,8 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
         .map_err(|e| format!("create database {into}: {}", pe(e)))?;
     drop(admin);
 
-    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-    let host = cx.a.get("host").map(String::from).or(env("PGHOST")).unwrap_or("/var/run/postgresql".into());
-    let port = cx.a.get("port").map(String::from).or(env("PGPORT")).unwrap_or("5432".into());
-    let user = cx.a.get("user").map(String::from).or(env("PGUSER")).unwrap_or("postgres".into());
+    let (host, port, user) = cx.target()?;
+    let port = port.to_string();
     let skipped: Vec<&str> = EXT_NAMES.iter().copied().filter(|n| !available.iter().any(|a| a == n)).collect();
     let exe = pg_restore_bin();
     let mut child = Command::new(&exe)

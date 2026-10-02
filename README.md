@@ -2,6 +2,11 @@
 
 Zero-touch Postgres backups to S3. **Create a database and it is backed up.** Everything else is optional SQL.
 
+Three parts: the **pgbx extension** runs inside Postgres and does the work (schedules, `pg_dump` to S3,
+restore tests, restores); the **pgbx CLI** (`pgbx`) is the client that talks to one or more Postgres servers
+(and restores straight from S3 when Postgres is down); the **agent skill** drives the CLI with `--json`.
+See [How it works](https://deemwar-products.github.io/pgbx/concepts/how-it-works/).
+
 Full documentation: [`site/`](site/README.md) (Astro Starlight, published to GitHub Pages).
 
 ## Quick start (Linux, PostgreSQL 13–18)

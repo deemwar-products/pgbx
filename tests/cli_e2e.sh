@@ -66,6 +66,20 @@ out=$(J db-restore --db shop --into shop_x --time '2026-01-01 00:00:00'); rc=$?;
 out=$(J frobnicate); rc=$?; check "unknown command: JSON usage error, exit 2" "$(onejson "$out")|$(jq1 "$out" .ok)|$rc" "yes|false|2"
 out=$(J now --bogus-flag); rc=$?; check "unknown flag: JSON usage error, exit 2" "$(onejson "$out")|$(jq1 "$out" .ok)|$rc" "yes|false|2"
 
+echo "## d. pgbx query (read ones of pgbx.* allowed; the rest refused; more in tests/ssh_e2e.sh)"
+out=$(J query "SELECT state FROM pgbx.status()" --db shop); check "query pgbx.status()" "$(jq1 "$out" .ok)|$(jq1 "$out" .row_count)" "true|1"
+out=$(J query "SELECT pgbx.backup_now()" --db shop); rc=$?; refused "query pgbx.backup_now() refused" "$out" $rc 1 "side effects"
+out=$(J query "DELETE FROM pgbx.history" --db shop); rc=$?; refused "query DELETE refused" "$out" $rc 1 "SELECT-style"
+
+echo "## e. setup client against this server (direct)"
+SC() { $DC exec -T -u postgres -e PGBX_CONFIG_DIR=/tmp/pgbx-sc db pgbx setup client "$@" --json 2>/dev/null; }
+X rm -rf /tmp/pgbx-sc
+out=$(SC local --host /var/run/postgresql --user postgres --db shop --yes); rc=$?
+check "setup client: ok, extension found, status read" "$(jq1 "$out" .ok)|$rc|$(jq1 "$out" '.test.extension_version != null')|$(jq1 "$out" '.test.status.state != null')" "true|0|true|true"
+check "setup client: first profile is the default" "$(jq1 "$out" .profile.default)" true
+out=$(X pgbx setup --json 2>/dev/null); check "plain setup is the server alias" "$(jq1 "$out" .hint)" "same as pgbx setup server"
+X rm -rf /tmp/pgbx-sc
+
 echo "## h. agent skill"
 X sh -c 'rm -rf /tmp/skh; mkdir -p /tmp/skh/claude; ln -s /tmp /tmp/skh/claude/foreign'
 SK() { $DC exec -T -u postgres -e HOME=/tmp/skh -e CLAUDE_SKILLS_DIR=/tmp/skh/claude db pgbx skill "$@" --no-codex --json 2>/dev/null; }
@@ -114,6 +128,18 @@ check "that restore predates the table" "$(PP -d shop_dr_t0 -c "SELECT count(*) 
 oldest=$(J backups --from-s3 --db shop $S3 | jq -r '.backups[-1].key')
 out=$(J db-restore --from-s3 --db shop --into shop_dr_k --host $PLAIN --backup "${oldest##*/}" $S3)
 check "--backup <file name> restores that exact dump" "$(jq1 "$out" .ok)|$(jq1 "$out" .key)" "true|$oldest"
+
+echo "## k. profiles (stored in a scratch config dir; never hold secrets)"
+PJ() { $DC exec -T -u postgres -e PGBX_CONFIG_DIR=/tmp/pgbx-prof db pgbx "$@" --json 2>/dev/null; }
+X rm -rf /tmp/pgbx-prof
+out=$(PJ profile add plain --host "$PLAIN" $S3); check "profile add" "$(jq1 "$out" .ok)|$(jq1 "$out" .profile.default)" "true|true"
+check "profile file is 0600 and has no key values" "$(X sh -c 'stat -c %a /tmp/pgbx-prof/profiles.json; grep -ci secret_access_key /tmp/pgbx-prof/profiles.json')" "600
+0"
+out=$(PJ profile list); check "profile list" "$(jq1 "$out" '.profiles|length')|$(jq1 "$out" .default)" "1|plain"
+out=$(PJ backups --from-s3 --db shop --profile plain); check "backups --from-s3 via --profile" "$(jq1 "$out" .ok)|$(jq1 "$out" .profile_used)|$(jq1 "$out" '.backups[0].key')" "true|plain|$newest"
+out=$(PJ status --db shop --profile nope); rc=$?; refused "unknown --profile" "$out" $rc 1 "no profile"
+out=$(PJ profile remove plain); check "profile remove" "$(jq1 "$out" .ok)" true
+X rm -rf /tmp/pgbx-prof
 docker rm -f $PLAIN >/dev/null 2>&1
 
 echo "RESULT: $pass passed, $fail failed"; [ $fail -eq 0 ]

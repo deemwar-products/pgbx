@@ -16,7 +16,7 @@
   <routes>
 
     <route id="status" mode="read-only">
-      <when>is postgres backed up, is it backed up, backup status, are backups working, last backup, list backups, show backups, when was the last backup, pgbx status, pgbx list</when>
+      <when>is postgres backed up, is it backed up, backup status, are backups working, last backup, list backups, show backups, when was the last backup, pgbx status, pgbx list, how big is the database, table sizes, how many connections, run a select, query the database, pgbx query</when>
       <goal>Answer "are we backed up?" in one line per database, from status JSON.</goal>
       <steps>
         <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>

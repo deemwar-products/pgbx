@@ -25,8 +25,8 @@ Routing lives in `router.xml`. This file holds invariants only.
 
 | tier | actions | rule |
 |---|---|---|
-| read-only | `pgbx status/list/doctor/logs`, `status()`, `overview()`, `doctor()`, `pgbx backups --from-s3`, `pgbx.backups`, `pgbx.history`, `rowless_tables()` | no approval needed |
-| safe mutation | `pgbx now`, `pgbx verify`, `pgbx db-restore --into <NEW db>` (also `--from-s3`), `backup_now()`, `verify_now()`, `resume()`, `restore(into_db => <NEW db>)`, short-lived `download_url()` | allowed; report what you did and the id |
+| read-only | `pgbx status/list/doctor/logs`, `pgbx profile list/show`, `pgbx query` (SELECT-only), `pgbx tunnel list`, `status()`, `overview()`, `doctor()`, `pgbx backups --from-s3`, `pgbx.backups`, `pgbx.history`, `rowless_tables()` | no approval needed |
+| safe mutation | `pgbx profile add/use/remove`, `pgbx setup client`, `pgbx tunnel [open|close]`, `pgbx now`, `pgbx verify`, `pgbx db-restore --into <NEW db>` (also `--from-s3`), `backup_now()`, `verify_now()`, `resume()`, `restore(into_db => <NEW db>)`, short-lived `download_url()` | allowed; report what you did and the id |
 | higher-risk | `pause()` expected > 1 hour, lowering retention, narrowing data scope, `set_verify_schedule('never')`, long-lived or third-party `download_url()` | ask the human first; say what protection is lost |
 | destructive | swapping/dropping the live database, dropping backups, disabling backups (`configure(enabled => false)`) | ALWAYS explicit human approval in this conversation, quoting exactly what will be replaced |
 
