@@ -84,10 +84,23 @@ function queueCard(q) {
   ], q.jobs, "nothing running or queued") + "</div>";
 }
 
+function loadCard(l) {
+  const s = l.sample || {}, g = l.settings || {};
+  const now = s.load_busy === true ? `<span class=warn>busy: ${esc(s.load_reasons)}</span>` : s.load_busy === false ? "<span class=ok>quiet</span>" : "<span class=mute>no sample yet</span>";
+  return `<div class="card"><h2>Load gate <span class=mute>· pgbx.load_gate = ${esc(g.load_gate)} · manual jobs: ${esc(g.gate_manual_jobs)}</span></h2>
+    <p>${now} <span class=mute>at ${ts(s.load_at)} · ${esc(s.load_active)} active · ${esc(s.load_tps)} tps · busy when active &gt; ${esc(g.busy_active_backends)},
+       tps &gt; ${esc(g.busy_tps)} · max_defer ${esc(g.max_defer)}</span></p>` + table([
+    ["database", r => `<a class="db" href="#db/${encodeURIComponent(r.database)}">${esc(r.database)}</a>`],
+    ["gate", r => esc(r.load_gate)], ["would have waited (7 d)", r => esc(r.would_defer_7d)],
+    ["deferred (7 d)", r => esc(r.deferred_7d)], ["forced (7 d)", r => esc(r.forced_7d)],
+  ], l.databases || [], "no database reported yet") +
+  `<p class="mute">shadow records what it would defer and never delays; turn it on per database: pgbx load --gate on --db NAME --yes</p></div>`;
+}
+
 async function overview() {
-  const [j, q] = await Promise.all([get("/api/overview"), get("/api/queue").catch(() => null)]);
+  const [j, q, l] = await Promise.all([get("/api/overview"), get("/api/queue").catch(() => null), get("/api/load").catch(() => null)]);
   $("#who").textContent = `read-only · role ${j.connection.role} · ${j.connection.server_name || ""}`;
-  return (q ? queueCard(q) : "") + `<div class="card"><h2>Every database (${j.databases.length})</h2>` + table([
+  return (q ? queueCard(q) : "") + (l ? loadCard(l) : "") + `<div class="card"><h2>Every database (${j.databases.length})</h2>` + table([
     ["database", r => `<a class="db" href="#db/${encodeURIComponent(r.database)}">${esc(r.database)}</a>`],
     ["state", r => st(r.state)], ["schedule", r => esc(r.schedule)],
     ["last backup", r => `${ts(r.last_backup_at)} <span class=mute>${ago(r.last_backup_at)}</span>`],

@@ -9,6 +9,7 @@
 
 mod diagnose;
 mod jobs;
+mod load;
 mod policy;
 mod profile;
 mod query;
@@ -38,12 +39,12 @@ const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
     "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
-    "ssh-jump", "tunnel-idle", "max-rows", "serve", "hours",
+    "ssh-jump", "tunnel-idle", "max-rows", "serve", "hours", "gate",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
     "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel",
-    "jobs",
+    "jobs", "load",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -112,6 +113,8 @@ read-only:
                                              and steps tagged readonly/safe/guarded/destructive (never run by pgbx)
   pgbx logs     [--lines N]                  recent failed jobs
   pgbx jobs                                  the server-wide job queue: what runs (slot / restore lane), what waits and why
+  pgbx load     [--db X]                     the load gate: last load sample, thresholds, per database what it would
+                                             defer (shadow, the default), deferred (on) or forced
   pgbx ui       [--listen 127.0.0.1:8432] [--strict]
                                              read-only audit web UI (overview, 30-day timeline, health);
                                              --strict refuses a role that could change backups
@@ -135,6 +138,7 @@ policy / access (show with no arguments; changes that reduce protection need --y
   pgbx verify-schedule TEXT|never pgbx link [--backup-id N] [--expires '1 hour']
   pgbx overview                   (admin database: every database on the server)
   pgbx jobs cancel ID [--db X] --yes        cancel a queued or running job (a running one is stopped, nothing left in S3)
+  pgbx load --gate off|shadow|on|default --db X   the load gate for one database (on needs --yes)
 setup (guarded: shows the plan; --yes writes):
   pgbx setup server [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
               --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
@@ -190,6 +194,7 @@ pub fn level(cmd: &str, a: &Args) -> Level {
         "verify-schedule" if a.pos.first().and_then(|s| policy::verify_schedule_risk(s)).is_some() => Level::Guarded,
         "verify-schedule" => Level::Safe,
         "jobs" if a.pos.first().map(String::as_str) == Some("cancel") => Level::Guarded,
+        "load" => load::level_of(a),
         _ => Level::ReadOnly,
     }
 }
@@ -591,6 +596,7 @@ fn main() {
         "doctor" => cmd_doctor(&mut cx),
         "logs" => cmd_logs(&mut cx),
         "jobs" => jobs::run(&mut cx),
+        "load" => load::run(&mut cx),
         "schedule" => policy::schedule(&mut cx),
         "retention" => policy::retention(&mut cx),
         "pause" => policy::pause(&mut cx),
@@ -631,6 +637,8 @@ fn main() {
         if v.get("diagnosis").is_some() {
             print!("\n{}", diagnose::text(&v["diagnosis"]));
         }
+    } else if cmd == "load" && ok && v.get("sample").is_some() {
+        print!("{}", load::text(&v));
     } else if cmd == "jobs" && ok && v.get("jobs").is_some() {
         print!("{}", jobs::text(&v));
     } else if cmd == "diagnose" && ok {
@@ -740,6 +748,9 @@ mod tests {
         assert_eq!(level("profile", &p(&["profile", "list"])), Level::ReadOnly);
         assert_eq!(level("profile", &p(&["profile", "add", "x", "--host", "h"])), Level::Safe);
         assert_eq!(level("jobs", &p(&["jobs"])), Level::ReadOnly);
+        assert_eq!(level("load", &p(&["load"])), Level::ReadOnly);
+        assert_eq!(level("load", &p(&["load", "--gate", "on", "--db", "x"])), Level::Guarded);
+        assert_eq!(level("load", &p(&["load", "--gate", "shadow", "--db", "x"])), Level::Safe);
         assert_eq!(level("schedule", &p(&["schedule", "suggest"])), Level::ReadOnly);
         assert_eq!(level("schedule", &p(&["schedule", "suggest", "--apply"])), Level::Safe);
         assert_eq!(level("jobs", &p(&["jobs", "cancel", "7"])), Level::Guarded);

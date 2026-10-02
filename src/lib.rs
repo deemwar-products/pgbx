@@ -81,6 +81,36 @@ pub static ACTIVITY_SAMPLING: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ACTIVITY_DECAY: GucSetting<f64> = GucSetting::<f64>::new(0.9);
 pub static SUGGEST_MIN_DAYS: GucSetting<i32> = GucSetting::<i32>::new(7);
 pub static DOCTOR_BUSY_RATIO: GucSetting<f64> = GucSetting::<f64>::new(3.0);
+// load gate (ADR 0001 §1): shadow by default (owner decision 2026-10-02)
+pub static LOAD_GATE: GucSetting<Gate> = GucSetting::<Gate>::new(Gate::Shadow);
+pub static BUSY_ACTIVE_BACKENDS: GucSetting<i32> = GucSetting::<i32>::new(4);
+pub static BUSY_TPS: GucSetting<i32> = GucSetting::<i32>::new(200);
+pub static BUSY_LONG_XACT: GucSetting<i32> = GucSetting::<i32>::new(30); // s
+pub static BUSY_REPLICA_LAG: GucSetting<i32> = GucSetting::<i32>::new(30); // s
+pub static BUSY_LOADAVG: GucSetting<f64> = GucSetting::<f64>::new(0.8);
+pub static GATE_MANUAL_JOBS: GucSetting<GateManual> = GucSetting::<GateManual>::new(GateManual::Warn);
+
+/// pgbx.load_gate: off = never look; shadow = record would_defer, never delay; on = defer while busy, up to max_defer.
+#[derive(pgrx::guc::PostgresGucEnum, Clone, Copy, PartialEq, Debug)]
+pub enum Gate {
+    #[name = c"off"]
+    Off,
+    #[name = c"shadow"]
+    Shadow,
+    #[name = c"on"]
+    On,
+}
+
+/// pgbx.gate_manual_jobs: what the gate does to backup_now() / verify_now() / restore().
+#[derive(pgrx::guc::PostgresGucEnum, Clone, Copy, PartialEq, Debug)]
+pub enum GateManual {
+    #[name = c"warn"]
+    Warn,
+    #[name = c"defer"]
+    Defer,
+    #[name = c"off"]
+    Off,
+}
 pub static OVERRUN_POLICY: GucSetting<Overrun> = GucSetting::<Overrun>::new(Overrun::Skip);
 pub static OVERRUN_MAX_GAP: GucSetting<f64> = GucSetting::<f64>::new(1.5);
 
@@ -129,6 +159,13 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_float_guc(c"pgbx.activity_decay", c"Weight of the past in each hour's activity average", c"0.5-0.99; 0.9 adapts in about two weeks", &ACTIVITY_DECAY, 0.5, 0.99, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.suggest_min_days", c"Days of activity samples before suggest_window() has high confidence", c"1-90", &SUGGEST_MIN_DAYS, 1, 90, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_float_guc(c"pgbx.doctor_busy_ratio", c"doctor() warns when the schedule's hour is this many times busier than the suggested window", c"1-100", &DOCTOR_BUSY_RATIO, 1.0, 100.0, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_enum_guc(c"pgbx.load_gate", c"Look at server load before starting a scheduled backup or restore test", c"off; shadow (default): record would_defer, never delay; on: defer while busy, never past pgbx.max_defer (per database: configure(load_gate => ...))", &LOAD_GATE, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.busy_active_backends", c"Busy when more client sessions than this are not idle", c"0 = ignore; pgbx's own sessions never count", &BUSY_ACTIVE_BACKENDS, 0, 10_000, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.busy_tps", c"Busy above this many transactions per second (all databases, between two polls)", c"0 = ignore; pgbx's own polling adds a few per database", &BUSY_TPS, 0, 10_000_000, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.busy_long_xact", c"Busy while a writing transaction has been open longer than this", c"0 = ignore; never stack a dump on a migration", &BUSY_LONG_XACT, 0, 3600, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_int_guc(c"pgbx.busy_replica_lag", c"Busy while a standby replays more than this behind", c"0 = ignore", &BUSY_REPLICA_LAG, 0, 3600, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_float_guc(c"pgbx.busy_loadavg", c"Busy above this 1-minute load average per core (Linux)", c"0 = ignore; ignored where /proc/loadavg is missing", &BUSY_LOADAVG, 0.0, 10.0, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_enum_guc(c"pgbx.gate_manual_jobs", c"What the load gate does to backup_now() / verify_now() / restore()", c"warn (default): a NOTICE, it starts anyway; defer: like scheduled jobs; off: nothing", &GATE_MANUAL_JOBS, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_enum_guc(c"pgbx.overrun_policy", c"Schedule slots that passed while a dump of the database was running", c"skip: the next run is the next slot after the dump finished (see pgbx.overrun_max_gap); catch_up: run once right away", &OVERRUN_POLICY, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_float_guc(c"pgbx.overrun_max_gap", c"With overrun_policy=skip, never wait for a slot more than this many schedule intervals after the last good backup finished", c"1.0-10; past it the backup runs right away", &OVERRUN_MAX_GAP, 1.0, 10.0, GucContext::Sighup, GucFlags::default());
 
@@ -174,7 +211,11 @@ CREATE TABLE pgbx.server_overview (
     window_cron      text,                                     -- suggest_window(): the quietest slot
     window_score     float8,
     current_score    float8,                                   -- the current schedule's slot, scored the same way
-    window_confidence text
+    window_confidence text,
+    load_gate        text,                                     -- this database's effective pgbx.load_gate
+    would_defer_7d   int,                                      -- jobs the gate would have deferred (shadow), 7 days
+    deferred_7d      int,                                      -- jobs it deferred (on)
+    forced_7d        int                                       -- backups that ran at their max_defer deadline
 );
 
 -- The server-wide job queue as the worker sees it (every database's running, queued and deferred jobs), rewritten
@@ -217,7 +258,12 @@ CREATE TABLE pgbx.server_capacity (
     wait_secs    float8,                                       -- estimated wait for a job queued now
     measured_at  timestamptz,                                  -- last cpu probe
     updated_at   timestamptz NOT NULL DEFAULT now(),
-    backup_slots jsonb                                         -- {database: [hour of week (UTC) its backups start in]}
+    backup_slots jsonb,                                        -- {database: [hour of week (UTC) its backups start in]}
+    load_at      timestamptz,                                  -- last load sample (ADR 0001 §1)
+    load_busy    bool,
+    load_reasons text,                                         -- '12 active sessions > 4, 900 tps > 200'
+    load_active  int,
+    load_tps     float8
 );
 
 -- Activity per hour of the week, learned from pg_stat_database deltas every poll (ADR 0001 §2). Hours are UTC, like
@@ -253,7 +299,8 @@ CREATE TABLE pgbx.config (
     updated_at     timestamptz NOT NULL DEFAULT now(),
     -- data scope: every table's DEFINITION is always backed up; these only decide whose ROWS are kept
     include_data   text[],                                     -- NULL/empty = rows of all tables
-    exclude_data   text[]                                      -- rows of these are skipped
+    exclude_data   text[],                                     -- rows of these are skipped
+    load_gate      text CHECK (load_gate IN ('off', 'shadow', 'on')) -- NULL = the server's pgbx.load_gate
 );
 -- No default row here: a restored dump brings its own row, and a fresh database gets one from the
 -- worker or configure() (INSERT ... ON CONFLICT DO NOTHING), so the two never collide.
@@ -287,9 +334,10 @@ $$;
 
 -- Change this database's policy. NULL arguments leave a setting unchanged. Meant for migrations.
 -- schedule accepts the same forms as set_schedule().
+-- load_gate: 'off' | 'shadow' | 'on' for this database ('default' = follow the server's pgbx.load_gate).
 CREATE FUNCTION pgbx.configure(
     schedule text DEFAULT NULL, max_backups int DEFAULT NULL, max_days int DEFAULT NULL,
-    enabled bool DEFAULT NULL, path text DEFAULT NULL
+    enabled bool DEFAULT NULL, path text DEFAULT NULL, load_gate text DEFAULT NULL
 ) RETURNS pgbx.config LANGUAGE plpgsql AS $$
 DECLARE r pgbx.config; c text := CASE WHEN schedule IS NULL THEN NULL ELSE pgbx.to_cron(schedule) END;
 BEGIN
@@ -303,6 +351,8 @@ BEGIN
         paused_at      = CASE WHEN configure.enabled IS NULL THEN x.paused_at WHEN configure.enabled THEN NULL ELSE now() END,
         paused_reason  = CASE WHEN configure.enabled IS NULL THEN x.paused_reason WHEN configure.enabled THEN NULL ELSE 'configure(enabled => false)' END,
         path           = coalesce(configure.path, x.path),
+        load_gate      = CASE WHEN configure.load_gate IS NULL THEN x.load_gate WHEN configure.load_gate = 'default' THEN NULL
+                              ELSE configure.load_gate END,
         updated_at     = now()
     RETURNING * INTO r;
     PERFORM pgbx._log('config', to_jsonb(r));
@@ -382,14 +432,14 @@ CREATE FUNCTION pgbx.status() RETURNS TABLE (
     backups_kept bigint, retention text, data_scope text, verify_schedule text, last_verified_at timestamptz, last_verify_result text,
     last_error text, last_error_at timestamptz, paused_reason text, paused_at timestamptz,
     queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text,
-    job_progress text, job_eta text, suggested_schedule text
+    job_progress text, job_eta text, suggested_schedule text, load_gate text, last_load text, would_defer_7d bigint
 ) LANGUAGE plpgsql STABLE AS $$
 DECLARE cfg pgbx.config; lb pgbx.history; le pgbx.history; lv pgbx.history; last_auto timestamptz;
 BEGIN
     SELECT * INTO cfg FROM pgbx.config;
     IF NOT FOUND THEN  -- worker hasn't visited this database yet
         cfg := ROW(1, NULL, '0 2 * * *', 'daily at 02:00', 14, 90, '0 4 * * 0', 'weekly on sunday at 04:00',
-                   true, NULL, NULL, now(), NULL, NULL)::pgbx.config;
+                   true, NULL, NULL, now(), NULL, NULL, NULL)::pgbx.config;
     END IF;
     SELECT * INTO lb FROM pgbx.history WHERE kind='backup' AND history.state='done' ORDER BY id DESC LIMIT 1;
     SELECT * INTO le FROM pgbx.history WHERE history.state='failed' ORDER BY id DESC LIMIT 1;
@@ -437,7 +487,12 @@ BEGIN
         (SELECT CASE WHEN w.cron IS NULL THEN w.start_at
                      ELSE format('%s (%s, %sx average activity vs %sx now; %s confidence) — never applied by itself: %s',
                                  w.cron, w.start_at, w.score, w.current_score, w.confidence, w.apply_sql) END
-           FROM pgbx.suggest_window() w)
+           FROM pgbx.suggest_window() w),
+        coalesce(cfg.load_gate, current_setting('pgbx.load_gate', true), 'shadow'),
+        (SELECT format('%s at %s', CASE WHEN c.load_busy THEN 'busy: ' || c.load_reasons ELSE 'quiet' END,
+                       to_char(c.load_at AT TIME ZONE 'UTC', 'HH24:MI:SS "UTC"'))
+           FROM pgbx.server_capacity c WHERE c.load_at IS NOT NULL),
+        (SELECT count(*) FROM pgbx.history h WHERE h.params ? 'would_defer' AND h.requested_at > now() - interval '7 days')
     FROM (SELECT NULL::bigint AS id, NULL::jsonb AS params
           UNION ALL (SELECT h.id, h.params FROM pgbx.history h WHERE h.state='queued'
                      ORDER BY (h.params->>'queue_position')::int NULLS LAST, h.id LIMIT 1)
@@ -679,7 +734,7 @@ END $$;
 
 -- internal: tell whoever queued job j when it starts and how long it takes, and what limits it
 CREATE FUNCTION pgbx._notice_eta(j bigint) RETURNS void LANGUAGE plpgsql AS $$
-DECLARE h pgbx.history; e record; cap pgbx.server_capacity; ahead int; starts timestamptz;
+DECLARE h pgbx.history; e record; cap pgbx.server_capacity; ahead int; starts timestamptz; act int; gate text; manual text;
 BEGIN
     SELECT * INTO h FROM pgbx.history x WHERE x.id = j;
     SELECT * INTO e FROM pgbx._estimate(h.kind);
@@ -690,6 +745,20 @@ BEGIN
         CASE WHEN ahead > 0 THEN format(' (%s job(s) running or waiting on this server)', ahead) ELSE '' END,
         CASE WHEN starts < now() + interval '1 minute' THEN 'now' ELSE to_char(starts, 'HH24:MI') END,
         pgbx._dur(e.est_secs), pg_size_pretty(e.est_bytes), e.confidence, e.basis);
+    -- the load gate on human jobs (pgbx.gate_manual_jobs): say it competes with the app, right now
+    gate := coalesce((SELECT c.load_gate FROM pgbx.config c), current_setting('pgbx.load_gate', true), 'shadow');
+    manual := coalesce(current_setting('pgbx.gate_manual_jobs', true), 'warn');
+    SELECT count(*) INTO act FROM pg_stat_activity a WHERE a.state <> 'idle' AND a.backend_type = 'client backend'
+       AND a.pid <> pg_backend_pid() AND coalesce(a.application_name, '') NOT LIKE 'pgbx%';
+    IF gate <> 'off' AND manual <> 'off' AND h.kind IN ('backup', 'verify', 'restore')
+       AND (coalesce(cap.load_busy, false)
+            OR act > nullif(coalesce(nullif(current_setting('pgbx.busy_active_backends', true), '')::int, 4), 0)) THEN
+        RAISE NOTICE '%', format('pgbx: the server is busy (%s active session(s) now%s): this %s will compete with the app; %s',
+            act, coalesce(', last sample: ' || cap.load_reasons, ''), h.kind,
+            CASE WHEN manual = 'defer' AND gate = 'on' AND h.kind <> 'restore'
+                 THEN 'it waits for a quieter moment, at most pgbx.max_defer'
+                 ELSE 'it starts anyway (pgbx.gate_manual_jobs = warn)' END);
+    END IF;
 END $$;
 
 
@@ -994,6 +1063,29 @@ BEGIN
     ok := v IS NULL;
     detail := CASE WHEN ok THEN 'no schedule sits in a busy hour while a much quieter one is known (pgbx.suggest_window())' ELSE v END;
     RETURN NEXT;
+
+    -- the load gate (ADR 0001 §1): informational; it never fails a check by itself
+    name := 'load_gate';
+    ok := true; fix := NULL;
+    SELECT format('pgbx.load_gate = %s%s; last sample %s: %s; last 7 days: %s job(s) would have waited (shadow), %s deferred, %s forced',
+                  current_setting('pgbx.load_gate', true),
+                  coalesce('; on in ' || (SELECT string_agg(s.database, ', ' ORDER BY s.database) FROM pgbx.server_overview s WHERE s.load_gate = 'on'), ''),
+                  coalesce(to_char(c.load_at AT TIME ZONE 'UTC', 'HH24:MI:SS "UTC"'), 'none yet'),
+                  CASE WHEN c.load_busy THEN 'busy (' || c.load_reasons || ')' WHEN c.load_busy IS NULL THEN '?' ELSE 'quiet' END,
+                  (SELECT coalesce(sum(s.would_defer_7d), 0) FROM pgbx.server_overview s),
+                  (SELECT coalesce(sum(s.deferred_7d), 0) FROM pgbx.server_overview s),
+                  (SELECT coalesce(sum(s.forced_7d), 0) FROM pgbx.server_overview s))
+      INTO detail FROM (SELECT 1) one LEFT JOIN pgbx.server_capacity c ON true;
+    RETURN NEXT;
+
+    -- backups that kept hitting their max_defer deadline: the schedule sits in a busy window
+    name := 'forced_backups_7d';
+    SELECT string_agg(format('%s: %s forced', s.database, s.forced_7d), ', ' ORDER BY s.forced_7d DESC), min(s.database)
+      INTO v, bad FROM pgbx.server_overview s WHERE s.forced_7d > 2;
+    ok := v IS NULL;
+    detail := CASE WHEN ok THEN 'no database had more than 2 backups forced past a busy server in 7 days' ELSE v END;
+    fix := CASE WHEN ok THEN NULL ELSE format('move the schedule to a quieter hour: pgbx schedule suggest --db %s', bad) END;
+    RETURN NEXT;
 END $$;
 
 -- Health checks for the CLI: one row per check, plain-language detail and the fix. Admin database only.
@@ -1094,7 +1186,7 @@ DO $lock$
 DECLARE f text;
 BEGIN
     FOREACH f IN ARRAY ARRAY[
-        'pgbx.configure(text, int, int, bool, text)', 'pgbx.set_schedule(text)',
+        'pgbx.configure(text, int, int, bool, text, text)', 'pgbx.set_schedule(text)',
         'pgbx.set_retention(int, int)', 'pgbx.pause(text)', 'pgbx.resume()',
         'pgbx.backup_now()', 'pgbx.restore(text, timestamptz)', 'pgbx.verify_now()',
         'pgbx.set_verify_schedule(text)', 'pgbx.download_url(bigint, interval)',

@@ -293,6 +293,8 @@ struct Sched {
     srv_flushed: i64,
     srv_copied: std::collections::HashSet<String>, // databases holding the latest server histogram
     slots: std::collections::BTreeMap<String, Vec<i32>>, // each database's backup start hours (UTC hour of week)
+    load: LoadNow,                          // last load sample
+    load_prev: Option<(f64, f64)>,          // (unix secs, total xacts) of the sample before, for tps
 }
 
 /// A queued job of some database, as found this poll.
@@ -307,6 +309,7 @@ struct Cand {
     schedule: String,
     max_backups: i32,
     max_days: i32,
+    gate: Option<String>, // this database's load_gate (NULL = the server's)
 }
 
 /// Pick order (ADR 0001 §0): restore (a human waits) > manual backup > scheduled / first backup > verify > prune.
@@ -347,6 +350,7 @@ fn tick(s: &mut Sched) -> Result<(), String> {
     ensure_template1(&c);
     let admin_db = setting(&ADMIN_DB).unwrap_or("postgres".into());
     let mut admin = connect(&c, &admin_db)?;
+    sample_load(&mut admin, s);
     admin.batch_execute("CREATE EXTENSION IF NOT EXISTS pgbx").map_err(pe)?;
     let owned: Vec<String> = s.running.iter().filter_map(|r| r.owns_db.clone()).collect();
     drop_stale_verify_dbs(&mut admin, &owned);
@@ -569,7 +573,9 @@ fn queue_scheduled_backup(cl: &mut Client, db: &str, schedule: &str) -> Result<(
 /// Per database, every poll: keep the extension current, recover jobs a restart cut off, pass on cancel requests,
 /// queue due jobs, publish the overview row; returns the connection, this database's queued jobs that may start now,
 /// and the deferred ones (with the reason).
-fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<(Client, Vec<Cand>, Vec<(Cand, String)>), String> {
+type Scanned = (Client, Vec<Cand>, Vec<(Cand, String)>);
+
+fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<Scanned, String> {
     let mut cl = connect(c, db)?;
     cl.batch_execute("CREATE EXTENSION IF NOT EXISTS pgbx;").map_err(pe)?;
     update_extension(&mut cl, db)?;
@@ -584,12 +590,13 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<(Clie
     .map_err(pe)?;
     let row = cl
         .query_one(
-            "SELECT coalesce(path, current_database()), schedule, max_backups, max_days, enabled, verify_schedule FROM pgbx.config",
+            "SELECT coalesce(path, current_database()), schedule, max_backups, max_days, enabled, verify_schedule, load_gate FROM pgbx.config",
             &[],
         )
         .map_err(pe)?;
     let (path, schedule, max_backups, max_days, enabled, verify_cron): (String, String, i32, i32, bool, Option<String>) =
         (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4), row.get(5));
+    let gate: Option<String> = row.get(6);
     let max_days = max_days.min(MAX_DAYS_LIMIT.get()); // server-wide ceiling wins
 
     // pgbx.cancel() of a running job: stop its thread and child; the thread records 'cancelled'
@@ -649,6 +656,7 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<(Clie
             schedule: schedule.clone(),
             max_backups,
             max_days,
+            gate: gate.clone(),
         };
         match j.get::<_, Option<String>>(5) {
             Some(why) => deferred.push((cand, why)),
@@ -715,15 +723,50 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
             waiting.push((j, why));
             continue;
         }
+        let cfg = JobCfg::now();
+        let p = parse_flat_json(&j.params);
+        let deadline = defer_deadline(j.requested, j.trigger == "first", &j.schedule, &cfg);
+        // the load gate (ADR 0001 §1): shadow records, on defers with backoff until the deadline
+        let mode = gate_of(j.gate.as_deref());
+        let manual = j.trigger == "manual" || p.get("manual").is_some_and(|v| v == "true");
+        let busy = !s.load.reasons.is_empty();
+        let reasons = s.load.reasons.join(", ");
+        let action = gate_action(mode, GATE_MANUAL_JOBS.get(), &j.kind, manual, busy, Utc::now() >= deadline);
+        if action == GateAction::Defer {
+            let n = |k: &str| p.get(k).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+            let wait = backoff_minutes(cfg.defer_backoff.as_deref(), n("deferrals") as usize);
+            let until = (Utc::now() + chrono::Duration::minutes(wait as i64)).min(deadline);
+            if let Some(cl) = conns.get_mut(&j.db) {
+                let r = cl.execute(
+                    "UPDATE pgbx.history SET params = params || jsonb_build_object(
+                        'deferrals', $2::int, 'busy_deferrals', $3::int, 'deferred_until', $4::timestamptz,
+                        'defer_reason', 'busy: ' || $5::text, 'deadline', $6::timestamptz) WHERE id=$1 AND state='queued'",
+                    &[&j.id, &(n("deferrals") + 1), &(n("busy_deferrals") + 1), &SystemTime::from(until), &reasons, &SystemTime::from(deadline)],
+                );
+                if r.is_ok() {
+                    log(&format!(
+                        "{}: {} #{} deferred, server busy ({reasons}); retry at {}, runs anyway from {}",
+                        j.db, j.kind, j.id, until.format("%H:%M:%S"), deadline.format("%Y-%m-%d %H:%M:%S UTC")
+                    ));
+                }
+            }
+            let why = format!("deferred (busy: {reasons}) until {} UTC", until.format("%H:%M:%S"));
+            waiting.push((j, why));
+            continue;
+        }
         let Some((slot, lock)) = take_slot(c, admin_db, &slots) else {
             waiting.push((j, "waits for a job slot: another pgbx worker holds them (pgbx.max_concurrent_jobs)".into()));
             continue;
         };
         let Some(cl) = conns.get_mut(&j.db) else { continue };
-        let cfg = JobCfg::now();
-        let p = parse_flat_json(&j.params);
-        let deadline = defer_deadline(j.requested, j.trigger == "first", &j.schedule, &cfg);
         let forced = j.kind == "backup" && p.contains_key("deferrals") && Utc::now() >= deadline;
+        let shadow: Option<String> = (action == GateAction::Shadow).then(|| reasons.clone());
+        if shadow.is_some() {
+            log(&format!("{}: {} #{} would wait for a quieter moment (pgbx.load_gate = shadow: {reasons}); starts now", j.db, j.kind, j.id));
+        }
+        let load_at_start: Option<String> = (mode != Gate::Off).then(|| {
+            if busy { format!("busy: {reasons}") } else { format!("quiet ({} active, {} tps)", s.load.active, s.load.tps.map(|x| format!("{x:.0}")).unwrap_or("?".into())) }
+        });
         // a cancel() between the scan and now wins: only a row still queued starts
         // what it is expected to take is recorded now: progress is measured against it, accuracy judged by it
         let n = cl.execute(
@@ -733,9 +776,12 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
                              || jsonb_build_object('est_bytes', e.est_bytes, 'eta_sec', round(e.est_secs::numeric), 'eta_basis', e.basis)
                              || CASE WHEN h.kind = 'backup' THEN jsonb_build_object('db_size', pg_database_size(current_database()))
                                      ELSE '{}'::jsonb END
+                             || CASE WHEN $4::text IS NULL THEN '{}'::jsonb
+                                     ELSE jsonb_build_object('would_defer', true, 'would_defer_reason', $4::text) END
+                             || CASE WHEN $5::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('load_at_start', $5::text) END
                FROM pgbx._estimate($3) e
               WHERE h.id=$1 AND h.state='queued'",
-            &[&j.id, &forced, &j.kind],
+            &[&j.id, &forced, &j.kind, &shadow, &load_at_start],
         );
         if !matches!(n, Ok(1)) {
             continue;
@@ -826,7 +872,8 @@ fn publish_queue(admin: &mut Client, s: &mut Sched, waiting: &[(Cand, String)], 
         let eta = conns.get_mut(&r.db).and_then(|cl| {
             cl.query_opt("SELECT eta_start, eta_finish, est_bytes, done_bytes, progress FROM pgbx.job_eta($1)", &[&r.id]).ok().flatten()
         });
-        let (es, ef, eb, db_, pr): (Option<SystemTime>, Option<SystemTime>, Option<i64>, Option<i64>, Option<String>) = match &eta {
+        type EtaRow = (Option<SystemTime>, Option<SystemTime>, Option<i64>, Option<i64>, Option<String>);
+        let (es, ef, eb, db_, pr): EtaRow = match &eta {
             Some(x) => (x.get(0), x.get(1), x.get(2), x.get(3), x.get(4)),
             None => (None, None, None, None, None),
         };
@@ -1097,6 +1144,117 @@ pub(crate) fn backup_slots(cron: &str, from: DateTime<Utc>) -> Vec<i32> {
     out
 }
 
+/// The server's load, sampled once per poll from the admin connection (ADR 0001 §1); pgbx's own sessions never count.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LoadNow {
+    at: Option<DateTime<Utc>>,
+    active: i32,
+    tps: Option<f64>,
+    reasons: Vec<String>,
+}
+
+/// pgbx.busy_* thresholds; 0 = that signal is ignored.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Busy {
+    pub active: i32,
+    pub tps: i32,
+    pub long_xact: i32,
+    pub lag: i32,
+    pub loadavg: f64,
+}
+
+/// Why the server counts as busy right now (empty = quiet).
+pub(crate) fn busy_reasons(active: i32, tps: Option<f64>, long_writers: i32, lag: Option<f64>, load_core: Option<f64>, t: Busy) -> Vec<String> {
+    let mut r = Vec::new();
+    if t.active > 0 && active > t.active {
+        r.push(format!("{active} active sessions > {}", t.active));
+    }
+    if let Some(x) = tps.filter(|x| t.tps > 0 && *x > t.tps as f64) {
+        r.push(format!("{x:.0} tps > {}", t.tps));
+    }
+    if t.long_xact > 0 && long_writers > 0 {
+        r.push(format!("{long_writers} writing transaction(s) open > {}s", t.long_xact));
+    }
+    if let Some(x) = lag.filter(|x| t.lag > 0 && *x > t.lag as f64) {
+        r.push(format!("replica {x:.0}s behind > {}s", t.lag));
+    }
+    if let Some(x) = load_core.filter(|x| t.loadavg > 0.0 && *x > t.loadavg) {
+        r.push(format!("load {x:.2} per core > {}", t.loadavg));
+    }
+    r
+}
+
+/// What the gate does with a job about to start.
+#[derive(Debug, PartialEq)]
+pub(crate) enum GateAction {
+    Run,
+    Shadow, // run, and record that it would have waited
+    Defer,  // leave it queued with a backoff
+}
+
+/// Scheduled backups and restore tests are gated; human jobs only with pgbx.gate_manual_jobs = defer; restores and
+/// prunes never. Past the deadline (max_defer) a job always runs.
+pub(crate) fn gate_action(mode: Gate, manual_policy: GateManual, kind: &str, manual: bool, busy: bool, past_deadline: bool) -> GateAction {
+    let gated = matches!(kind, "backup" | "verify") && (!manual || manual_policy == GateManual::Defer);
+    if !busy || !gated || mode == Gate::Off {
+        return GateAction::Run;
+    }
+    match mode {
+        Gate::Shadow => GateAction::Shadow,
+        Gate::On if past_deadline => GateAction::Run,
+        _ => GateAction::Defer,
+    }
+}
+
+fn gate_of(s: Option<&str>) -> Gate {
+    match s {
+        Some("off") => Gate::Off,
+        Some("on") => Gate::On,
+        Some("shadow") => Gate::Shadow,
+        _ => LOAD_GATE.get(),
+    }
+}
+
+/// Sample the load (once per poll, before anything else so the window between polls is the app's, not ours).
+fn sample_load(admin: &mut Client, s: &mut Sched) {
+    let r = admin.query_one(
+        "SELECT (SELECT count(*) FROM pg_stat_activity a WHERE a.state <> 'idle' AND a.backend_type = 'client backend'
+                    AND a.pid <> pg_backend_pid() AND coalesce(a.application_name, '') NOT LIKE 'pgbx%')::int,
+                (SELECT sum(xact_commit + xact_rollback) FROM pg_stat_database)::float8,
+                (SELECT count(*) FROM pg_stat_activity a WHERE a.state = 'active' AND a.backend_type = 'client backend'
+                    AND coalesce(a.application_name, '') NOT LIKE 'pgbx%' AND $1 > 0
+                    AND now() - a.xact_start > make_interval(secs => $1)
+                    AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND l.granted
+                                AND l.mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock',
+                                               'ExclusiveLock', 'AccessExclusiveLock')))::int,
+                (SELECT extract(epoch FROM max(replay_lag))::float8 FROM pg_stat_replication),
+                extract(epoch FROM clock_timestamp())::float8",
+        &[&(BUSY_LONG_XACT.get() as f64)],
+    );
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => return log(&format!("load sample: {}", pe(e))),
+    };
+    let (active, xacts, long, lag, t): (i32, f64, i32, Option<f64>, f64) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+    let tps = s.load_prev.filter(|(pt, px)| t > *pt && xacts >= *px).map(|(pt, px)| (xacts - px) / (t - pt));
+    s.load_prev = Some((t, xacts));
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    let load_core = std::fs::read_to_string("/proc/loadavg").ok().and_then(|x| x.split_whitespace().next()?.parse::<f64>().ok()).map(|l| l / cores);
+    let th = Busy {
+        active: BUSY_ACTIVE_BACKENDS.get(),
+        tps: BUSY_TPS.get(),
+        long_xact: BUSY_LONG_XACT.get(),
+        lag: BUSY_REPLICA_LAG.get(),
+        loadavg: BUSY_LOADAVG.get(),
+    };
+    let reasons = busy_reasons(active, tps, long, lag, load_core, th);
+    let was = s.load.reasons.is_empty();
+    if was != reasons.is_empty() {
+        log(&if reasons.is_empty() { "load: quiet again".to_string() } else { format!("load: busy ({})", reasons.join(", ")) });
+    }
+    s.load = LoadNow { at: Some(Utc::now()), active, tps, reasons };
+}
+
 /// Same as pgbx._dur() in SQL.
 pub(crate) fn dur(secs: f64) -> String {
     if secs < 90.0 {
@@ -1151,7 +1309,15 @@ fn publish_capacity(admin: &mut Client, s: &mut Sched, conns: &mut HashMap<Strin
         ),
     );
     let key = format!("{:?} {:?}", (vals.0, vals.1, &vals.2, vals.3, vals.4, vals.5, vals.6), (vals.7, vals.8, vals.9, vals.10, vals.11, vals.12, &vals.13));
+    let load = s.load.clone();
+    let load_at = load.at.map(SystemTime::from);
+    let (busy, reasons) = (load.at.map(|_| !load.reasons.is_empty()), (!load.reasons.is_empty()).then(|| load.reasons.join(", ")));
+    let tps = load.tps.map(|x| x.round());
+    let admin_db = setting(&ADMIN_DB).unwrap_or("postgres".into());
+    let minute = Utc::now().timestamp() / 60;
     for (db, cl) in conns.iter_mut() {
+        // the admin database (pgbx load, doctor) gets every sample; the others when busy flips or once a minute
+        let key = if *db == admin_db { format!("{key} {load_at:?}") } else { format!("{key} {busy:?} {minute}") };
         if s.cap_written.get(db) == Some(&key) {
             continue;
         }
@@ -1166,6 +1332,10 @@ fn publish_capacity(admin: &mut Client, s: &mut Sched, conns: &mut HashMap<Strin
         );
         match r {
             Ok(_) => {
+                let _ = cl.execute(
+                    "UPDATE pgbx.server_capacity SET load_at=$1, load_busy=$2, load_reasons=$3, load_active=$4, load_tps=$5",
+                    &[&load_at, &busy, &reasons, &load.active, &tps],
+                );
                 s.cap_written.insert(db.clone(), key.clone());
             }
             Err(e) => log(&format!("{db}: server_capacity: {}", pe(e))),
@@ -1488,19 +1658,31 @@ fn publish_overview(admin: &mut Client, cl: &mut Client, db: &str, cron: &str) -
         )
         .map_err(pe)?
         .get(0);
+    let g = cl
+        .query_one(
+            "SELECT coalesce((SELECT load_gate FROM pgbx.config), current_setting('pgbx.load_gate', true)),
+                    count(*) FILTER (WHERE params ? 'would_defer')::int, count(*) FILTER (WHERE params ? 'busy_deferrals')::int,
+                    count(*) FILTER (WHERE kind = 'backup' AND params->>'forced' = 'true')::int
+               FROM pgbx.history WHERE requested_at > now() - interval '7 days' AND kind IN ('backup', 'verify')",
+            &[],
+        )
+        .map_err(pe)?;
+    let (gate, would, deferred, forced): (Option<String>, i32, i32, i32) = (g.get(0), g.get(1), g.get(2), g.get(3));
     let w = cl.query_one("SELECT cron, score, current_score, confidence FROM pgbx.suggest_window()", &[]).map_err(pe)?;
     let (wcron, wscore, wcur, wconf): (Option<String>, Option<f64>, Option<f64>, Option<String>) = (w.get(0), w.get(1), w.get(2), w.get(3));
     admin
         .execute(
             "INSERT INTO pgbx.server_overview AS o
                 (database, state, schedule, last_backup_at, last_backup_size, next_backup_at, backups_kept, last_verify, last_error,
-                 seen_at, interval_secs, dump_secs, eta_error, window_cron, window_score, current_score, window_confidence)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12, $13, $14, $15, $16)
+                 seen_at, interval_secs, dump_secs, eta_error, window_cron, window_score, current_score, window_confidence,
+                 load_gate, would_defer_7d, deferred_7d, forced_7d)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
              ON CONFLICT (database) DO UPDATE SET state=$2, schedule=$3, last_backup_at=$4, last_backup_size=$5,
                 next_backup_at=$6, backups_kept=$7, last_verify=$8, last_error=$9, seen_at=now(), interval_secs=$10, dump_secs=$11,
-                eta_error=$12, window_cron=$13, window_score=$14, current_score=$15, window_confidence=$16",
+                eta_error=$12, window_cron=$13, window_score=$14, current_score=$15, window_confidence=$16,
+                load_gate=$17, would_defer_7d=$18, deferred_7d=$19, forced_7d=$20",
             &[&db, &state, &schedule, &last_at, &size, &next_at, &kept, &verify, &err, &interval, &dump_secs, &eta_error,
-              &wcron, &wscore, &wcur, &wconf],
+              &wcron, &wscore, &wcur, &wconf, &gate, &would, &deferred, &forced],
         )
         .map_err(pe)?;
     Ok(())
@@ -1824,6 +2006,7 @@ fn pick_backup(c: &Ctx, b: &Bucket, path: &str, at: DateTime<Utc>) -> Result<Str
 }
 
 /// CREATE DATABASE <into> TEMPLATE template0, then stream the S3 object straight into pg_restore's stdin.
+#[allow(clippy::too_many_arguments)]
 fn restore_key_into(
     c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: &str, into: &str, app: &str, progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<i64, String> {
@@ -2115,6 +2298,32 @@ mod t {
         assert_eq!(backup_slots("0 2 * * *", from), vec![2, 26, 50, 74, 98, 122, 146]);
         assert_eq!(backup_slots("30 4 * * 0", from), vec![4]);
         assert_eq!(backup_slots("0 * * * *", from).len(), 168);
+    }
+
+    #[test]
+    fn gate_decisions() {
+        let th = Busy { active: 4, tps: 200, long_xact: 30, lag: 30, loadavg: 0.8 };
+        assert!(busy_reasons(4, Some(200.0), 0, Some(30.0), Some(0.8), th).is_empty(), "at the threshold is not busy");
+        let r = busy_reasons(12, Some(900.0), 1, Some(45.0), Some(1.5), th);
+        assert_eq!(r.len(), 5, "{r:?}");
+        assert_eq!(r[0], "12 active sessions > 4");
+        assert_eq!(r[1], "900 tps > 200");
+        let off = Busy { active: 0, tps: 0, long_xact: 0, lag: 0, loadavg: 0.0 };
+        assert!(busy_reasons(999, Some(1e6), 9, Some(1e4), Some(9.0), off).is_empty(), "0 = ignore");
+        assert!(busy_reasons(1, None, 0, None, None, th).is_empty(), "no tps yet, no replica, no /proc");
+        use GateAction::*;
+        let (sh, on, of) = (Gate::Shadow, Gate::On, Gate::Off);
+        let (warn, defer) = (GateManual::Warn, GateManual::Defer);
+        assert_eq!(gate_action(sh, warn, "backup", false, true, false), Shadow, "shadow never delays");
+        assert_eq!(gate_action(on, warn, "backup", false, true, false), Defer);
+        assert_eq!(gate_action(on, warn, "backup", false, true, true), Run, "deadline reached: runs (forced)");
+        assert_eq!(gate_action(on, warn, "backup", false, false, false), Run, "quiet");
+        assert_eq!(gate_action(of, warn, "backup", false, true, false), Run);
+        assert_eq!(gate_action(on, warn, "backup", true, true, false), Run, "manual + warn: starts now");
+        assert_eq!(gate_action(on, defer, "backup", true, true, false), Defer, "manual + defer");
+        assert_eq!(gate_action(on, defer, "restore", true, true, false), Run, "restores are never gated");
+        assert_eq!(gate_action(on, warn, "verify", false, true, false), Defer);
+        assert_eq!(gate_action(on, warn, "prune", false, true, false), Run);
     }
 
     #[test]

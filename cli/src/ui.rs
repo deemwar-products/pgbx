@@ -26,6 +26,8 @@ pub const WRITE_FUNCTIONS: &[&str] = &[
     "pgbx.backup_now()",
     "pgbx.restore(text, timestamptz)",
     "pgbx.configure(text, int, int, bool, text)",
+    "pgbx.configure(text, int, int, bool, text, text)",
+    "pgbx.cancel(bigint)",
     "pgbx.download_url(bigint, interval)",
 ];
 
@@ -39,6 +41,7 @@ pub enum Route {
     Timeline { days: i32 },
     Health,
     Queue,
+    Load,
     NotFound,
     MethodNotAllowed,
 }
@@ -53,6 +56,7 @@ pub fn route(method: &str, target: &str) -> Route {
         "/api/overview" => Route::Overview,
         "/api/health" => Route::Health,
         "/api/queue" => Route::Queue,
+        "/api/load" => Route::Load,
         "/api/timeline" => {
             let days = query_param(query, "days").and_then(|d| d.parse::<i32>().ok()).unwrap_or(30).clamp(1, 3650);
             Route::Timeline { days }
@@ -210,6 +214,13 @@ fn api_queue(cx: &Ctx) -> Result<Value, String> {
     Ok(json!({"ok": true, "jobs": jobs, "slots": slots}))
 }
 
+/// The load gate: last sample, settings, per-database counts (same data as `pgbx load`).
+fn api_load(cx: &Ctx) -> Result<Value, String> {
+    let mut c = admin(cx)?;
+    Ok(json!({"ok": true, "sample": one(&mut c, crate::load::LOAD_SQL, &[])?, "settings": one(&mut c, crate::load::SETTINGS_SQL, &[])?,
+              "databases": rows(&mut c, crate::load::DBS_SQL, &[])?}))
+}
+
 fn api_health(cx: &Ctx) -> Result<Value, String> {
     let mut c = admin(cx)?;
     let checks = rows(&mut c, "SELECT * FROM pgbx.doctor()", &[])?;
@@ -277,6 +288,7 @@ fn handle(mut s: TcpStream, cx: &Ctx, loopback: bool) {
         Route::Timeline { days } => json_resp(&mut s, api_timeline(cx, days)),
         Route::Health => json_resp(&mut s, api_health(cx)),
         Route::Queue => json_resp(&mut s, api_queue(cx)),
+        Route::Load => json_resp(&mut s, api_load(cx)),
     }
 }
 
@@ -338,6 +350,7 @@ mod tests {
         assert_eq!(route("GET", "/api/cluster"), Route::NotFound);
         assert_eq!(route("GET", "/api/health"), Route::Health);
         assert_eq!(route("GET", "/api/queue"), Route::Queue);
+        assert_eq!(route("GET", "/api/load"), Route::Load);
         assert_eq!(route("GET", "/api/timeline"), Route::Timeline { days: 30 });
         assert_eq!(route("GET", "/api/timeline?days=7"), Route::Timeline { days: 7 });
         assert_eq!(route("GET", "/api/timeline?days=0"), Route::Timeline { days: 1 });
@@ -388,7 +401,7 @@ mod tests {
     #[test]
     fn page_is_self_contained() {
         assert!(PAGE.contains("/api/overview") && PAGE.contains("/api/timeline") && PAGE.contains("/api/health"));
-        assert!(PAGE.contains("/api/queue") && PAGE.contains("cancel"));
+        assert!(PAGE.contains("/api/queue") && PAGE.contains("cancel") && PAGE.contains("/api/load"));
         assert!(PAGE.contains("Apply") && PAGE.contains("clipboard") && PAGE.contains("schedule suggest"));
         for bad in ["http://", "https://", "<form", "method=\"post\"", "POST"] {
             assert!(!PAGE.contains(bad), "page must not contain {bad}");

@@ -3,7 +3,8 @@
 #   1) tests/e2e.sh        — every per-database feature against the real S3 bucket
 #   2) tests/cli_e2e.sh    — the pgbx CLI (policy, refusals, skill, db-restore --from-s3 onto a server without pgbx)
 #      tests/ui_e2e.sh     — pgbx ui: read-only audit UI (pages, JSON, GET only, viewer role)
-#      tests/queue_e2e.sh  — the server-wide job queue: slots, pick order, overrun skip, crash recovery (restarts db)
+#      tests/queue_e2e.sh  — the server-wide job queue: slots, pick order, overrun skip, cancel, ETA, crash recovery (restarts db)
+#      tests/load_e2e.sh   — quiet-window suggestion and the load gate (pgbench)
 #   3) tests/bench_local.sh — ~1.2 GB speed + S3-outage chaos against a local S3
 #   4) tests/upgrade_e2e.sh — worker auto-update (ALTER EXTENSION UPDATE incl. template1)
 # PG_MAJOR=13..18 picks the Postgres major (needs a dev image built with that PG_MAJOR, see docker/Dockerfile).
@@ -25,6 +26,7 @@ echo "== server ready"
 ../tests/cli_e2e.sh; cli=$?
 ../tests/ui_e2e.sh; ui=$?
 ../tests/queue_e2e.sh; queue=$?
+../tests/load_e2e.sh; load=$?
 ../tests/bench_local.sh; bench=$?
 (set -a; . ./.env; set +a; ../tests/upgrade_e2e.sh); upgrade=$?
 diag=0
@@ -32,5 +34,5 @@ if [ "${PGBX_DIAG_SMOKE:-0}" = 1 ]; then   # optional: pgbx doctor/diagnose with
   (cd .. && docker run --rm --name pgbx-diag-smoke -v "$PWD":/src -v pgbx-diag-target:/src/target \
      -v pgbx-diag-clitarget:/src/cli/target -w /src pgbx-dev sh tests/diag_smoke.sh); diag=$?
 fi
-echo "== e2e exit $e2e, cli_e2e exit $cli, ui_e2e exit $ui, queue_e2e exit $queue, bench exit $bench, upgrade exit $upgrade, diag smoke exit $diag"
-[ $e2e -eq 0 ] && [ $cli -eq 0 ] && [ $ui -eq 0 ] && [ $queue -eq 0 ] && [ $bench -eq 0 ] && [ $upgrade -eq 0 ] && [ $diag -eq 0 ]
+echo "== e2e exit $e2e, cli_e2e exit $cli, ui_e2e exit $ui, queue_e2e exit $queue, load_e2e exit $load, bench exit $bench, upgrade exit $upgrade, diag smoke exit $diag"
+[ $e2e -eq 0 ] && [ $cli -eq 0 ] && [ $ui -eq 0 ] && [ $queue -eq 0 ] && [ $load -eq 0 ] && [ $bench -eq 0 ] && [ $upgrade -eq 0 ] && [ $diag -eq 0 ]

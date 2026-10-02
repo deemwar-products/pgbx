@@ -197,6 +197,29 @@ BEGIN
     ok := v IS NULL;
     detail := CASE WHEN ok THEN 'no schedule sits in a busy hour while a much quieter one is known (pgbx.suggest_window())' ELSE v END;
     RETURN NEXT;
+
+    -- the load gate (ADR 0001 §1): informational; it never fails a check by itself
+    name := 'load_gate';
+    ok := true; fix := NULL;
+    SELECT format('pgbx.load_gate = %s%s; last sample %s: %s; last 7 days: %s job(s) would have waited (shadow), %s deferred, %s forced',
+                  current_setting('pgbx.load_gate', true),
+                  coalesce('; on in ' || (SELECT string_agg(s.database, ', ' ORDER BY s.database) FROM pgbx.server_overview s WHERE s.load_gate = 'on'), ''),
+                  coalesce(to_char(c.load_at AT TIME ZONE 'UTC', 'HH24:MI:SS "UTC"'), 'none yet'),
+                  CASE WHEN c.load_busy THEN 'busy (' || c.load_reasons || ')' WHEN c.load_busy IS NULL THEN '?' ELSE 'quiet' END,
+                  (SELECT coalesce(sum(s.would_defer_7d), 0) FROM pgbx.server_overview s),
+                  (SELECT coalesce(sum(s.deferred_7d), 0) FROM pgbx.server_overview s),
+                  (SELECT coalesce(sum(s.forced_7d), 0) FROM pgbx.server_overview s))
+      INTO detail FROM (SELECT 1) one LEFT JOIN pgbx.server_capacity c ON true;
+    RETURN NEXT;
+
+    -- backups that kept hitting their max_defer deadline: the schedule sits in a busy window
+    name := 'forced_backups_7d';
+    SELECT string_agg(format('%s: %s forced', s.database, s.forced_7d), ', ' ORDER BY s.forced_7d DESC), min(s.database)
+      INTO v, bad FROM pgbx.server_overview s WHERE s.forced_7d > 2;
+    ok := v IS NULL;
+    detail := CASE WHEN ok THEN 'no database had more than 2 backups forced past a busy server in 7 days' ELSE v END;
+    fix := CASE WHEN ok THEN NULL ELSE format('move the schedule to a quieter hour: pgbx schedule suggest --db %s', bad) END;
+    RETURN NEXT;
 END $$;
 
 -- coalesced manual jobs and cancel (ADR 0001 §0)
@@ -288,14 +311,14 @@ CREATE OR REPLACE FUNCTION pgbx.status() RETURNS TABLE (
     backups_kept bigint, retention text, data_scope text, verify_schedule text, last_verified_at timestamptz, last_verify_result text,
     last_error text, last_error_at timestamptz, paused_reason text, paused_at timestamptz,
     queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text,
-    job_progress text, job_eta text, suggested_schedule text
+    job_progress text, job_eta text, suggested_schedule text, load_gate text, last_load text, would_defer_7d bigint
 ) LANGUAGE plpgsql STABLE AS $$
 DECLARE cfg pgbx.config; lb pgbx.history; le pgbx.history; lv pgbx.history; last_auto timestamptz;
 BEGIN
     SELECT * INTO cfg FROM pgbx.config;
     IF NOT FOUND THEN  -- worker hasn't visited this database yet
         cfg := ROW(1, NULL, '0 2 * * *', 'daily at 02:00', 14, 90, '0 4 * * 0', 'weekly on sunday at 04:00',
-                   true, NULL, NULL, now(), NULL, NULL)::pgbx.config;
+                   true, NULL, NULL, now(), NULL, NULL, NULL)::pgbx.config;
     END IF;
     SELECT * INTO lb FROM pgbx.history WHERE kind='backup' AND history.state='done' ORDER BY id DESC LIMIT 1;
     SELECT * INTO le FROM pgbx.history WHERE history.state='failed' ORDER BY id DESC LIMIT 1;
@@ -343,7 +366,12 @@ BEGIN
         (SELECT CASE WHEN w.cron IS NULL THEN w.start_at
                      ELSE format('%s (%s, %sx average activity vs %sx now; %s confidence) — never applied by itself: %s',
                                  w.cron, w.start_at, w.score, w.current_score, w.confidence, w.apply_sql) END
-           FROM pgbx.suggest_window() w)
+           FROM pgbx.suggest_window() w),
+        coalesce(cfg.load_gate, current_setting('pgbx.load_gate', true), 'shadow'),
+        (SELECT format('%s at %s', CASE WHEN c.load_busy THEN 'busy: ' || c.load_reasons ELSE 'quiet' END,
+                       to_char(c.load_at AT TIME ZONE 'UTC', 'HH24:MI:SS "UTC"'))
+           FROM pgbx.server_capacity c WHERE c.load_at IS NOT NULL),
+        (SELECT count(*) FROM pgbx.history h WHERE h.params ? 'would_defer' AND h.requested_at > now() - interval '7 days')
     FROM (SELECT NULL::bigint AS id, NULL::jsonb AS params
           UNION ALL (SELECT h.id, h.params FROM pgbx.history h WHERE h.state='queued'
                      ORDER BY (h.params->>'queue_position')::int NULLS LAST, h.id LIMIT 1)
@@ -477,7 +505,7 @@ BEGIN
     RETURN NEXT;
 END $$;
 CREATE OR REPLACE FUNCTION pgbx._notice_eta(j bigint) RETURNS void LANGUAGE plpgsql AS $$
-DECLARE h pgbx.history; e record; cap pgbx.server_capacity; ahead int; starts timestamptz;
+DECLARE h pgbx.history; e record; cap pgbx.server_capacity; ahead int; starts timestamptz; act int; gate text; manual text;
 BEGIN
     SELECT * INTO h FROM pgbx.history x WHERE x.id = j;
     SELECT * INTO e FROM pgbx._estimate(h.kind);
@@ -488,6 +516,20 @@ BEGIN
         CASE WHEN ahead > 0 THEN format(' (%s job(s) running or waiting on this server)', ahead) ELSE '' END,
         CASE WHEN starts < now() + interval '1 minute' THEN 'now' ELSE to_char(starts, 'HH24:MI') END,
         pgbx._dur(e.est_secs), pg_size_pretty(e.est_bytes), e.confidence, e.basis);
+    -- the load gate on human jobs (pgbx.gate_manual_jobs): say it competes with the app, right now
+    gate := coalesce((SELECT c.load_gate FROM pgbx.config c), current_setting('pgbx.load_gate', true), 'shadow');
+    manual := coalesce(current_setting('pgbx.gate_manual_jobs', true), 'warn');
+    SELECT count(*) INTO act FROM pg_stat_activity a WHERE a.state <> 'idle' AND a.backend_type = 'client backend'
+       AND a.pid <> pg_backend_pid() AND coalesce(a.application_name, '') NOT LIKE 'pgbx%';
+    IF gate <> 'off' AND manual <> 'off' AND h.kind IN ('backup', 'verify', 'restore')
+       AND (coalesce(cap.load_busy, false)
+            OR act > nullif(coalesce(nullif(current_setting('pgbx.busy_active_backends', true), '')::int, 4), 0)) THEN
+        RAISE NOTICE '%', format('pgbx: the server is busy (%s active session(s) now%s): this %s will compete with the app; %s',
+            act, coalesce(', last sample: ' || cap.load_reasons, ''), h.kind,
+            CASE WHEN manual = 'defer' AND gate = 'on' AND h.kind <> 'restore'
+                 THEN 'it waits for a quieter moment, at most pgbx.max_defer'
+                 ELSE 'it starts anyway (pgbx.gate_manual_jobs = warn)' END);
+    END IF;
 END $$;
 -- restore() becomes plpgsql to raise the NOTICE (same signature)
 CREATE OR REPLACE FUNCTION pgbx.restore(into_db text, at timestamptz DEFAULT now()) RETURNS bigint LANGUAGE plpgsql AS $$
@@ -618,3 +660,41 @@ END $$;
 REVOKE ALL ON FUNCTION pgbx._activity_add(text, timestamptz, float8, float8, float8, float8, float8), pgbx.suggest_window(int) FROM PUBLIC;
 ALTER FUNCTION pgbx.suggest_window(int) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.suggest_window(int) TO pgbx_viewer;
+
+-- the load gate (ADR 0001 §1): shadow by default, per-database configure(load_gate => ...), doctor load_gate / forced_backups_7d
+ALTER TABLE pgbx.config ADD COLUMN load_gate text CHECK (load_gate IN ('off', 'shadow', 'on'));
+ALTER TABLE pgbx.server_capacity ADD COLUMN load_at timestamptz, ADD COLUMN load_busy bool, ADD COLUMN load_reasons text,
+    ADD COLUMN load_active int, ADD COLUMN load_tps float8;
+ALTER TABLE pgbx.server_overview ADD COLUMN load_gate text, ADD COLUMN would_defer_7d int, ADD COLUMN deferred_7d int,
+    ADD COLUMN forced_7d int;
+-- configure() gains load_gate (new signature: drop and create, then the install's lockdown for it)
+DROP FUNCTION pgbx.configure(text, int, int, bool, text);
+CREATE OR REPLACE FUNCTION pgbx.configure(
+    schedule text DEFAULT NULL, max_backups int DEFAULT NULL, max_days int DEFAULT NULL,
+    enabled bool DEFAULT NULL, path text DEFAULT NULL, load_gate text DEFAULT NULL
+) RETURNS pgbx.config LANGUAGE plpgsql AS $$
+DECLARE r pgbx.config; c text := CASE WHEN schedule IS NULL THEN NULL ELSE pgbx.to_cron(schedule) END;
+BEGIN
+    INSERT INTO pgbx.config DEFAULT VALUES ON CONFLICT (id) DO NOTHING;
+    UPDATE pgbx.config x SET
+        schedule       = coalesce(c, x.schedule),
+        schedule_label = coalesce(configure.schedule, x.schedule_label),
+        max_backups    = coalesce(configure.max_backups, x.max_backups),
+        max_days       = coalesce(pgbx._check_days(configure.max_days), x.max_days),
+        enabled        = coalesce(configure.enabled, x.enabled),
+        paused_at      = CASE WHEN configure.enabled IS NULL THEN x.paused_at WHEN configure.enabled THEN NULL ELSE now() END,
+        paused_reason  = CASE WHEN configure.enabled IS NULL THEN x.paused_reason WHEN configure.enabled THEN NULL ELSE 'configure(enabled => false)' END,
+        path           = coalesce(configure.path, x.path),
+        load_gate      = CASE WHEN configure.load_gate IS NULL THEN x.load_gate WHEN configure.load_gate = 'default' THEN NULL
+                              ELSE configure.load_gate END,
+        updated_at     = now()
+    RETURNING * INTO r;
+    PERFORM pgbx._log('config', to_jsonb(r));
+    IF configure.max_backups IS NOT NULL OR configure.max_days IS NOT NULL THEN
+        INSERT INTO pgbx.history (kind, trigger) VALUES ('prune', 'migration');
+    END IF;
+    RETURN r;
+END $$;
+REVOKE ALL ON FUNCTION pgbx.configure(text, int, int, bool, text, text) FROM PUBLIC;
+ALTER FUNCTION pgbx.configure(text, int, int, bool, text, text) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.configure(text, int, int, bool, text, text) TO pgbx_admin;
