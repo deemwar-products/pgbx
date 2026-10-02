@@ -9,6 +9,7 @@
 
 mod diagnose;
 mod policy;
+mod profile;
 mod s3restore;
 mod setup;
 mod skill;
@@ -32,11 +33,11 @@ const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset",
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
-    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf",
+    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
-    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup",
+    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -128,9 +129,14 @@ first-time server setup (guarded: shows the plan; --yes writes; never restarts P
               --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
       writes <config dir>/conf.d/pgbx.conf (shared_preload_libraries merged with what is loaded) and the
       credentials file (0600, owner postgres; keys read from env vars, default AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
+profiles (one per server; never stores passwords or S3 keys):
+  pgbx profile add NAME [--host H --port P --user U --admin-db D --s3-endpoint U --s3-bucket B --s3-region R
+                         --server-name S --credentials-file F]   (the first profile becomes the default)
+  pgbx profile list | show NAME | remove NAME | use NAME          (use = set the default)
+  --profile NAME or PGBX_PROFILE on any command; precedence: flag > PGHOST/PGPORT/PGUSER > profile > default
 agent skill:
   pgbx skill install [--no-codex] | uninstall | where
-common: --json --host --port --user --admin-db --timeout SECS (PGHOST/PGPORT/PGUSER/PGPASSWORD honoured)
+common: --json --profile NAME --host --port --user --admin-db --timeout SECS (PGHOST/PGPORT/PGUSER/PGPASSWORD honoured)
 TS always carries a UTC offset: '2026-01-31 14:00:00+00'";
 
 // ---------------------------------------------------------------- safety
@@ -147,6 +153,7 @@ pub fn level(cmd: &str, a: &Args) -> Level {
     let shows = a.pos.is_empty() && !["max-backups", "max-days", "include", "exclude", "reset"].iter().any(|f| a.has(f));
     match cmd {
         "now" | "verify" | "db-restore" | "resume" | "link" | "skill" => Level::Safe,
+        "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "remove" | "use")) => Level::Safe,
         "schedule" if shows => Level::ReadOnly,
         "schedule" => Level::Safe,
         "retention" | "scope" if shows => Level::ReadOnly,
@@ -516,10 +523,14 @@ fn main() {
         println!("{HELP}");
         return;
     }
+    let mut a = a;
     let cmd = a.cmd.clone();
     let lvl = level(&cmd, &a);
+    let prof = if cmd == "profile" { Ok(None) } else { profile::apply_from_disk(&mut a) };
     let mut cx = Ctx { a, admin_db: None };
     let r = match cmd.as_str() {
+        _ if prof.is_err() => Err(prof.clone().unwrap_err()),
+        "profile" => profile::run_sys(&cx.a),
         "status" => cmd_status(&mut cx),
         "list" => cmd_list(&mut cx),
         "now" => cmd_now(&mut cx),
@@ -545,6 +556,9 @@ fn main() {
     let mut v = r.unwrap_or_else(|e| json!({"ok": false, "error": e}));
     v["command"] = json!(cmd);
     v["safety"] = json!(format!("{lvl:?}").to_lowercase());
+    if let Ok(Some(p)) = &prof {
+        v["profile_used"] = json!(p);
+    }
     let ok = v["ok"] == true;
     if as_json {
         println!("{v}");
@@ -659,6 +673,14 @@ mod tests {
         assert_eq!(level("resume", &p(&["resume"])), Level::Safe);
         assert_eq!(level("verify-schedule", &p(&["verify-schedule", "never"])), Level::Guarded);
         assert_eq!(level("schedule", &p(&["schedule"])), Level::ReadOnly);
+        assert_eq!(level("profile", &p(&["profile", "list"])), Level::ReadOnly);
+        assert_eq!(level("profile", &p(&["profile", "add", "x", "--host", "h"])), Level::Safe);
+    }
+
+    #[test]
+    fn profile_flag_parses() {
+        let a = p(&["status", "--profile", "prod", "--json"]);
+        assert_eq!(a.get("profile"), Some("prod"));
     }
 
 }
