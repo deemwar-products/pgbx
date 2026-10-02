@@ -92,10 +92,17 @@ fn set_child(pid: u32) {
     }
 }
 
+/// One line to the server log at LOG level. Not pgrx::log!: on PG13 its pre-check compares LOG numerically with
+/// log_min_messages (default WARNING) and drops every line; errstart() itself knows LOG goes to the server log.
+fn pg_log(msg: String) {
+    pgrx::pg_sys::panic::ErrorReport::new(pgrx::PgSqlErrorCode::ERRCODE_SUCCESSFUL_COMPLETION, msg, "pgbx")
+        .report(pgrx::PgLogLevel::LOG);
+}
+
 /// The Postgres log, from any thread: job threads queue their lines, the main thread writes them.
 pub(crate) fn log(msg: &str) {
     if on_main_thread() {
-        pgrx::log!("pgbx: {msg}");
+        pg_log(format!("pgbx: {msg}"));
     } else {
         LOG_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(msg.to_string());
     }
@@ -104,7 +111,7 @@ pub(crate) fn log(msg: &str) {
 fn drain_logs() {
     let lines = std::mem::take(&mut *LOG_QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
     for l in lines {
-        pgrx::log!("pgbx: {l}");
+        pg_log(format!("pgbx: {l}"));
     }
 }
 

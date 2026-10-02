@@ -192,7 +192,7 @@ echo "## 17. bandwidth caps (token bucket): pgbx.upload_kbps / download_kbps = 2
 P -c "ALTER SYSTEM SET pgbx.upload_kbps = 2048" -c "ALTER SYSTEM SET pgbx.download_kbps = 2048" -c "SELECT pg_reload_conf()" >/dev/null
 P -c "DROP DATABASE IF EXISTS big_capped WITH (FORCE)"
 capped() { # id -> "<state> <MiB/s>" once finished
-  for _ in $(seq 240); do r=$(P -d big -c "SELECT state||' '||coalesce(round(bytes / extract(epoch FROM finished - started) / 1048576, 2)::text, '-') FROM pgbx.history WHERE id=$1");
+  for _ in $(seq 240); do r=$(P -d big -c "SELECT state||' '||coalesce(round((bytes / extract(epoch FROM finished - started) / 1048576)::numeric, 2)::text, '-') FROM pgbx.history WHERE id=$1");
     case "$r" in done*|failed*) break;; esac; sleep 1; done; echo "$r"; }
 within() { awk -v r="${1#* }" -v s="${1%% *}" 'BEGIN { print (s == "done" && r >= 1.8 && r <= 2.2) ? "yes" : "no (" s ", " r " MiB/s)" }'; }
 r=$(capped "$(P -d big -c "SELECT pgbx.backup_now()")"); echo "  backup: $r MiB/s"; check "upload at 2 MiB/s ±10%" "$(within "$r")" yes
