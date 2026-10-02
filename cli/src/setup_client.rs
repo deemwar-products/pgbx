@@ -2,7 +2,9 @@
 //! for) a profile name, how to reach the server (direct host/port, or an SSH target), the database user and
 //! optional S3 locations for `--from-s3` restores — never a password or S3 key. Writes the profile (default if
 //! it is the first), then tests it: connect (through the tunnel when ssh), the pgbx extension's version and a
-//! `pgbx.status()` summary, with the next step for each failure. Last, offers `pgbx skill install`.
+//! `pgbx.status()` summary, with the next step for each failure. A server without the extension is fine:
+//! pgbx then is a plain client (profiles, tunnels, `pgbx query`, agent memory) and backups are reported as off,
+//! with turning them on as an optional step. Last, offers `pgbx skill install`.
 //! Non-interactive (no TTY, or --json): flags only, and --yes to write.
 
 use crate::{one, Args, Ctx, Out};
@@ -73,7 +75,7 @@ pub fn gather(a: &Args, mut ask: Option<Ask>) -> Result<(String, HashMap<String,
     Ok((name, f))
 }
 
-/// What to do next, given the test results.
+/// What to do next, given the test results. Steps for an extension that is simply absent start with "optional".
 pub fn next_steps(t: &Value, via_ssh: bool) -> Vec<String> {
     let mut s = vec![];
     if let Some(e) = t["connect_error"].as_str() {
@@ -87,7 +89,11 @@ pub fn next_steps(t: &Value, via_ssh: bool) -> Vec<String> {
         return s;
     }
     if t["extension_version"].is_null() {
-        s.push(format!("extension not found: on the database server run `{}` and then `sudo pgbx setup server`", crate::tunnel::INSTALL));
+        s.push(if t["extension"] == "not_in_db" {
+            "pgbx is on this server but not in this database yet: wait for the worker's next poll, then run `pgbx doctor` if it stays missing".into()
+        } else {
+            crate::client_only::turn_on()
+        });
         return s;
     }
     if t["status"]["state"].as_str() == Some("failing") {
@@ -117,6 +123,15 @@ fn test(name: &str, fields: &HashMap<String, String>, db: &str) -> Value {
     if let Ok(v) = one(&mut c, "SELECT extversion FROM pg_extension WHERE extname = 'pgbx'", &[]) {
         t["extension_version"] = v["extversion"].clone();
     }
+    match crate::client_only::ext(&mut c) {
+        Ok(crate::client_only::Ext::Absent) => {
+            t["extension"] = json!("absent");
+            t["backups"] = json!("off");
+            t["info"] = json!(crate::client_only::OFF);
+        }
+        Ok(crate::client_only::Ext::NotInDb) => t["extension"] = json!("not_in_db"),
+        _ => {}
+    }
     if !t["extension_version"].is_null() {
         match one(&mut c, "SELECT state, schedule, last_backup_at, last_backup_age::text AS last_backup_age, backups_kept, last_error FROM pgbx.status()", &[]) {
             Ok(v) => t["status"] = v,
@@ -140,7 +155,8 @@ pub fn run(cx: &mut Ctx) -> Out {
     let db = cx.a.get("db").unwrap_or("postgres").to_string();
     let t = test(&name, &fields, &db);
     let steps = next_steps(&t, fields.contains_key("ssh"));
-    let ok = t["connected"] == true && !t["extension_version"].is_null();
+    // connected is enough: without the extension pgbx is a plain client (backups off), which is a fine way to use it
+    let ok = t["connected"] == true && t["extension"] != "not_in_db";
 
     // agent skill: default yes on a terminal, skipped without one
     let skill = if cx.a.has("no-skill") || !interactive {
@@ -202,8 +218,10 @@ mod tests {
         assert!(next_steps(&json!({"connect_error": "ssh tunnel to x failed"}), true)[0].contains("ssh"));
         assert!(next_steps(&json!({"connect_error": "password authentication failed"}), false)[0].contains(".pgpass"));
         assert!(next_steps(&json!({"connect_error": "connection refused"}), false)[0].contains("listen"));
-        let s = next_steps(&json!({"connected": true, "extension_version": null}), false);
-        assert!(s[0].contains("install.sh") && s[0].contains("pgbx setup server"));
+        let s = next_steps(&json!({"connected": true, "extension_version": null, "extension": "absent"}), false);
+        assert!(s[0].starts_with("optional") && s[0].contains("install.sh") && s[0].contains("pgbx setup server"));
+        let s = next_steps(&json!({"connected": true, "extension_version": null, "extension": "not_in_db"}), false);
+        assert!(s[0].contains("not in this database") && s[0].contains("doctor"));
         assert!(next_steps(&json!({"connected": true, "extension_version": "0.5.0", "status": {"state": "active"}}), false).is_empty());
         assert!(next_steps(&json!({"connected": true, "extension_version": "0.5.0", "status": {"state": "failing"}}), false)[0].contains("doctor"));
     }

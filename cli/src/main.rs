@@ -7,6 +7,7 @@
 //!   safe        now, verify, db-restore (NEW db only, also --from-s3), resume, link, schedule, skill
 //!   guarded     pause, lowering retention, narrowing scope, verify-schedule never — require --yes
 
+mod client_only;
 mod diagnose;
 mod memories;
 mod policy;
@@ -329,6 +330,9 @@ type Out = Result<Value, String>;
 fn cmd_status(cx: &mut Ctx) -> Out {
     let db = cx.db();
     let mut c = cx.connect(&db).map_err(|e| format!("{e} — if Postgres is down, run pgbx diagnose"))?;
+    if let Some(v) = client_only::status_without(&client_only::ext(&mut c)?, &db) {
+        return Ok(v);
+    }
     let st = one(&mut c, "SELECT * FROM pgbx.status()", &[])?;
     Ok(json!({"ok": true, "postgres": "up", "database": db, "status": st}))
 }
@@ -413,10 +417,16 @@ fn cmd_doctor(cx: &mut Ctx) -> Out {
                     ch.push(check(r["name"].as_str().unwrap_or("?"), r["ok"] == true, scalar(&r["detail"]), r["fix"].as_str().unwrap_or("")));
                 }
             }
+            Err(_) if client_only::ext(&mut c) == Ok(client_only::Ext::Absent) => {
+                let mut i = check("backups (pgbx extension)", true, client_only::OFF, "");
+                i["info"] = json!(client_only::turn_on());
+                ch.push(i);
+            }
             Err(e) => ch.push(check("server checks", false, e,
                 "make sure pgbx is in shared_preload_libraries (the worker creates the extension in the admin database)")),
         }
-        if let Some(d) = c.query_one("SHOW data_directory", &[]).ok().and_then(|r| r.get::<_, Option<String>>(0)) {
+        // over ssh the data directory is on the server, not on this machine
+        if let Some(d) = c.query_one("SHOW data_directory", &[]).ok().filter(|_| !cx.a.has("ssh")).and_then(|r| r.get::<_, Option<String>>(0)) {
             data_dir = Some(d);
         }
     }
@@ -511,9 +521,11 @@ fn doctor_text(v: &Value) -> String {
     let mut s = String::new();
     for c in v["checks"].as_array().cloned().unwrap_or_default() {
         let ok = c["ok"] == true;
-        s.push_str(&format!("[{}] {}: {}\n", if ok { " ok " } else if c["warning"] == true { "warn" } else { "FAIL" }, scalar(&c["name"]), scalar(&c["detail"])));
+        s.push_str(&format!("[{}] {}: {}\n", if c.get("info").is_some() { "info" } else if ok { " ok " } else if c["warning"] == true { "warn" } else { "FAIL" }, scalar(&c["name"]), scalar(&c["detail"])));
         if !ok {
             s.push_str(&format!("       fix: {}\n", scalar(&c["fix"])));
+        } else if let Some(i) = c.get("info") {
+            s.push_str(&format!("       {}\n", scalar(i)));
         }
     }
     s.push_str(if v["healthy"] == true { "healthy\n" } else { "NOT healthy\n" });
@@ -577,6 +589,9 @@ fn main() {
         _ if prof.is_err() => Err(prof.clone().unwrap_err()),
         "profile" => profile::run_sys(&cx.a),
         "memories" => memories::run_sys(&cx.a, prof.clone().ok().flatten()),
+        // no pgbx on the ssh host (client-only use): doctor checks what it can through the tunnel instead
+        "doctor" if tunnel::runs_remotely("doctor", &cx.a) => tunnel::run_remote("doctor", &cx.a)
+            .or_else(|e| if e.contains("not installed on") { cmd_doctor(&mut cx) } else { Err(e) }),
         c if tunnel::runs_remotely(c, &cx.a) => tunnel::run_remote(c, &cx.a),
         "query" => query::run(&mut cx),
         "tunnel" => tunnel::run(&cx.a, cx.a.get("profile")),
@@ -606,7 +621,7 @@ fn main() {
         },
         _ => unreachable!(),
     };
-    let mut v = r.unwrap_or_else(|e| json!({"ok": false, "error": e}));
+    let mut v = r.unwrap_or_else(|e| json!({"ok": false, "error": client_only::friendly(&cmd, e)}));
     v["command"] = json!(cmd);
     v["safety"] = json!(format!("{lvl:?}").to_lowercase());
     if cmd == "setup" && setup_sub.is_none() {
