@@ -69,6 +69,20 @@ pub static DEFER_BACKOFF: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 pub static MAX_DEFER: GucSetting<i32> = GucSetting::<i32>::new(4 * 3600); // s
 pub static MAX_DEFER_FIRST: GucSetting<i32> = GucSetting::<i32>::new(15 * 60); // s
 pub static COALESCE_MANUAL: GucSetting<bool> = GucSetting::<bool>::new(true);
+// one server-wide job queue (ADR 0001 §0)
+pub static MAX_CONCURRENT_JOBS: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub static OVERRUN_POLICY: GucSetting<Overrun> = GucSetting::<Overrun>::new(Overrun::Skip);
+pub static OVERRUN_MAX_GAP: GucSetting<f64> = GucSetting::<f64>::new(1.5);
+
+/// pgbx.overrun_policy: what happens to schedule slots that passed while a dump of that database ran.
+#[derive(pgrx::guc::PostgresGucEnum, Clone, Copy, PartialEq, Debug)]
+pub enum Overrun {
+    #[name = c"skip"]
+    Skip,
+    #[name = c"catch_up"]
+    CatchUp,
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.s3_endpoint", c"S3 endpoint URL", c"e.g. https://hel1.your-objectstorage.com", &S3_ENDPOINT, GucContext::Sighup, GucFlags::default());
@@ -96,6 +110,9 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(c"pgbx.max_defer", c"A deferred backup runs anyway this long after it was queued", c"capped at the schedule interval; backups are never skipped", &MAX_DEFER, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
     GucRegistry::define_int_guc(c"pgbx.max_defer_first", c"max_defer for a new database's first backup", c"", &MAX_DEFER_FIRST, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
     GucRegistry::define_bool_guc(c"pgbx.coalesce_manual", c"backup_now() / verify_now() return the job already queued instead of adding another", c"", &COALESCE_MANUAL, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.max_concurrent_jobs", c"Jobs (backups, restore tests, restores, prunes) running at once on this server", c"1-8; each running job holds an advisory lock slot in the admin database, so nothing can exceed it", &MAX_CONCURRENT_JOBS, 1, 8, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_enum_guc(c"pgbx.overrun_policy", c"Schedule slots that passed while a dump of the database was running", c"skip: the next run is the next slot after the dump finished (see pgbx.overrun_max_gap); catch_up: run once right away", &OVERRUN_POLICY, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_float_guc(c"pgbx.overrun_max_gap", c"With overrun_policy=skip, never wait for a slot more than this many schedule intervals after the last good backup finished", c"1.0-10; past it the backup runs right away", &OVERRUN_MAX_GAP, 1.0, 10.0, GucContext::Sighup, GucFlags::default());
 
     // Only register the worker when loaded at server start (shared_preload_libraries),
     // not when a backend loads the library for CREATE EXTENSION.
@@ -132,7 +149,9 @@ CREATE TABLE pgbx.server_overview (
     backups_kept     bigint,
     last_verify      text,
     last_error       text,
-    seen_at          timestamptz NOT NULL DEFAULT now()
+    seen_at          timestamptz NOT NULL DEFAULT now(),
+    interval_secs    float8,                                   -- seconds between this schedule's slots
+    dump_secs        float8[]                                  -- run time of the last 3 backups, newest first
 );
 
 -- One row per database. path NULL = use the database name (so the row copied from template1 stays correct).
@@ -566,6 +585,33 @@ BEGIN
     fix := CASE WHEN ok THEN NULL
                 ELSE 'a running dump blocks DDL (ALTER TABLE, migrations) on the tables it reads; move the schedule to a quiet hour, '
                      || 'or skip the rows of big tables with pgbx.set_data_scope()' END;
+    RETURN NEXT;
+
+    -- each of the last 3 dumps ran longer than the schedule interval: slots get skipped (or run back to back)
+    name := 'dump_longer_than_interval';
+    v := NULL; bad := NULL; fix := NULL;
+    FOR o IN SELECT s.database, s.interval_secs, s.dump_secs, (SELECT min(d) FROM unnest(s.dump_secs) d) AS shortest,
+                    (SELECT max(d) FROM unnest(s.dump_secs) d) AS longest
+               FROM pgbx.server_overview s
+              WHERE coalesce(s.state, '') NOT ILIKE 'paused%' AND s.interval_secs > 0 AND cardinality(s.dump_secs) >= 3
+              ORDER BY s.database LOOP
+        CONTINUE WHEN o.shortest <= o.interval_secs;
+        v := concat_ws('; ', v, format('%s: last 3 backups took %s; the schedule runs every %s', o.database,
+                 (SELECT string_agg(make_interval(secs => round(d))::text, ', ') FROM unnest(o.dump_secs) d),
+                 make_interval(secs => round(o.interval_secs))));
+        IF bad IS NULL THEN
+            bad := o.database;
+            SELECT l.label INTO fix FROM (VALUES ('every 15 minutes', 900), ('every 30 minutes', 1800), ('every 1 hour', 3600),
+                    ('every 2 hours', 7200), ('every 3 hours', 10800), ('every 4 hours', 14400), ('every 6 hours', 21600),
+                    ('every 12 hours', 43200), ('daily', 86400), ('weekly', 604800)) l(label, secs)
+             WHERE l.secs >= 2 * o.longest ORDER BY l.secs LIMIT 1;
+        END IF;
+    END LOOP;
+    ok := v IS NULL;
+    detail := CASE WHEN ok THEN 'recent backups of every database finish within its schedule interval' ELSE v END;
+    fix := CASE WHEN ok THEN NULL
+                ELSE format('connect to %s and give it a longer schedule: SELECT pgbx.configure(schedule => %L);',
+                            bad, coalesce(fix, 'weekly')) END;
     RETURN NEXT;
 END $$;
 

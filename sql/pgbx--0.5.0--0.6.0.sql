@@ -1,7 +1,10 @@
 -- pgbx 0.5.0 -> 0.6.0. The worker runs ALTER EXTENSION pgbx UPDATE in every database and template1 by itself.
 -- Objects changed here must match their CREATE in src/lib.rs (unit test worker::t::update_script_matches_install).
 
--- doctor(): long_running_job (ADR 0001 §3)
+-- server-wide queue (ADR 0001 §0): what doctor() needs to see dumps longer than their schedule interval
+ALTER TABLE pgbx.server_overview ADD COLUMN interval_secs float8, ADD COLUMN dump_secs float8[];
+
+-- doctor(): long_running_job (ADR 0001 §3), dump_longer_than_interval (§0)
 CREATE OR REPLACE FUNCTION pgbx._doctor() RETURNS TABLE (name text, ok bool, detail text, fix text)
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
@@ -122,6 +125,33 @@ BEGIN
     fix := CASE WHEN ok THEN NULL
                 ELSE 'a running dump blocks DDL (ALTER TABLE, migrations) on the tables it reads; move the schedule to a quiet hour, '
                      || 'or skip the rows of big tables with pgbx.set_data_scope()' END;
+    RETURN NEXT;
+
+    -- each of the last 3 dumps ran longer than the schedule interval: slots get skipped (or run back to back)
+    name := 'dump_longer_than_interval';
+    v := NULL; bad := NULL; fix := NULL;
+    FOR o IN SELECT s.database, s.interval_secs, s.dump_secs, (SELECT min(d) FROM unnest(s.dump_secs) d) AS shortest,
+                    (SELECT max(d) FROM unnest(s.dump_secs) d) AS longest
+               FROM pgbx.server_overview s
+              WHERE coalesce(s.state, '') NOT ILIKE 'paused%' AND s.interval_secs > 0 AND cardinality(s.dump_secs) >= 3
+              ORDER BY s.database LOOP
+        CONTINUE WHEN o.shortest <= o.interval_secs;
+        v := concat_ws('; ', v, format('%s: last 3 backups took %s; the schedule runs every %s', o.database,
+                 (SELECT string_agg(make_interval(secs => round(d))::text, ', ') FROM unnest(o.dump_secs) d),
+                 make_interval(secs => round(o.interval_secs))));
+        IF bad IS NULL THEN
+            bad := o.database;
+            SELECT l.label INTO fix FROM (VALUES ('every 15 minutes', 900), ('every 30 minutes', 1800), ('every 1 hour', 3600),
+                    ('every 2 hours', 7200), ('every 3 hours', 10800), ('every 4 hours', 14400), ('every 6 hours', 21600),
+                    ('every 12 hours', 43200), ('daily', 86400), ('weekly', 604800)) l(label, secs)
+             WHERE l.secs >= 2 * o.longest ORDER BY l.secs LIMIT 1;
+        END IF;
+    END LOOP;
+    ok := v IS NULL;
+    detail := CASE WHEN ok THEN 'recent backups of every database finish within its schedule interval' ELSE v END;
+    fix := CASE WHEN ok THEN NULL
+                ELSE format('connect to %s and give it a longer schedule: SELECT pgbx.configure(schedule => %L);',
+                            bad, coalesce(fix, 'weekly')) END;
     RETURN NEXT;
 END $$;
 

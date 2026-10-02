@@ -4,7 +4,7 @@
 //! Download: if the connection drops, continue from the byte we reached (HTTP Range) into the same writer,
 //! so a running pg_restore never restarts from zero.
 
-use crate::worker::{log, shutting_down};
+use crate::worker::{log, shutting_down, stop_reason};
 use s3::Bucket;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -21,13 +21,13 @@ pub fn retry<T>(what: &str, mut f: impl FnMut() -> Result<T, String>) -> Result<
             log(&format!("{what}: retry {i}/{} in {wait}s after: {last}", BACKOFF_SECS.len()));
             for _ in 0..wait * 5 {
                 if shutting_down() {
-                    return Err(format!("{what}: stopped, Postgres is shutting down"));
+                    return Err(format!("{what}: stopped, {}", stop_reason()));
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
         if shutting_down() {
-            return Err(format!("{what}: stopped, Postgres is shutting down"));
+            return Err(format!("{what}: stopped, {}", stop_reason()));
         }
         match f() {
             Ok(v) => return Ok(v),
@@ -91,14 +91,18 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n)
 }
 
-/// Stream `r` to `key`. Small inputs go up in one PUT; larger ones as a multipart upload with per-part retries.
-/// On failure the multipart upload is aborted, so nothing half-written is left looking like a backup.
-pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read) -> Result<u64, String> {
+/// Stream `r` to `key` at most `kbps` KiB/s (0 = unlimited). Small inputs go up in one PUT; larger ones as a
+/// multipart upload with per-part retries. On failure the multipart upload is aborted, so nothing half-written is
+/// left looking like a backup. A stop (shutdown or cancel) before the last request never completes the upload.
+pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read, kbps: i32) -> Result<u64, String> {
     let mut buf = vec![0u8; PART_SIZE];
-    let mut throttle = Throttle::new(crate::UPLOAD_KBPS.get());
+    let mut throttle = Throttle::new(kbps);
     let n = fill(r, &mut buf).map_err(|e| format!("read dump: {e}"))?;
     if n < PART_SIZE {
         throttle.pace(n);
+        if shutting_down() {
+            return Err(format!("upload {key}: stopped, {}", stop_reason()));
+        }
         retry(&format!("upload {key}"), || {
             let resp = b.put_object(key, &buf[..n]).map_err(|e| e.to_string())?;
             if resp.status_code() / 100 == 2 { Ok(()) } else { Err(format!("HTTP {}", resp.status_code())) }
@@ -125,6 +129,9 @@ pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read) -> Result<u64, St
             }
             number += 1;
         }
+        if shutting_down() {
+            return Err(format!("upload {key}: stopped, {}", stop_reason()));
+        }
         retry(&format!("finish upload {key}"), || {
             let resp = b.complete_multipart_upload(key, &id, parts.clone()).map_err(|e| e.to_string())?;
             if resp.status_code() / 100 == 2 { Ok(()) } else { Err(format!("HTTP {}", resp.status_code())) }
@@ -149,7 +156,7 @@ impl<W: Write> Write for Tracked<'_, W> {
         if shutting_down() {
             *self.dest_failed = true;
             // not Interrupted: write_all retries that forever and the shutdown would hang
-            return Err(std::io::Error::other("Postgres is shutting down"));
+            return Err(std::io::Error::other(stop_reason()));
         }
         match self.inner.write(buf) {
             Ok(k) => {
@@ -168,8 +175,9 @@ impl<W: Write> Write for Tracked<'_, W> {
     }
 }
 
-/// Download `key` into `w`, resuming from the last byte on network errors. Destination errors are not retried.
-pub fn download_resumable<W: Write + Send>(b: &Bucket, key: &str, w: &mut W) -> Result<u64, String> {
+/// Download `key` into `w` at most `kbps` KiB/s (0 = unlimited), resuming from the last byte on network errors.
+/// Destination errors are not retried.
+pub fn download_resumable<W: Write + Send>(b: &Bucket, key: &str, w: &mut W, kbps: i32) -> Result<u64, String> {
     let size = retry(&format!("stat {key}"), || {
         let (head, code) = b.head_object(key).map_err(|e| e.to_string())?;
         if code / 100 != 2 {
@@ -179,7 +187,7 @@ pub fn download_resumable<W: Write + Send>(b: &Bucket, key: &str, w: &mut W) -> 
     })?;
     let mut done = 0u64;
     let mut dest_failed = false;
-    let mut throttle = Throttle::new(crate::DOWNLOAD_KBPS.get());
+    let mut throttle = Throttle::new(kbps);
     retry(&format!("download {key}"), || {
         if done >= size {
             return Ok(());
