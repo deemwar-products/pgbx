@@ -190,7 +190,11 @@ impl Conn {
         let live = self.live()?;
         let mut c = live.cfg.clone();
         c.dbname(db);
-        c.connect(NoTls).map_err(|e| vars::scrub(&format!("cannot connect to Postgres ({}, db {db}): {e}", live.display)))
+        c.connect(NoTls).map_err(|e| {
+            // a server error (bad password, no such database) says why only in its DbError, not in Display
+            let why = e.as_db_error().map_or_else(|| e.to_string(), |d| format!("{}: {}", d.severity(), d.message()));
+            vars::scrub(&format!("cannot connect to Postgres ({}, db {db}): {why}", live.display))
+        })
     }
 
     /// For child tools: (host, port, user, password). The password goes into their environment, never argv.
