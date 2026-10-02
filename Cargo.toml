@@ -25,6 +25,11 @@ rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls
 croner = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 miniz_oxide = "0.8"
+# 0.6: client-side encryption, roles file (zstd), notifications (HTTP + SMTP)
+ring = "0.17"
+zstd = { version = "0.13", default-features = false }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
 
 [dev-dependencies]
 [dev-dependencies.pgrx-tests]

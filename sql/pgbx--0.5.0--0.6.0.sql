@@ -318,7 +318,7 @@ BEGIN
     SELECT * INTO cfg FROM pgbx.config;
     IF NOT FOUND THEN  -- worker hasn't visited this database yet
         cfg := ROW(1, NULL, '0 2 * * *', 'daily at 02:00', 14, 90, '0 4 * * 0', 'weekly on sunday at 04:00',
-                   true, NULL, NULL, now(), NULL, NULL, NULL)::pgbx.config;
+                   true, NULL, NULL, now(), NULL, NULL, NULL, NULL)::pgbx.config;
     END IF;
     SELECT * INTO lb FROM pgbx.history WHERE kind='backup' AND history.state='done' ORDER BY id DESC LIMIT 1;
     SELECT * INTO le FROM pgbx.history WHERE history.state='failed' ORDER BY id DESC LIMIT 1;
@@ -337,7 +337,7 @@ BEGIN
              ELSE to_timestamp(pgbx.next_run_epoch(cfg.schedule, extract(epoch FROM last_auto))) END,
         lb.finished, now() - lb.finished, pg_size_pretty(lb.bytes), lb.s3_key,
         (SELECT count(*) FROM pgbx.history h WHERE h.kind='backup' AND h.state='done'),
-        format('max %s backups, max %s days', cfg.max_backups, cfg.max_days),
+        format('max %s backups, max %s days', cfg.max_backups, cfg.max_days) || coalesce(', gfs ' || cfg.gfs, ''),
         CASE WHEN coalesce(cardinality(cfg.include_data), 0) = 0 AND coalesce(cardinality(cfg.exclude_data), 0) = 0
              THEN 'all tables, all rows'
              ELSE 'all tables; rows of ' ||
@@ -531,12 +531,19 @@ BEGIN
                  ELSE 'it starts anyway (pgbx.gate_manual_jobs = warn)' END);
     END IF;
 END $$;
--- restore() becomes plpgsql to raise the NOTICE (same signature)
-CREATE OR REPLACE FUNCTION pgbx.restore(into_db text, at timestamptz DEFAULT now()) RETURNS bigint LANGUAGE plpgsql AS $$
+-- restore() becomes plpgsql to raise the NOTICE, and gains with_roles / roles (0.6 roles file): drop and create
+DROP FUNCTION pgbx.restore(text, timestamptz);
+CREATE OR REPLACE FUNCTION pgbx.restore(into_db text, at timestamptz DEFAULT now(), with_roles bool DEFAULT false,
+                             roles text DEFAULT 'referenced') RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE j bigint;
 BEGIN
+    IF restore.roles IS NULL OR restore.roles NOT IN ('referenced', 'all') THEN
+        RAISE EXCEPTION 'pgbx: roles must be referenced or all';
+    END IF;
     INSERT INTO pgbx.history (kind, trigger, params)
-    VALUES ('restore', 'manual', jsonb_build_object('into_db', restore.into_db, 'at', restore.at)) RETURNING id INTO j;
+    VALUES ('restore', 'manual', jsonb_build_object('into_db', restore.into_db, 'at', restore.at,
+                                                     'with_roles', coalesce(restore.with_roles, false), 'roles', restore.roles))
+    RETURNING id INTO j;
     PERFORM pgbx._notice_eta(j);
     RETURN j;
 END $$;
@@ -544,7 +551,9 @@ REVOKE ALL ON FUNCTION pgbx._dur(double precision), pgbx._estimate(text), pgbx.j
 GRANT EXECUTE ON FUNCTION pgbx._dur(double precision), pgbx._estimate(text) TO pgbx_viewer;
 ALTER FUNCTION pgbx.job_eta(bigint) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.job_eta(bigint) TO pgbx_viewer;
-ALTER FUNCTION pgbx.restore(text, timestamptz) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+REVOKE ALL ON FUNCTION pgbx.restore(text, timestamptz, bool, text) FROM PUBLIC;
+ALTER FUNCTION pgbx.restore(text, timestamptz, bool, text) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.restore(text, timestamptz, bool, text) TO pgbx_admin;
 
 -- quiet-window suggestion (ADR 0001 §2): activity per hour, suggest_window(), doctor schedule_in_quiet_window
 ALTER TABLE pgbx.server_capacity ADD COLUMN backup_slots jsonb;
@@ -698,3 +707,39 @@ END $$;
 REVOKE ALL ON FUNCTION pgbx.configure(text, int, int, bool, text, text) FROM PUBLIC;
 ALTER FUNCTION pgbx.configure(text, int, int, bool, text, text) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.configure(text, int, int, bool, text, text) TO pgbx_admin;
+
+-- 0.6 extras: Prometheus metrics columns (pgbx metrics, GET /metrics on pgbx ui), written by the worker
+ALTER TABLE pgbx.server_overview ADD COLUMN last_backup_bytes bigint, ADD COLUMN failures_total bigint,
+    ADD COLUMN queued_jobs bigint, ADD COLUMN last_verify_ok bool, ADD COLUMN last_backup_encrypted bool;
+
+-- GFS retention: config.gfs, set_retention(..., gfs) (new signature: drop and create, then the install's lockdown)
+ALTER TABLE pgbx.config ADD COLUMN gfs text;
+CREATE FUNCTION pgbx."_gfs_span"("spec" TEXT) RETURNS INT IMMUTABLE STRICT LANGUAGE c AS 'MODULE_PATHNAME', 'gfs_span_wrapper';
+DROP FUNCTION pgbx.set_retention(int, int);
+CREATE OR REPLACE FUNCTION pgbx.set_retention(max_backups int DEFAULT NULL, max_days int DEFAULT NULL, gfs text DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE r pgbx.config; span int; lim int := coalesce(nullif(current_setting('pgbx.max_days_limit', true), '')::int, 90);
+BEGIN
+    IF set_retention.gfs IS NOT NULL THEN
+        span := pgbx._gfs_span(set_retention.gfs);
+        IF span > lim THEN
+            RAISE EXCEPTION 'pgbx: gfs ''%'' reaches back % days, beyond this server''s limit of % days (raise pgbx.max_days_limit)',
+                set_retention.gfs, span, lim;
+        END IF;
+    END IF;
+    INSERT INTO pgbx.config DEFAULT VALUES ON CONFLICT (id) DO NOTHING;
+    UPDATE pgbx.config x SET
+        max_backups = coalesce(set_retention.max_backups, x.max_backups),
+        max_days    = coalesce(pgbx._check_days(set_retention.max_days), x.max_days),
+        gfs         = CASE WHEN set_retention.gfs IS NULL THEN x.gfs WHEN span = 0 THEN NULL ELSE lower(trim(set_retention.gfs)) END,
+        updated_at  = now()
+    RETURNING * INTO r;
+    PERFORM pgbx._log('config', jsonb_build_object('max_backups', r.max_backups, 'max_days', r.max_days, 'gfs', r.gfs));
+    INSERT INTO pgbx.history (kind, trigger) VALUES ('prune', 'manual');
+    RETURN format('keeping at most %s backups and nothing older than %s days%s (newest always kept); pruning now',
+                  r.max_backups, r.max_days,
+                  CASE WHEN r.gfs IS NULL THEN '' ELSE format(', plus the newest backup per period of gfs %s', r.gfs) END);
+END $$;
+REVOKE ALL ON FUNCTION pgbx._gfs_span(text), pgbx.set_retention(int, int, text) FROM PUBLIC;
+ALTER FUNCTION pgbx.set_retention(int, int, text) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.set_retention(int, int, text) TO pgbx_admin;

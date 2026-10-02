@@ -6,6 +6,8 @@
 //!
 //! The dump is streamed from S3 into pg_restore (no temp file); a dropped connection resumes from the byte
 //! reached (HTTP Range), so pg_restore never starts over. Credentials are read from a file and never printed.
+//! Encrypted dumps (pgbx.encryption_key_file on the source) are decrypted in the stream with --key-file;
+//! --with-roles first replays the backup's roles file (<ts>.globals.sql.zst; see src/globals.rs).
 
 use crate::{check_time, pe, Args, Ctx, Out};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -260,6 +262,13 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
     if backup.is_some() && at.is_some() {
         return Err("give --backup or --time, not both".into());
     }
+    // encrypted dumps (pgbx.encryption_key_file on the source) are decrypted in the stream; plain ones pass through
+    let key_file = cx.a.get("key-file").map(crate::crypt::Key::load).transpose()?;
+    let roles_scope = match (cx.a.has("with-roles"), cx.a.get("roles")) {
+        (false, Some(_)) => return Err("--roles works with --with-roles".into()),
+        (false, None) => None,
+        (true, r) => Some(crate::check_roles_scope(r)?),
+    };
 
     let mut admin = cx.connect("postgres")?;
     let exists: bool = admin.query_one("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", &[&into]).map_err(pe)?.get(0);
@@ -275,6 +284,28 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
     let keys: Vec<String> = list(&b, &prefix(&f.server, &db))?.into_iter().map(|(k, _)| k).collect();
     let key = pick_key(&keys, backup.as_deref(), at)?;
 
+    // roles first (before CREATE DATABASE, so a failure leaves nothing half-made); existing roles are never changed
+    let roles_report = match &roles_scope {
+        Some(scope) => {
+            let gkey = crate::globals::globals_key(&key);
+            let mut z = zstd::stream::write::Decoder::new(Vec::new()).map_err(|e| format!("zstd: {e}"))?;
+            {
+                let mut d = crate::crypt::DecryptWriter::new(&mut z, key_file.as_ref(), true);
+                let r = download_resumable(&b, &gkey, &mut d);
+                if let Some(e) = d.error.clone() {
+                    return Err(format!("roles file {gkey}: {e}"));
+                }
+                r.map_err(|e| format!("roles file {gkey} (backups taken before pgbx 0.6 have none; restore without --with-roles): {e}"))?;
+                d.finish().map_err(|e| format!("roles file {gkey}: {e}"))?;
+            }
+            z.flush().map_err(|e| format!("zstd: {e}"))?;
+            let sql = String::from_utf8(z.into_inner()).map_err(|_| "roles file is not text")?;
+            let rep = crate::globals::apply(&mut admin, &sql, scope)?;
+            Some(serde_json::from_str::<serde_json::Value>(&rep).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+
     admin
         .batch_execute(&format!("CREATE DATABASE {} TEMPLATE template0", quote_ident(&into)))
         .map_err(|e| format!("create database {into}: {}", pe(e)))?;
@@ -285,7 +316,8 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
     let skipped: Vec<&str> = EXT_NAMES.iter().copied().filter(|n| !available.iter().any(|a| a == n)).collect();
     let exe = pg_restore_bin();
     let mut child = Command::new(&exe)
-        .args(["--no-owner", "-h", &host, "-p", &port, "-U", &user, "-d", &into])
+        .args(roles_scope.is_none().then_some("--no-owner")) // with roles: keep the owners
+        .args(["-h", &host, "-p", &port, "-U", &user, "-d", &into])
         .args(skipped.iter().map(|n| format!("--exclude-schema={n}")))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -293,8 +325,16 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
         .spawn()
         .map_err(|e| format!("cannot run {}: {e} (install the PostgreSQL client tools)", exe.display()))?;
     let mut stdin = child.stdin.take().unwrap();
-    let dl = download_resumable(&b, &key, &mut stdin);
+    let mut dw = crate::crypt::DecryptWriter::new(&mut stdin, key_file.as_ref(), true); // plain dumps pass through
+    let dl = download_resumable(&b, &key, &mut dw);
+    let (crypt_err, encrypted) = (dw.error.clone(), dw.encrypted() == Some(true));
+    let fin = dw.finish().map(|_| ());
     drop(stdin); // EOF for pg_restore
+    if let Some(e) = crypt_err.or(fin.err().filter(|_| encrypted).map(|e| e.to_string())) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{key}: {e} (database {into} was created and is incomplete; drop it before retrying)"));
+    }
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let bytes = dl?;
@@ -316,7 +356,7 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
     }
     Ok(json!({
         "ok": true, "restored_into": into, "source_db": db, "key": key, "taken_at": key_time(&key).map(|t| t.to_rfc3339()),
-        "bytes": bytes, "warnings": warnings,
+        "bytes": bytes, "encrypted": encrypted, "roles": roles_report, "warnings": warnings,
         "next": format!("check the data (psql -d {into}), then point your application at it"),
     }))
 }

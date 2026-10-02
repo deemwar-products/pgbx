@@ -12,6 +12,11 @@ use std::ffi::CString;
 use std::time::Duration;
 
 mod audit;
+pub mod crypt;
+mod extras;
+pub mod globals;
+mod notify;
+mod retention;
 mod schedule;
 mod transfer;
 mod worker;
@@ -111,6 +116,11 @@ pub enum GateManual {
     #[name = c"off"]
     Off,
 }
+// 0.6 extras: client-side encryption, roles with every backup, notifications
+pub static ENCRYPTION_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static BACKUP_ROLE_PASSWORDS: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static NOTIFY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static NOTIFY_SECRETS_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static OVERRUN_POLICY: GucSetting<Overrun> = GucSetting::<Overrun>::new(Overrun::Skip);
 pub static OVERRUN_MAX_GAP: GucSetting<f64> = GucSetting::<f64>::new(1.5);
 
@@ -167,6 +177,10 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_float_guc(c"pgbx.busy_loadavg", c"Busy above this 1-minute load average per core (Linux)", c"0 = ignore; ignored where /proc/loadavg is missing", &BUSY_LOADAVG, 0.0, 10.0, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_enum_guc(c"pgbx.gate_manual_jobs", c"What the load gate does to backup_now() / verify_now() / restore()", c"warn (default): a NOTICE, it starts anyway; defer: like scheduled jobs; off: nothing", &GATE_MANUAL_JOBS, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_enum_guc(c"pgbx.overrun_policy", c"Schedule slots that passed while a dump of the database was running", c"skip: the next run is the next slot after the dump finished (see pgbx.overrun_max_gap); catch_up: run once right away", &OVERRUN_POLICY, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.encryption_key_file", c"Encrypt every dump and roles file with this key (AES-256-GCM)", c"file with 32 random bytes as base64 or hex, chmod 600, owned by postgres; empty (default) = no encryption", &ENCRYPTION_KEY_FILE, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_bool_guc(c"pgbx.backup_role_passwords", c"Keep role password hashes in the roles file stored with each backup", c"off (default): pg_dumpall --no-role-passwords; restored roles have no password", &BACKUP_ROLE_PASSWORDS, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.notify", c"Notification channels by name: slack:NAME, telegram:NAME, webhook:NAME, email:NAME", c"names only; URLs and tokens go in pgbx.notify_secrets_file", &NOTIFY, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.notify_secrets_file", c"File with the URLs/tokens of the pgbx.notify channels", c"chmod 600, owned by postgres; e.g. slack.ops.url = https://hooks.slack.com/...", &NOTIFY_SECRETS_FILE, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_float_guc(c"pgbx.overrun_max_gap", c"With overrun_policy=skip, never wait for a slot more than this many schedule intervals after the last good backup finished", c"1.0-10; past it the backup runs right away", &OVERRUN_MAX_GAP, 1.0, 10.0, GucContext::Sighup, GucFlags::default());
 
     // Only register the worker when loaded at server start (shared_preload_libraries),
@@ -215,7 +229,13 @@ CREATE TABLE pgbx.server_overview (
     load_gate        text,                                     -- this database's effective pgbx.load_gate
     would_defer_7d   int,                                      -- jobs the gate would have deferred (shadow), 7 days
     deferred_7d      int,                                      -- jobs it deferred (on)
-    forced_7d        int                                       -- backups that ran at their max_defer deadline
+    forced_7d        int,                                      -- backups that ran at their max_defer deadline
+    -- Prometheus metrics (pgbx metrics / GET /metrics on pgbx ui)
+    last_backup_bytes     bigint,
+    failures_total        bigint,                               -- failed backups / restores / restore tests in the history
+    queued_jobs           bigint,
+    last_verify_ok        bool,
+    last_backup_encrypted bool
 );
 
 -- The server-wide job queue as the worker sees it (every database's running, queued and deferred jobs), rewritten
@@ -300,7 +320,8 @@ CREATE TABLE pgbx.config (
     -- data scope: every table's DEFINITION is always backed up; these only decide whose ROWS are kept
     include_data   text[],                                     -- NULL/empty = rows of all tables
     exclude_data   text[],                                     -- rows of these are skipped
-    load_gate      text CHECK (load_gate IN ('off', 'shadow', 'on')) -- NULL = the server's pgbx.load_gate
+    load_gate      text CHECK (load_gate IN ('off', 'shadow', 'on')), -- NULL = the server's pgbx.load_gate
+    gfs            text                                        -- e.g. '7d,4w,12m': also keep the newest per day/week/month
 );
 -- No default row here: a restored dump brings its own row, and a fresh database gets one from the
 -- worker or configure() (INSERT ... ON CONFLICT DO NOTHING), so the two never collide.
@@ -373,21 +394,32 @@ BEGIN
 END $$;
 
 -- Expiry: keep at most max_backups backups AND none older than max_days (whichever deletes first;
--- the newest backup is always kept). Takes effect on the worker's next pass.
-CREATE FUNCTION pgbx.set_retention(max_backups int DEFAULT NULL, max_days int DEFAULT NULL) RETURNS text
+-- the newest backup is always kept). gfs ('7d,4w,12m'; 'off' clears it) ALSO keeps the newest backup of each of
+-- the last N days / ISO weeks / months / years ('y'); a GFS keeper is never deleted by the other two rules, and the
+-- span must fit pgbx.max_days_limit. Takes effect on the worker's next pass.
+CREATE FUNCTION pgbx.set_retention(max_backups int DEFAULT NULL, max_days int DEFAULT NULL, gfs text DEFAULT NULL) RETURNS text
 LANGUAGE plpgsql AS $$
-DECLARE r pgbx.config;
+DECLARE r pgbx.config; span int; lim int := coalesce(nullif(current_setting('pgbx.max_days_limit', true), '')::int, 90);
 BEGIN
+    IF set_retention.gfs IS NOT NULL THEN
+        span := pgbx._gfs_span(set_retention.gfs);
+        IF span > lim THEN
+            RAISE EXCEPTION 'pgbx: gfs ''%'' reaches back % days, beyond this server''s limit of % days (raise pgbx.max_days_limit)',
+                set_retention.gfs, span, lim;
+        END IF;
+    END IF;
     INSERT INTO pgbx.config DEFAULT VALUES ON CONFLICT (id) DO NOTHING;
     UPDATE pgbx.config x SET
         max_backups = coalesce(set_retention.max_backups, x.max_backups),
         max_days    = coalesce(pgbx._check_days(set_retention.max_days), x.max_days),
+        gfs         = CASE WHEN set_retention.gfs IS NULL THEN x.gfs WHEN span = 0 THEN NULL ELSE lower(trim(set_retention.gfs)) END,
         updated_at  = now()
     RETURNING * INTO r;
-    PERFORM pgbx._log('config', jsonb_build_object('max_backups', r.max_backups, 'max_days', r.max_days));
+    PERFORM pgbx._log('config', jsonb_build_object('max_backups', r.max_backups, 'max_days', r.max_days, 'gfs', r.gfs));
     INSERT INTO pgbx.history (kind, trigger) VALUES ('prune', 'manual');
-    RETURN format('keeping at most %s backups and nothing older than %s days (newest always kept); pruning now',
-                  r.max_backups, r.max_days);
+    RETURN format('keeping at most %s backups and nothing older than %s days%s (newest always kept); pruning now',
+                  r.max_backups, r.max_days,
+                  CASE WHEN r.gfs IS NULL THEN '' ELSE format(', plus the newest backup per period of gfs %s', r.gfs) END);
 END $$;
 
 -- 'every 1 hour', 'every 15 minutes', 'daily at 02:30', 'weekly on sunday at 03:00', 'hourly', or cron.
@@ -439,7 +471,7 @@ BEGIN
     SELECT * INTO cfg FROM pgbx.config;
     IF NOT FOUND THEN  -- worker hasn't visited this database yet
         cfg := ROW(1, NULL, '0 2 * * *', 'daily at 02:00', 14, 90, '0 4 * * 0', 'weekly on sunday at 04:00',
-                   true, NULL, NULL, now(), NULL, NULL, NULL)::pgbx.config;
+                   true, NULL, NULL, now(), NULL, NULL, NULL, NULL)::pgbx.config;
     END IF;
     SELECT * INTO lb FROM pgbx.history WHERE kind='backup' AND history.state='done' ORDER BY id DESC LIMIT 1;
     SELECT * INTO le FROM pgbx.history WHERE history.state='failed' ORDER BY id DESC LIMIT 1;
@@ -458,7 +490,7 @@ BEGIN
              ELSE to_timestamp(pgbx.next_run_epoch(cfg.schedule, extract(epoch FROM last_auto))) END,
         lb.finished, now() - lb.finished, pg_size_pretty(lb.bytes), lb.s3_key,
         (SELECT count(*) FROM pgbx.history h WHERE h.kind='backup' AND h.state='done'),
-        format('max %s backups, max %s days', cfg.max_backups, cfg.max_days),
+        format('max %s backups, max %s days', cfg.max_backups, cfg.max_days) || coalesce(', gfs ' || cfg.gfs, ''),
         CASE WHEN coalesce(cardinality(cfg.include_data), 0) = 0 AND coalesce(cardinality(cfg.exclude_data), 0) = 0
              THEN 'all tables, all rows'
              ELSE 'all tables; rows of ' ||
@@ -1143,12 +1175,20 @@ END $$;
 
 -- Queue a restore of this database's newest backup taken at or before `at` into a NEW database `into_db`.
 -- The live database is never touched; swap names yourself once the restore is verified.
--- A NOTICE says when it starts and how long it takes.
-CREATE FUNCTION pgbx.restore(into_db text, at timestamptz DEFAULT now()) RETURNS bigint LANGUAGE plpgsql AS $$
+-- with_roles: first create the roles in the backup's roles file that do not exist on this server (existing roles are
+-- never changed), then restore keeping object owners. roles: 'referenced' (default; only the roles this database
+-- uses) or 'all'. A NOTICE says when it starts and how long it takes.
+CREATE FUNCTION pgbx.restore(into_db text, at timestamptz DEFAULT now(), with_roles bool DEFAULT false,
+                             roles text DEFAULT 'referenced') RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE j bigint;
 BEGIN
+    IF restore.roles IS NULL OR restore.roles NOT IN ('referenced', 'all') THEN
+        RAISE EXCEPTION 'pgbx: roles must be referenced or all';
+    END IF;
     INSERT INTO pgbx.history (kind, trigger, params)
-    VALUES ('restore', 'manual', jsonb_build_object('into_db', restore.into_db, 'at', restore.at)) RETURNING id INTO j;
+    VALUES ('restore', 'manual', jsonb_build_object('into_db', restore.into_db, 'at', restore.at,
+                                                     'with_roles', coalesce(restore.with_roles, false), 'roles', restore.roles))
+    RETURNING id INTO j;
     PERFORM pgbx._notice_eta(j);
     RETURN j;
 END $$;
@@ -1187,8 +1227,8 @@ DECLARE f text;
 BEGIN
     FOREACH f IN ARRAY ARRAY[
         'pgbx.configure(text, int, int, bool, text, text)', 'pgbx.set_schedule(text)',
-        'pgbx.set_retention(int, int)', 'pgbx.pause(text)', 'pgbx.resume()',
-        'pgbx.backup_now()', 'pgbx.restore(text, timestamptz)', 'pgbx.verify_now()',
+        'pgbx.set_retention(int, int, text)', 'pgbx.pause(text)', 'pgbx.resume()',
+        'pgbx.backup_now()', 'pgbx.restore(text, timestamptz, bool, text)', 'pgbx.verify_now()',
         'pgbx.set_verify_schedule(text)', 'pgbx.download_url(bigint, interval)',
         'pgbx.set_data_scope(text[], text[])', 'pgbx.cancel(bigint)']
     LOOP
@@ -1196,7 +1236,7 @@ BEGIN
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pgbx_admin', f);
     END LOOP;
 END $lock$;
--- internals (_presign, _log, _check_days, _queue_manual, _notice_eta, _activity_add): superuser only — no grants.
+-- internals (_presign, _log, _check_days, _queue_manual, _notice_eta, _activity_add, _gfs_span): superuser only — no grants.
 -- (_estimate only reads: status() calls it as the viewer.)
 "#,
     name = "lockdown",

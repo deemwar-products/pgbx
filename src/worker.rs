@@ -237,17 +237,22 @@ pub(crate) struct JobCfg {
     nice: i32,
     ionice: Option<String>,
     restore_sync: bool,
-    upload_kbps: i32,
-    download_kbps: i32,
-    alert_command: Option<String>,
+    pub(crate) upload_kbps: i32,
+    pub(crate) download_kbps: i32,
+    pub(crate) alert_command: Option<String>,
     defer_backoff: Option<String>,
     max_defer: i32,
     max_defer_first: i32,
-    admin_db: String,
+    pub(crate) admin_db: String,
+    // 0.6 extras (extras.rs)
+    pub(crate) encryption_key_file: Option<String>,
+    pub(crate) role_passwords: bool,
+    pub(crate) notify: Option<String>,
+    pub(crate) notify_secrets_file: Option<String>,
 }
 
 impl JobCfg {
-    fn now() -> JobCfg {
+    pub(crate) fn now() -> JobCfg {
         JobCfg {
             bucket: bucket(),
             compression: setting(&DUMP_COMPRESSION),
@@ -264,6 +269,10 @@ impl JobCfg {
             max_defer: MAX_DEFER.get(),
             max_defer_first: MAX_DEFER_FIRST.get(),
             admin_db: setting(&ADMIN_DB).unwrap_or("postgres".into()),
+            encryption_key_file: setting(&ENCRYPTION_KEY_FILE),
+            role_passwords: BACKUP_ROLE_PASSWORDS.get(),
+            notify: setting(&NOTIFY),
+            notify_secrets_file: setting(&NOTIFY_SECRETS_FILE),
         }
     }
 
@@ -316,6 +325,7 @@ struct Cand {
     schedule: String,
     max_backups: i32,
     max_days: i32,
+    gfs: Option<String>,  // GFS retention spec ('7d,4w,12m'), NULL = none
     gate: Option<String>, // this database's load_gate (NULL = the server's)
 }
 
@@ -598,13 +608,15 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<Scann
     .map_err(pe)?;
     let row = cl
         .query_one(
-            "SELECT coalesce(path, current_database()), schedule, max_backups, max_days, enabled, verify_schedule, load_gate FROM pgbx.config",
+            "SELECT coalesce(path, current_database()), schedule, max_backups, max_days, enabled, verify_schedule, load_gate, gfs
+               FROM pgbx.config",
             &[],
         )
         .map_err(pe)?;
     let (path, schedule, max_backups, max_days, enabled, verify_cron): (String, String, i32, i32, bool, Option<String>) =
         (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4), row.get(5));
     let gate: Option<String> = row.get(6);
+    let gfs: Option<String> = row.get(7);
     let max_days = max_days.min(MAX_DAYS_LIMIT.get()); // server-wide ceiling wins
 
     // pgbx.cancel() of a running job: stop its thread and child; the thread records 'cancelled'
@@ -664,6 +676,7 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<Scann
             schedule: schedule.clone(),
             max_backups,
             max_days,
+            gfs: gfs.clone(),
             gate: gate.clone(),
         };
         match j.get::<_, Option<String>>(5) {
@@ -813,6 +826,7 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
             schedule: j.schedule.clone(),
             max_backups: j.max_backups,
             max_days: j.max_days,
+            gfs: j.gfs.clone(),
             forced,
             scratch: owns_db.clone().filter(|_| j.kind == "verify"),
         };
@@ -1485,6 +1499,7 @@ struct Job {
     schedule: String,
     max_backups: i32,
     max_days: i32,
+    gfs: Option<String>,
     forced: bool,
     scratch: Option<String>,
 }
@@ -1561,7 +1576,7 @@ fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), St
                     .map_err(pe)?;
             }
             if kind == "backup" || kind == "prune" {
-                match prune(&j.c, &j.cfg, &j.path, j.max_backups, j.max_days) {
+                match prune(&j.c, &j.cfg, &j.path, j.max_backups, j.max_days, j.gfs.as_deref()) {
                     Ok(gone) if !gone.is_empty() => {
                         cl.execute("UPDATE pgbx.history SET state='expired' WHERE kind='backup' AND s3_key = ANY($1)", &[&gone])
                             .map_err(pe)?;
@@ -1578,6 +1593,7 @@ fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), St
             )
             .map_err(pe)?;
             log(&format!("{db}: {kind} #{id} done ({}, {} bytes)", done.key.as_deref().unwrap_or("-"), done.bytes));
+            crate::extras::job_finished(&j.cfg, &j.c.server, db, kind, id, None);
         }
         // a lock held by DDL/a migration: never queue behind it; try again later, until the deadline
         Err(e) if kind == "backup" && !j.forced && is_lock_timeout(e) => {
@@ -1604,6 +1620,7 @@ fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), St
                 .map_err(pe)?;
             log(&format!("{db}: {kind} #{id} failed: {e}"));
             alert(j.cfg.alert_command.as_deref(), &j.c.server, db, kind, id, e);
+            crate::extras::job_finished(&j.cfg, &j.c.server, db, kind, id, Some(e));
         }
     }
     Ok(())
@@ -1678,19 +1695,35 @@ fn publish_overview(admin: &mut Client, cl: &mut Client, db: &str, cron: &str) -
     let (gate, would, deferred, forced): (Option<String>, i32, i32, i32) = (g.get(0), g.get(1), g.get(2), g.get(3));
     let w = cl.query_one("SELECT cron, score, current_score, confidence FROM pgbx.suggest_window()", &[]).map_err(pe)?;
     let (wcron, wscore, wcur, wconf): (Option<String>, Option<f64>, Option<f64>, Option<String>) = (w.get(0), w.get(1), w.get(2), w.get(3));
+    // Prometheus metrics (pgbx metrics, GET /metrics on pgbx ui)
+    let m = cl
+        .query_one(
+            "SELECT (SELECT bytes FROM pgbx.history WHERE kind='backup' AND state='done' ORDER BY id DESC LIMIT 1),
+                    (SELECT count(*) FROM pgbx.history WHERE state='failed' AND kind IN ('backup', 'restore', 'verify')),
+                    (SELECT count(*) FROM pgbx.history WHERE state='queued' AND kind IN ('backup', 'restore', 'verify', 'prune')),
+                    (SELECT state = 'done' FROM pgbx.history WHERE kind='verify' AND state IN ('done','failed') ORDER BY id DESC LIMIT 1),
+                    (SELECT coalesce((params->>'encrypted')::bool, false) FROM pgbx.history
+                      WHERE kind='backup' AND state='done' ORDER BY id DESC LIMIT 1)",
+            &[],
+        )
+        .map_err(pe)?;
+    let (mbytes, mfail, mqueued, mverify, menc): (Option<i64>, i64, i64, Option<bool>, Option<bool>) =
+        (m.get(0), m.get(1), m.get(2), m.get(3), m.get(4));
     admin
         .execute(
             "INSERT INTO pgbx.server_overview AS o
                 (database, state, schedule, last_backup_at, last_backup_size, next_backup_at, backups_kept, last_verify, last_error,
                  seen_at, interval_secs, dump_secs, eta_error, window_cron, window_score, current_score, window_confidence,
-                 load_gate, would_defer_7d, deferred_7d, forced_7d)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                 load_gate, would_defer_7d, deferred_7d, forced_7d,
+                 last_backup_bytes, failures_total, queued_jobs, last_verify_ok, last_backup_encrypted)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now(), $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
              ON CONFLICT (database) DO UPDATE SET state=$2, schedule=$3, last_backup_at=$4, last_backup_size=$5,
                 next_backup_at=$6, backups_kept=$7, last_verify=$8, last_error=$9, seen_at=now(), interval_secs=$10, dump_secs=$11,
                 eta_error=$12, window_cron=$13, window_score=$14, current_score=$15, window_confidence=$16,
-                load_gate=$17, would_defer_7d=$18, deferred_7d=$19, forced_7d=$20",
+                load_gate=$17, would_defer_7d=$18, deferred_7d=$19, forced_7d=$20,
+                last_backup_bytes=$21, failures_total=$22, queued_jobs=$23, last_verify_ok=$24, last_backup_encrypted=$25",
             &[&db, &state, &schedule, &last_at, &size, &next_at, &kept, &verify, &err, &interval, &dump_secs, &eta_error,
-              &wcron, &wscore, &wcur, &wconf, &gate, &would, &deferred, &forced],
+              &wcron, &wscore, &wcur, &wconf, &gate, &would, &deferred, &forced, &mbytes, &mfail, &mqueued, &mverify, &menc],
         )
         .map_err(pe)?;
     Ok(())
@@ -1782,7 +1815,9 @@ fn backup(c: &Ctx, cfg: &JobCfg, db: &str, path: &str, forced: bool, progress: &
     // data scope: definitions of every table are dumped; rows are skipped for these (resolved now, so new tables count)
     let rowless: Vec<String> = src.query("SELECT table_name FROM pgbx.rowless_tables()", &[]).map_err(pe)?
         .iter().map(|r| r.get(0)).collect();
+    let roles = crate::extras::referenced_roles(&mut src);
     drop(src);
+    let enc = crate::extras::encryption_key(cfg)?; // a bad key file fails the backup before anything is uploaded
     let b = cfg.bucket()?;
     let key = format!("{}{}.dump", prefix(c, path), Utc::now().format("%Y-%m-%dT%H-%M-%SZ"));
     let (pg_dump, major) = client_tool(c, "pg_dump");
@@ -1801,7 +1836,7 @@ fn backup(c: &Ctx, cfg: &JobCfg, db: &str, path: &str, forced: bool, progress: &
         .map_err(|e| format!("spawn pg_dump: {e}"))?;
     set_child(child.id());
     let mut out = child.stdout.take().unwrap();
-    let up = transfer::upload_stream(&b, &key, &mut out, cfg.upload_kbps, progress);
+    let up = crate::extras::upload(&b, &key, &mut out, enc.as_ref(), cfg.upload_kbps, progress);
     drop(out); // if the upload gave up, this stops pg_dump (broken pipe)
     if up.is_err() {
         let _ = child.kill();
@@ -1818,10 +1853,15 @@ fn backup(c: &Ctx, cfg: &JobCfg, db: &str, path: &str, forced: bool, progress: &
     }
     let bytes = up?;
     let skipped = rowless.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(",");
+    // the roles this database needs, next to the dump (<ts>.globals.sql.zst); never fails the backup
+    let globals = crate::extras::backup_globals(c, cfg, &b, &key, &roles, enc.as_ref());
     Ok(Done {
         key: Some(key),
         bytes: bytes as i64,
-        extra: format!("{{\"tables\":{tables},\"compression\":\"{compress}\",\"rows_skipped\":[{skipped}]}}"),
+        extra: format!(
+            "{{\"tables\":{tables},\"compression\":\"{compress}\",\"rows_skipped\":[{skipped}],\"encrypted\":{}{globals}}}",
+            enc.is_some()
+        ),
     })
 }
 
@@ -1983,24 +2023,19 @@ fn key_time(key: &str) -> Option<DateTime<Utc>> {
     chrono::NaiveDateTime::parse_from_str(stem, "%Y-%m-%dT%H-%M-%SZ").ok().map(|n| n.and_utc())
 }
 
-/// Delete backups beyond the newest `max_backups`, and any older than `max_days`; never the newest one.
-/// Returns the deleted keys.
-fn prune(c: &Ctx, cfg: &JobCfg, path: &str, max_backups: i32, max_days: i32) -> Result<Vec<String>, String> {
+/// Delete what the retention rules do not keep (max_backups, max_days and the optional GFS spec; see retention.rs),
+/// never the newest backup, together with each dump's roles file. Returns the deleted dump keys.
+fn prune(c: &Ctx, cfg: &JobCfg, path: &str, max_backups: i32, max_days: i32, gfs: Option<&str>) -> Result<Vec<String>, String> {
     let b = cfg.bucket()?;
     let keys = list_dumps(c, &b, path)?; // oldest first
-    let cutoff = Utc::now() - chrono::Duration::days(max_days as i64);
-    let keep_from = keys.len().saturating_sub(max_backups.max(1) as usize);
+    let g = gfs.map(crate::retention::Gfs::parse).transpose()?.flatten();
+    let times: Vec<_> = keys.iter().map(|k| key_time(k)).collect();
     let mut gone = Vec::new();
-    for (i, k) in keys.iter().enumerate() {
-        if i + 1 == keys.len() {
-            break; // newest: always kept
-        }
-        let too_many = i < keep_from;
-        let too_old = key_time(k).is_some_and(|t| t < cutoff);
-        if too_many || too_old {
-            b.delete_object(k).map_err(|e| format!("delete {k}: {e}"))?;
-            gone.push(k.clone());
-        }
+    for i in crate::retention::to_delete(&times, max_backups, max_days, g.as_ref(), Utc::now()) {
+        let k = &keys[i];
+        b.delete_object(k).map_err(|e| format!("delete {k}: {e}"))?;
+        let _ = b.delete_object(crate::globals::globals_key(k)); // absent for dumps taken before 0.6
+        gone.push(k.clone());
     }
     Ok(gone)
 }
@@ -2014,9 +2049,11 @@ fn pick_backup(c: &Ctx, b: &Bucket, path: &str, at: DateTime<Utc>) -> Result<Str
 }
 
 /// CREATE DATABASE <into> TEMPLATE template0, then stream the S3 object straight into pg_restore's stdin.
+/// `keep_owner`: restore object owners (with_roles: the roles were created first); otherwise `--no-owner`.
 #[allow(clippy::too_many_arguments)]
 fn restore_key_into(
-    c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: &str, into: &str, app: &str, progress: &mut (dyn FnMut(u64) + Send),
+    c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: &str, into: &str, app: &str, keep_owner: bool,
+    progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<i64, String> {
     // template0: the dump brings its own CREATE EXTENSION pgbx, so start from a database without it
     admin
@@ -2026,7 +2063,8 @@ fn restore_key_into(
     let sync = if cfg.restore_sync { "on" } else { "off" };
     let mut child = job_command(&client_tool(c, "pg_restore").0, app, cfg)
         .env("PGOPTIONS", format!("-c synchronous_commit={sync}"))
-        .args(["-h", &c.socket, "-p", &c.port.to_string(), "-U", "postgres", "--no-owner", "-d", into])
+        .args(["-h", &c.socket, "-p", &c.port.to_string(), "-U", "postgres", "-d", into])
+        .args((!keep_owner).then_some("--no-owner"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -2034,9 +2072,10 @@ fn restore_key_into(
         .map_err(|e| format!("spawn pg_restore: {e}"))?;
     set_child(child.id());
     let mut stdin = child.stdin.take().unwrap();
-    let dl = transfer::download_resumable(b, key, &mut stdin, cfg.download_kbps, progress);
+    let dl = crate::extras::download(cfg, b, key, &mut stdin, progress); // decrypts an encrypted dump in the stream
     drop(stdin); // EOF for pg_restore
-    if dl.is_err() && shutting_down() {
+    let bad_cipher = dl.as_ref().is_err_and(|e| e.starts_with("decrypt") || e.starts_with("pgbx.encryption_key_file"));
+    if (dl.is_err() && shutting_down()) || bad_cipher {
         let _ = child.kill();
     }
     let out = child.wait_with_output().map_err(pe);
@@ -2048,6 +2087,11 @@ fn restore_key_into(
             let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{into}\" WITH (FORCE)"));
         }
         return Err(format!("restore stopped, {}", stop_reason()));
+    }
+    if let Some(e) = dl.as_ref().err().filter(|_| bad_cipher) {
+        // the real cause, not pg_restore's complaint about a cut-off input; the half-restored NEW database goes
+        let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{into}\" WITH (FORCE)"));
+        return Err(e.clone());
     }
     if !out.status.success() {
         return Err(format!("pg_restore failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
@@ -2069,11 +2113,20 @@ fn restore(c: &Ctx, cfg: &JobCfg, admin: &mut Client, path: &str, params: &str, 
         .unwrap_or_else(Utc::now);
     let b = cfg.bucket()?;
     let key = pick_backup(c, &b, path, at)?;
-    let bytes = restore_key_into(c, cfg, admin, &b, &key, &into, "pgbx_restore", progress)?;
+    // with_roles: create the roles the dump needs first (existing roles are never changed), then keep owners
+    let with_roles = p.get("with_roles").is_some_and(|v| v == "true");
+    let roles = if with_roles {
+        let scope = p.get("roles").map(String::as_str).unwrap_or("referenced");
+        Some(crate::extras::restore_globals(cfg, admin, &b, &key, scope)?)
+    } else {
+        None
+    };
+    let bytes = restore_key_into(c, cfg, admin, &b, &key, &into, "pgbx_restore", with_roles, progress)?;
     // the copy must not back up into the original's folder: give it its own path (= its own name)
     let mut copy = connect(c, &into)?;
     copy.batch_execute("UPDATE pgbx.config SET path = NULL").map_err(pe)?;
-    Ok(Done { key: Some(key), bytes, extra: "{}".into() })
+    let extra = roles.map(|r| format!("{{\"roles\":{r}}}")).unwrap_or("{}".into());
+    Ok(Done { key: Some(key), bytes, extra })
 }
 
 /// Restore test: newest backup -> scratch database -> same number of user tables as at backup time -> drop.
@@ -2083,7 +2136,7 @@ fn verify(
     let b = cfg.bucket()?;
     let key = pick_backup(c, &b, path, Utc::now())?;
     let result = (|| {
-        let bytes = restore_key_into(c, cfg, admin, &b, &key, scratch, "pgbx_verify", progress)?;
+        let bytes = restore_key_into(c, cfg, admin, &b, &key, scratch, "pgbx_verify", false, progress)?;
         let mut sc = connect(c, scratch)?;
         let got = user_tables(&mut sc)?;
         let ok = sc.query_one("SELECT 1", &[]).is_ok();

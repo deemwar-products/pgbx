@@ -8,10 +8,16 @@
 //!   guarded     pause, lowering retention, narrowing scope, verify-schedule never — require --yes
 
 mod client_only;
+#[path = "../../src/crypt.rs"]
+pub mod crypt;
+mod decrypt;
 mod diagnose;
+#[path = "../../src/globals.rs"]
+pub mod globals;
 mod jobs;
 mod load;
 mod memories;
+mod metrics;
 mod policy;
 mod profile;
 mod query;
@@ -36,17 +42,20 @@ const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite", "apply"];
+const BOOL_FLAGS: &[&str] = &[
+    "json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite", "apply",
+    "with-roles",
+];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
     "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
-    "ssh-jump", "tunnel-idle", "max-rows", "serve", "as", "hours", "gate",
+    "ssh-jump", "tunnel-idle", "max-rows", "serve", "as", "hours", "gate", "key-file", "roles", "gfs", "in", "out",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
     "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel", "memories",
-    "jobs", "load",
+    "jobs", "load", "metrics", "decrypt",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -118,20 +127,25 @@ read-only:
   pgbx load     [--db X]                     the load gate: last load sample, thresholds, per database what it would
                                              defer (shadow, the default), deferred (on) or forced
   pgbx ui       [--listen 127.0.0.1:8432] [--strict]
-                                             read-only audit web UI (overview, 30-day timeline, health);
-                                             --strict refuses a role that could change backups
+                                             read-only audit web UI (overview, 30-day timeline, health) and
+                                             Prometheus GET /metrics; --strict refuses a role that could change backups
+  pgbx metrics                               the same Prometheus metrics once, as text
+  pgbx decrypt  --key-file F [--in FILE] [--out FILE]
+                                             decrypt an encrypted dump (e.g. from a download link; stdin -> stdout)
 safe:
   pgbx now      [--db X] [--wait]            queue a backup
   pgbx verify   [--db X] [--wait]            queue a restore test
-  pgbx db-restore --db X --into NEWDB [--time TS] [--wait]
-                                             restore into a NEW database on this server (via the extension)
+  pgbx db-restore --db X --into NEWDB [--time TS] [--with-roles [--roles referenced|all]] [--wait]
+                                             restore into a NEW database on this server (via the extension);
+                                             --with-roles first creates missing roles from the backup's roles file
 new server / disaster (no extension needed on the target; needs pg_restore):
   pgbx backups    --from-s3 --db X S3FLAGS   list X's dumps in S3, newest first
-  pgbx db-restore --from-s3 --db X --into NEWDB [--backup KEY | --time TS] S3FLAGS
+  pgbx db-restore --from-s3 --db X --into NEWDB [--backup KEY | --time TS] [--with-roles [--roles R]]
+                  [--key-file F] S3FLAGS      (--key-file: the pgbx.encryption_key_file of encrypted backups)
       S3FLAGS: --s3-endpoint URL --s3-bucket B [--s3-region R] --server-name S --credentials-file F
       newest dump at or before TS (default: newest) -> CREATE DATABASE NEWDB (refused if it exists) -> pg_restore
 policy / access (show with no arguments; changes that reduce protection need --yes):
-  pgbx schedule [TEXT]            pgbx retention [--max-backups N] [--max-days N]
+  pgbx schedule [TEXT]            pgbx retention [--max-backups N] [--max-days N] [--gfs 7d,4w,12m|off]
   pgbx schedule suggest [--db X] [--hours N] [--apply [--yes]]
                                   the quietest window learned from activity + the configure() call to copy;
                                   never applied by itself (--apply asks y/N on a terminal, else needs --yes)
@@ -187,7 +201,7 @@ pub enum Level {
 }
 
 pub fn level(cmd: &str, a: &Args) -> Level {
-    let shows = a.pos.is_empty() && !["max-backups", "max-days", "include", "exclude", "reset"].iter().any(|f| a.has(f));
+    let shows = a.pos.is_empty() && !["max-backups", "max-days", "gfs", "include", "exclude", "reset"].iter().any(|f| a.has(f));
     match cmd {
         "now" | "verify" | "db-restore" | "resume" | "link" | "skill" => Level::Safe,
         "setup" if a.pos.first().map(String::as_str) == Some("client") => Level::Safe,
@@ -221,6 +235,14 @@ pub fn check_time(t: &str) -> Result<(), String> {
         Ok(())
     } else {
         bad()
+    }
+}
+
+/// --roles: which roles of the backup's roles file --with-roles creates.
+pub fn check_roles_scope(r: Option<&str>) -> Result<String, String> {
+    match r.unwrap_or("referenced") {
+        s @ ("referenced" | "all") => Ok(s.to_string()),
+        s => Err(format!("--roles '{s}': use referenced (roles this database uses; default) or all")),
     }
 }
 
@@ -406,7 +428,17 @@ fn cmd_db_restore(cx: &mut Ctx) -> Out {
         check_time(t)?;
     }
     drop(c);
-    queue(cx, &db, "SELECT pgbx.restore($1, coalesce(($2::text)::timestamptz, now()))", &[&into, &time])
+    if cx.a.has("key-file") {
+        return Err("--key-file is for --from-s3 restores; on this server the worker uses pgbx.encryption_key_file".into());
+    }
+    if !cx.a.has("with-roles") {
+        if cx.a.has("roles") {
+            return Err("--roles works with --with-roles".into());
+        }
+        return queue(cx, &db, "SELECT pgbx.restore($1, coalesce(($2::text)::timestamptz, now()))", &[&into, &time]);
+    }
+    let roles = check_roles_scope(cx.a.get("roles"))?;
+    queue(cx, &db, "SELECT pgbx.restore($1, coalesce(($2::text)::timestamptz, now()), true, $3)", &[&into, &time, &roles])
 }
 
 /// doctor() rows that give advice (a better schedule, estimates still settling) rather than report a fault
@@ -639,6 +671,8 @@ fn main() {
         "skill" => cmd_skill(&mut cx),
         "diagnose" => cmd_diagnose(&mut cx),
         "ui" => ui::run(&mut cx),
+        "metrics" => metrics::cmd(&mut cx),
+        "decrypt" => decrypt::cmd(&mut cx),
         "setup" => match setup_sub.as_deref() {
             Some("client") => setup_client::run(&mut cx),
             Some("server") | None => setup::run(&mut cx),
@@ -659,8 +693,12 @@ fn main() {
         v["profile_used"] = json!(p);
     }
     let ok = v["ok"] == true;
-    if as_json {
-        println!("{v}");
+    if as_json && !(cmd == "decrypt" && ok && v["out"].is_null()) {
+        println!("{v}"); // (decrypt without --out: stdout carries the plaintext dump)
+    } else if cmd == "decrypt" && ok {
+        eprintln!("pgbx decrypt: {} bytes decrypted", v["bytes"]);
+    } else if cmd == "metrics" && ok {
+        print!("{}", scalar(&v["text"]));
     } else if cmd == "link" && ok {
         println!("{}", scalar(&v["url"])); // bare URL so URL=$(pgbx link) works
     } else if cmd == "doctor" && v.get("checks").is_some() {
@@ -785,6 +823,19 @@ mod tests {
         assert_eq!(level("schedule", &p(&["schedule", "suggest"])), Level::ReadOnly);
         assert_eq!(level("schedule", &p(&["schedule", "suggest", "--apply"])), Level::Safe);
         assert_eq!(level("jobs", &p(&["jobs", "cancel", "7"])), Level::Guarded);
+    }
+
+    #[test]
+    fn extras_flags_and_levels() {
+        let a = p(&["db-restore", "--db", "shop", "--into", "s2", "--with-roles", "--roles", "all", "--key-file", "/k"]);
+        assert!(a.has("with-roles") && a.get("roles") == Some("all") && a.get("key-file") == Some("/k"));
+        assert_eq!(check_roles_scope(None).unwrap(), "referenced");
+        assert_eq!(check_roles_scope(Some("all")).unwrap(), "all");
+        assert!(check_roles_scope(Some("everyone")).is_err());
+        assert_eq!(level("metrics", &p(&["metrics"])), Level::ReadOnly);
+        assert_eq!(level("decrypt", &p(&["decrypt", "--key-file", "k"])), Level::ReadOnly);
+        assert_eq!(level("retention", &p(&["retention", "--gfs", "7d,4w,12m"])), Level::Guarded);
+        assert!(parse_args(["mcp"].iter().map(|s| s.to_string())).is_err(), "no MCP server");
     }
 
     #[test]

@@ -115,11 +115,21 @@ pub fn suggest(cx: &mut Ctx) -> Out {
     Ok(out)
 }
 
-fn current_retention(cx: &mut Ctx, db: &str) -> Result<(i64, i64), String> {
+fn current_retention(cx: &mut Ctx, db: &str) -> Result<(i64, i64, Option<String>), String> {
     let mut c = cx.connect(db)?;
+    // to_jsonb(c)->>'gfs': NULL (not an error) on a server whose extension is older than 0.6
     let r = c.query_one("SELECT coalesce((SELECT max_backups FROM pgbx.config), 14)::bigint,
-                               coalesce((SELECT max_days FROM pgbx.config), 90)::bigint", &[]).map_err(pe)?;
-    Ok((r.get(0), r.get(1)))
+                               coalesce((SELECT max_days FROM pgbx.config), 90)::bigint,
+                               (SELECT to_jsonb(c)->>'gfs' FROM pgbx.config c)", &[]).map_err(pe)?;
+    Ok((r.get(0), r.get(1), r.get(2)))
+}
+
+/// Changing or clearing a GFS spec can delete long-term keepers; adding one where there was none cannot.
+pub fn gfs_risk(cur: Option<&str>, new: Option<&str>) -> Option<String> {
+    let norm = |s: &str| s.trim().to_ascii_lowercase();
+    let (cur, new) = (cur.map(norm).filter(|s| !s.is_empty()), new.map(norm)?);
+    let cur = cur?;
+    (cur != new).then(|| format!("changing GFS retention ({cur} -> {new}) can delete long-term backups now"))
 }
 
 fn int_flag(a: &Args, k: &str) -> Result<Option<i64>, String> {
@@ -129,12 +139,17 @@ fn int_flag(a: &Args, k: &str) -> Result<Option<i64>, String> {
 pub fn retention(cx: &mut Ctx) -> Out {
     let db = cx.db();
     let (nb, nd) = (int_flag(&cx.a, "max-backups")?, int_flag(&cx.a, "max-days")?);
-    let cur = current_retention(cx, &db)?;
-    if nb.is_none() && nd.is_none() {
-        return Ok(json!({"ok": true, "database": db, "max_backups": cur.0, "max_days": cur.1}));
+    let gfs = cx.a.get("gfs").map(String::from);
+    let (cb, cd, cg) = current_retention(cx, &db)?;
+    if nb.is_none() && nd.is_none() && gfs.is_none() {
+        return Ok(json!({"ok": true, "database": db, "max_backups": cb, "max_days": cd, "gfs": cg}));
     }
-    require_yes(&cx.a, retention_risk(cur, nb, nd))?;
+    let risks: Vec<String> = [retention_risk((cb, cd), nb, nd), gfs_risk(cg.as_deref(), gfs.as_deref())].into_iter().flatten().collect();
+    require_yes(&cx.a, (!risks.is_empty()).then(|| risks.join("; ")))?;
     let (b, d) = (nb.map(|x| x as i32), nd.map(|x| x as i32));
+    if gfs.is_some() {
+        return text_call(cx, "SELECT pgbx.set_retention($1, $2, $3)", &[&b, &d, &gfs]);
+    }
     text_call(cx, "SELECT pgbx.set_retention($1, $2)", &[&b, &d])
 }
 
@@ -208,6 +223,15 @@ mod tests {
         assert!(require_yes(&a(&["retention", "--yes"]), r).is_ok());
         assert_eq!(retention_risk((14, 90), Some(20), Some(120)), None);
         assert!(retention_risk((14, 90), None, Some(30)).unwrap().contains("90 -> 30"));
+    }
+
+    #[test]
+    fn gfs_change_needs_yes() {
+        assert_eq!(gfs_risk(None, Some("7d,4w,12m")), None, "adding GFS only keeps more");
+        assert_eq!(gfs_risk(Some("7d,4w,12m"), Some("7D,4w,12m ")), None);
+        assert!(gfs_risk(Some("7d,4w,12m"), Some("off")).unwrap().contains("long-term"));
+        assert!(gfs_risk(Some("7d,4w,12m"), Some("7d")).is_some());
+        assert_eq!(gfs_risk(Some("7d"), None), None);
     }
 
     #[test]

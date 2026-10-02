@@ -3,7 +3,7 @@ name: pgbx-skill
 description: "Zero-touch PostgreSQL backups to S3 via `pgbx` (pgbx), and a plain Postgres client without them: read queries as JSON over SSH/jump-host profiles, per-database memory, status, backup now, restore a database (also from S3 onto a new server), verify, schedule, retention. Trigger: query the database, run a select, connect over ssh, is postgres backed up, take a backup, backup before deploy, restore the db, restore on a new server, backup failing, postgres is down, disk full, wal growing, pgbx."
 ---
 
-<!-- version: 0.5.0 -->
+<!-- version: 0.6.0 -->
 
 # pgbx-skill
 
