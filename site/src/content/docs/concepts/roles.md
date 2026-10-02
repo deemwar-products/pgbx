@@ -1,7 +1,7 @@
 ---
 title: Roles
 description: Who can call what.
-sidebar: { order: 4 }
+sidebar: { order: 5 }
 ---
 
 The extension creates two roles, server-wide. `PUBLIC` gets nothing.

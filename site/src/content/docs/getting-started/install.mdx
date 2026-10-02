@@ -5,6 +5,10 @@ sidebar: { order: 1 }
 ---
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
+The installer puts two things in place: the **pgbx extension** on the database server (it runs inside
+Postgres and does the backups) and the **pgbx CLI** (`pgbx`, the client you run commands with), plus the
+optional agent skill. See [How it works](../../concepts/how-it-works/).
+
 <Tabs syncKey="os">
 <TabItem label="Linux / macOS">
 
@@ -29,7 +33,7 @@ cmd.exe:
 curl -fsSL https://deemwar-products.github.io/pgbx/install.cmd -o install.cmd && install.cmd
 ```
 
-The extension runs on the Linux database server; on Windows you get `pgbx.exe` (in
+The pgbx extension runs on the Linux database server; on Windows you get the pgbx CLI, `pgbx.exe` (in
 `%LOCALAPPDATA%\pgbx\bin`, added to your user PATH) and the agent skill. Point it at the server:
 `pgbx status --host db.example.com --user postgres`.
 
@@ -44,7 +48,7 @@ The extension runs on the Linux database server; on Windows you get `pgbx.exe` (
 | Linux | Debian / Ubuntu / RHEL-family (Rocky, Alma, Fedora), amd64 and arm64 |
 | pgbx CLI | Linux amd64/arm64 (static), macOS arm64, Windows amd64/arm64 |
 
-On a machine without a local PostgreSQL 13–18 server the installer puts only the `pgbx` CLI in place and
+On a machine without a local PostgreSQL 13–18 server the installer puts only the pgbx CLI in place and
 says so (`pgbx's extension supports PostgreSQL 13–18; found N`).
 
 ## What the installer does

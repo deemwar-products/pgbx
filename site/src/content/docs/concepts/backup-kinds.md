@@ -1,7 +1,7 @@
 ---
 title: How backups work
 description: One logical backup per database, streamed to S3, restored into a new database.
-sidebar: { order: 1 }
+sidebar: { order: 2 }
 ---
 
 pgbx backs up **each database on its own**. There is no whole-server backup and no WAL archiving:

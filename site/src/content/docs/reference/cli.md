@@ -4,7 +4,8 @@ description: Every pgbx command, its flags, JSON output and safety level.
 sidebar: { order: 3 }
 ---
 
-With Postgres up, `pgbx` calls the extension's SQL. With Postgres down, `pgbx diagnose` explains why, and
+The pgbx CLI is the client: it talks to one or more Postgres servers (see [How it works](../../concepts/how-it-works/)).
+With Postgres up, `pgbx` calls the pgbx extension's SQL. With Postgres down, `pgbx diagnose` explains why, and
 `pgbx backups --from-s3` / `pgbx db-restore --from-s3` read dumps straight from S3 (no extension needed).
 
 ## Common flags
@@ -12,6 +13,7 @@ With Postgres up, `pgbx` calls the extension's SQL. With Postgres down, `pgbx di
 | flag | default |
 |---|---|
 | `--json` | one JSON object on stdout |
+| `--profile NAME` | a saved server (see [Profiles](#profiles)); also `PGBX_PROFILE`; else the default profile |
 | `--db X` | the database to act on |
 | `--host` / `--port` / `--user` | `/var/run/postgresql`, `5432`, `postgres` (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` honoured) |
 | `--admin-db` | `postgres` |
@@ -54,6 +56,9 @@ Every `--json` reply is one object with at least:
 | `scope [--include P1,P2] [--exclude P1,P2] [--reset] [--yes]` | readonly / guarded | `database`, `data_scope` |
 | `verify-schedule TEXT\|never [--yes]` | safe / guarded (`never`) | `database`, result |
 | `skill install [--no-codex] \| uninstall \| where` | safe | `version`, `installed_to`, `files` / `removed`, `skipped` |
+| `profile add NAME [flags]` | safe | `profile` (`name, default, settings`), `replaced`, `file` |
+| `profile list` / `profile show NAME` | readonly | `default`, `profiles[]` / `profile` |
+| `profile remove NAME` / `profile use NAME` | safe | `removed` / `default` |
 | `--version` | — | `{"ok": true, "version": "..."}` |
 
 ## S3 flags (`--from-s3`)
@@ -69,3 +74,30 @@ Every `--json` reply is one object with at least:
 `db-restore --from-s3` creates `--into` (refusing if it exists) on the server given by `--host/--port/--user`,
 then streams the dump into `pg_restore --no-owner`, resuming downloads with HTTP Range.
 Example: [Disaster recovery](../../guides/disaster-recovery/).
+
+## Profiles
+
+A profile is a named server, so you do not retype `--host/--port/--user` and the S3 flags:
+
+```sh
+pgbx profile add prod --host db.prod.example.com --port 5432 --user ops --admin-db postgres \
+  --s3-endpoint https://s3.eu-central-1.amazonaws.com --s3-bucket my-backups --s3-region eu-central-1 \
+  --server-name db-prod-1 --credentials-file ~/.config/pgbx/prod.credentials
+pgbx profile add local --host localhost
+pgbx profile use prod            # the default when no --profile is given (the first profile added is the default)
+pgbx status --profile local --db shop
+PGBX_PROFILE=local pgbx list --db shop
+pgbx profile list --json
+pgbx profile remove local
+```
+
+- Fields: `host`, `port`, `user`, `admin-db`, `s3-endpoint`, `s3-bucket`, `s3-region`, `server-name`,
+  `credentials-file`. `add` on an existing name replaces it.
+- Precedence for each value: **flag > environment** (`PGHOST`, `PGPORT`, `PGUSER`) **> profile > built-in
+  default**. With no profile saved and none asked for, behaviour is unchanged.
+- Chosen by `--profile NAME`, else `PGBX_PROFILE`, else the default. Every `--json` reply then carries
+  `profile_used`. An unknown name is an error, never a silent fallback.
+- Stored in `~/.config/pgbx/profiles.json` (`$XDG_CONFIG_HOME/pgbx`; `%APPDATA%\pgbx` on Windows;
+  `PGBX_CONFIG_DIR` overrides), mode 0600.
+- **Never stores passwords or S3 keys.** Passwords: `~/.pgpass` or `PGPASSWORD`. S3 keys: the
+  `--credentials-file` (only its path is saved).

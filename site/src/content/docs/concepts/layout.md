@@ -1,7 +1,7 @@
 ---
 title: Folder layout
 description: Where backups land in the bucket.
-sidebar: { order: 2 }
+sidebar: { order: 3 }
 ---
 
 ```
