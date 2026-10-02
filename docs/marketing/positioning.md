@@ -207,3 +207,13 @@ agent and posted by the owner, by hand, at human pace.**
 
 **Not in this plan:** cold email, ads, LinkedIn outreach, posting in other people's repos. All measured about 0 or
 burned accounts (LEARNED lessons 2 and 4).
+
+---
+
+## Appendix: proposed homepage diagram
+
+`docs/marketing/diagrams/HowItWorks.astro` is a **proposal** for the homepage and the how-it-works page (it is not in
+`site/` here, to avoid colliding with `cli-profiles`). It shows: you or an agent (pgbx-skill) → pgbx CLI (profiles,
+`--json`, `query`, `tunnel`, `--yes` gates) → SQL directly or over an SSH tunnel with jump hosts → the pgbx extension
+inside Postgres (install once) → your S3 bucket, plus `db-restore --from-s3` when the server is gone. Command names
+follow branch `cli-profiles` as reported by its agent (not merged yet).
