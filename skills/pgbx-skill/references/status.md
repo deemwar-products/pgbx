@@ -63,9 +63,11 @@ pgbx logs --json
 ```
 Fallback (SQL): `psql -XAtq -d myapp -c "SELECT row_to_json(h) FROM (SELECT id, kind, state, s3_key, bytes, error, finished FROM pgbx.history WHERE id = 1234) h"`
 
-**Expected response:** `state` one of `queued | running | done | failed | expired`; `error` set on failure.
+**Expected response:** `state` one of `queued | running | done | failed | expired | cancelled`; `error` set on
+failure. For where a job is in line and why it waits, use STAT-R-8 (`pgbx jobs`).
 
-**Common errors:** stuck `queued` → worker not running (`shared_preload_libraries`).
+**Common errors:** stuck `queued` → `pgbx jobs` says why (a job slot, a running dump of the same database, the load
+gate); if `pgbx jobs` is empty too, the worker is not running (`shared_preload_libraries`).
 
 **User-visible formatting:** "Job #<id> <kind>: <state>" + error verbatim when failed.
 
@@ -132,3 +134,48 @@ function, no psql) — use the matching pgbx command or ask the human. The guard
 boundary: never run anything that changes data through it. `statement timeout` → narrow it or raise `--timeout`.
 
 **User-visible formatting:** the answer in one or two sentences, then a small table of the rows that matter.
+
+### STAT-R-8: Job queue — what runs, what waits, why, how long
+
+**When to use:** "what is pgbx doing", "why hasn't my backup started", "is the restore running", "how long will it
+take", "cancel that backup", "job queue", "pgbx jobs".
+
+**Command:**
+```bash
+pgbx jobs --json                                   # the whole server's queue (admin database)
+pgbx jobs cancel 42 --db myapp --yes --json        # GUARDED: ask the human first; stops a running job too
+```
+Fallback (SQL): `psql -XAtq -d postgres -c "SELECT json_agg(q) FROM pgbx.server_queue q"`;
+per database `psql -XAtq -d myapp -c "SELECT row_to_json(e) FROM pgbx.job_eta(42) e"`.
+
+**Expected response:** `jobs[]` with `database, job_id, kind, state (running|cancelling|queued|deferred), position,
+slot (0 = restore lane), detail (why it waits), progress ('41 % · ~9 min left' / 'queued, #2 in line: starts ~14:05,
+takes ~18 min'), eta_start, eta_finish`; `slots` = `max_concurrent_jobs`, `restore_lane`. `cancel` returns a message;
+a running job ends as `cancelled` within seconds, with nothing left in S3.
+
+**Common errors:** `refusing without --yes` → by design; confirm with the human. `job id N exists in several
+databases` → add `--db`. `only a queued or running job can be cancelled` → it already finished.
+
+**User-visible formatting:** one line per job: "<db> #<id> <kind> <state> — <progress or detail>".
+
+### STAT-R-9: Load gate — is the server busy, would backups wait
+
+**When to use:** "is the server busy", "will a backup hurt the app", "why was the backup deferred", "load gate",
+"pgbx load", before a manual backup during business hours.
+
+**Command:**
+```bash
+pgbx load --json                                   # last sample, thresholds, per-database gate and counts
+pgbx load --db myapp --json                        # + that database's recent gated jobs
+pgbx load --gate on --db myapp --yes --json        # GUARDED: defer scheduled backups while busy (ask first)
+```
+Fallback (SQL): `psql -XAtq -d postgres -c "SELECT row_to_json(c) FROM (SELECT load_at, load_busy, load_reasons FROM pgbx.server_capacity) c"`
+
+**Expected response:** `sample.load_busy` + `load_reasons` ('12 active sessions > 4, 900 tps > 200'); `settings.load_gate`
+(default `shadow`: records `would_defer`, never delays); `databases[]` with `load_gate, would_defer_7d, deferred_7d,
+forced_7d`; `deferred_jobs[]`.
+
+**Common errors:** `--gate needs --db` → the gate is set per database. `no sample yet` → wait one poll.
+
+**User-visible formatting:** one line: "Server <busy: reasons | quiet>; gate <mode>; last 7 days <n> would have waited,
+<n> deferred, <n> forced." A manual backup on a busy server still starts: say so and offer the quiet window (POL-R-6).

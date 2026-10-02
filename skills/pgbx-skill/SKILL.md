@@ -77,10 +77,10 @@ Runs:
 
 | Family | Covers | Reference |
 |---|---|---|
-| Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries | `references/status.md` |
+| Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries, job queue + ETA + cancel (`pgbx jobs`), server load / gate (`pgbx load`) | `references/status.md` |
 | Backup | backup now, wait, backup id | `references/backup.md` |
 | Restore | db into a new database, from S3 onto a new server | `references/restore.md` |
 | Verify | restore tests, verify schedule, failures | `references/verify.md` |
-| Policy | schedule, retention, pause/resume, data scope | `references/policy.md` |
+| Policy | schedule, quietest time to back up (`pgbx schedule suggest`, never auto-applied), retention, pause/resume, data scope | `references/policy.md` |
 | Access | roles, download links | `references/access.md` |
 | Diagnose | postgres down, disk full, WAL growing, OOM, corruption — cause + tiered steps | `references/diagnose.md` |

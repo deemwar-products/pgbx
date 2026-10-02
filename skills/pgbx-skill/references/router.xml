@@ -16,7 +16,7 @@
   <routes>
 
     <route id="status" mode="read-only">
-      <when>is postgres backed up, is it backed up, backup status, are backups working, last backup, list backups, show backups, when was the last backup, pgbx status, pgbx list, how big is the database, table sizes, how many connections, run a select, query the database, pgbx query</when>
+      <when>is postgres backed up, is it backed up, backup status, are backups working, last backup, list backups, show backups, when was the last backup, pgbx status, pgbx list, how big is the database, table sizes, how many connections, run a select, query the database, pgbx query, job queue, why hasn't my backup started, how long will the backup take, pgbx jobs, cancel the backup, is the server busy, load gate, pgbx load</when>
       <goal>Answer "are we backed up?" in one line per database, from status JSON.</goal>
       <steps>
         <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
@@ -86,7 +86,7 @@
     </route>
 
     <route id="policy" mode="higher-risk">
-      <when>change backup schedule, backup every hour, retention, keep backups for, pause backups, resume backups, stop backups for now</when>
+      <when>change backup schedule, backup every hour, retention, keep backups for, pause backups, resume backups, stop backups for now, when should backups run, suggest a schedule, quietest time to back up, pgbx schedule suggest</when>
       <goal>Change schedule, retention, pause/resume; ask first when protection shrinks.</goal>
       <steps>
         <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>

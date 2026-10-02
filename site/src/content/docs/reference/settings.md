@@ -50,9 +50,66 @@ your app's locks.
 
 The child connections show in `pg_stat_activity` as `pgbx_dump`, `pgbx_restore` and `pgbx_verify`.
 
-| setting | default | |
+## Job queue
+
+One worker runs every database's jobs from one server-wide queue: restore > manual backup > scheduled / first backup >
+restore test > prune, then oldest first, then the database that waited longest. Jobs run as child processes the
+worker supervises every second, so it keeps polling (new databases, cancels, SIGTERM) while a dump runs.
+`pgbx jobs` shows the queue and why each job waits.
+
+| setting | default | what |
 |---|---|---|
+| `pgbx.max_concurrent_jobs` | `1` | jobs running at once on this server (1–8); each holds an advisory-lock slot in the admin database, so a second worker cannot exceed it either |
+| `pgbx.restore_lane` | `on` | one extra slot for restores only, so a restore never waits behind a long dump; turn off on very small servers |
 | `pgbx.coalesce_manual` | `on` | `backup_now()` / `verify_now()` return the job of that kind already queued instead of adding another |
+| `pgbx.overrun_policy` | `skip` | schedule slots that passed while a dump of that database ran: `skip` = the next run is the next slot after the dump finished (`params.skipped_slots`); `catch_up` = run once right away |
+| `pgbx.overrun_max_gap` | `1.5` | with `skip`: if waiting for that slot would leave more than this many schedule intervals since the last good backup **finished**, run right away (1.0–10) |
+
+Never two dumps of one database at once; a restore or restore test of a database may run while it is being dumped.
+
+## Time estimates
+
+Every job gets an estimate when it is created (a `NOTICE`), and live progress while it runs (`job_eta()`,
+`status()`, `pgbx jobs`, the UI).
+
+| setting | default | what |
+|---|---|---|
+| `pgbx.eta_samples` | `5` | recent jobs of the same kind per database the speed comes from (1–50) |
+| `pgbx.eta_default_mbps` | `20` | MB/s assumed before anything was measured; deliberately slow, so first estimates err long (1–10000) |
+| `pgbx.eta_calibrate` | `on` | once a day (and after a reload), with no job running, time one niced core compressing up to 64 MiB of the largest table's pages (~1 s) |
+
+Network speed comes from the last 20 upload parts / downloads (no extra traffic); disk speed from `blk_read_time`
+(needs `track_io_timing`). `doctor()` shows them (`capacity`) and how good past estimates were (`eta_accuracy`).
+
+## Quiet window
+
+The worker reads `pg_stat_database` for every database each poll and learns the activity per hour of the week into
+`pgbx.activity_hourly` (decayed averages, at most 336 rows per database; hours are UTC, like schedules).
+`suggest_window()` / `pgbx schedule suggest` name the quietest window. It is **never applied by itself**.
+
+| setting | default | what |
+|---|---|---|
+| `pgbx.activity_sampling` | `on` | one stats read per database per poll |
+| `pgbx.activity_decay` | `0.9` | weight of the past in each hour's average (0.5–0.99); adapts in about two weeks |
+| `pgbx.suggest_min_days` | `7` | days of samples before a suggestion has `high` confidence (1–90) |
+| `pgbx.doctor_busy_ratio` | `3.0` | `doctor()` (`schedule_in_quiet_window`) warns when the schedule's hour is busier than an average hour and this many times busier than the suggested window (1–100) |
+
+## Load gate
+
+Before a scheduled backup or restore test starts, the worker looks at the server's load (one sample per poll; pgbx's
+own sessions never count). The default is `shadow`: it records `params.would_defer` and never delays. With `on` a
+busy server defers the job with `pgbx.defer_backoff`, never past `pgbx.max_defer` (then it runs `forced`).
+Set it per database with `SELECT pgbx.configure(load_gate => 'on')` or `pgbx load --gate on --db X --yes`.
+
+| setting | default | what |
+|---|---|---|
+| `pgbx.load_gate` | `shadow` | `off`, `shadow` (record only), `on` (defer while busy); a database's `configure(load_gate => ...)` wins |
+| `pgbx.busy_active_backends` | `4` | busy when more client sessions than this are not idle (0 = ignore) |
+| `pgbx.busy_tps` | `200` | busy above this many transactions per second, all databases (0 = ignore); pgbx's own polling adds a few per database |
+| `pgbx.busy_long_xact` | `30s` | busy while a writing transaction is open longer than this (0 = ignore): never stack a dump on a migration |
+| `pgbx.busy_replica_lag` | `30s` | busy while a standby replays more than this behind (0 = ignore) |
+| `pgbx.busy_loadavg` | `0.8` | busy above this 1-minute load average per core (Linux; 0 = ignore) |
+| `pgbx.gate_manual_jobs` | `warn` | `backup_now()` / `verify_now()` / `restore()`: `warn` = a NOTICE that it competes with the app, it starts anyway; `defer` = gated like scheduled jobs (restores never are); `off` |
 
 ## Per-database defaults
 
@@ -66,3 +123,4 @@ Stored in `pgbx.config`, one row per database. Change them with SQL, not setting
 | verify schedule | weekly on sunday at 04:00 |
 | data scope | every row |
 | path | database name |
+| load gate | the server's `pgbx.load_gate` |
