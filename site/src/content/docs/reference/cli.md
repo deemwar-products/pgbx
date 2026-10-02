@@ -69,6 +69,3 @@ Every `--json` reply is one object with at least:
 `db-restore --from-s3` creates `--into` (refusing if it exists) on the server given by `--host/--port/--user`,
 then streams the dump into `pg_restore --no-owner`, resuming downloads with HTTP Range.
 Example: [Disaster recovery](../../guides/disaster-recovery/).
-
-Removed in 0.5.0: `restore` (whole-server), `now --cluster`, `--system-id`, `--conf`, `--work-dir`,
-`--process-max`, `--stop-command`, `--yes-replace-whole-server`, `--allow-gap`, `logs --pgbackrest`.

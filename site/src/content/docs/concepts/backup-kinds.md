@@ -4,8 +4,8 @@ description: One logical backup per database, streamed to S3, restored into a ne
 sidebar: { order: 1 }
 ---
 
-pgbx backs up **each database on its own**. There is no whole-server backup, no WAL archiving and
-no pgBackRest: `archive_mode` is not needed and no extra package is installed.
+pgbx backs up **each database on its own**. There is no whole-server backup and no WAL archiving:
+`archive_mode` is not needed and no extra package is installed.
 
 | | |
 |---|---|

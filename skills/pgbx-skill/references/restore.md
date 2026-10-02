@@ -1,7 +1,7 @@
 # Restore — recipes
 
 Every restore goes into a NEW database = safe mutation. Swapping it in for the live database is
-**destructive** (RST-R-2, explicit approval). There is no whole-server restore since 0.5.0.
+**destructive** (RST-R-2, explicit approval). There is no whole-server restore.
 
 **User-visible formatting (family default):** "Restored <what> as of <time> into <where>; <what was untouched>."
 

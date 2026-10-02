@@ -77,8 +77,7 @@ self-check: `sh skills/pgbx-skill/tests/all.sh`.
 ## Requirements
 
 PostgreSQL 13–18 for the extension. `pgbx db-restore --from-s3` needs only `pg_restore` on the restoring host and
-any server the dump can be restored into. Coming from pgbx's previous name? See CHANGELOG.md and the
-"Migrating from the previous version" guide.
+any server the dump can be restored into.
 
 ## Server setup (once, postgresql.conf)
 ```ini
@@ -93,9 +92,7 @@ pgbx.alert_command    = 'curl -s -X POST -d @- https://hooks.example/alert'   # 
 pgbx.dump_compression = 'auto'
 pgbx.audit_days       = 30                       # history (audit trail) kept; kept backups never pruned
 ```
-No `archive_mode`, no WAL archiving and no pgBackRest are needed: since 0.5.0 pgbx does per-database
-backups only (see the [upgrade notes](site/src/content/docs/guides/upgrading.md) for what was removed and how to
-delete old whole-server data in S3). `doctor()` reports inactive `replication_slots` pinning WAL.
+No `archive_mode` and no WAL archiving are needed: pgbx does per-database backups only. `doctor()` reports inactive `replication_slots` pinning WAL.
 When Postgres is down, `pgbx diagnose` (and `pgbx doctor`) names the probable cause with tiered steps it never runs.
 Backups land at `s3://<bucket>/<server_name>/<database>/<UTC timestamp>.dump`.
 
