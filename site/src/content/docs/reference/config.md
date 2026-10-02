@@ -84,6 +84,7 @@ pgbx's own keys:
 | `admin-db` | the admin database (default: `pgbx.admin_db`, else `postgres`) |
 | `s3-endpoint`, `s3-bucket`, `s3-region`, `server-name`, `credentials-file` | for `--from-s3`; S3 keys stay in the credentials file |
 | `ready_timeout` | how long the adapter may take to answer (`30s` default; `60s`, `2m`) |
+| `sslmode`, `sslrootcert` | TLS to Postgres (see [TLS](#tls)); an adapter gets them too, in its settings |
 
 Without `--db`, a command uses the database named in the connection string, else `postgres`. A connection
 string without a user uses `PGUSER`, else `postgres`; without a password, `PGPASSWORD` (or `~/.pgpass` for
@@ -98,6 +99,43 @@ string without a user uses `PGUSER`, else `postgres`; without a password, `PGPAS
 5. `PGBX_PROFILE`
 6. the default profile
 7. `PGHOST` / `PGPORT` / `PGUSER` and the built-in defaults (`/var/run/postgresql`, `5432`, `postgres`)
+
+## TLS
+
+Every CLI connection to Postgres (`query`, `status`, `doctor`, `jobs`, `serve`, `setup client`,
+`db-restore --from-s3`, ...) uses TLS the way `psql` does, with libpq's `sslmode`:
+
+| `sslmode` | TLS | certificate check |
+|---|---|---|
+| `disable` | never | |
+| `allow`, `prefer` (the default) | when the server offers it, else plain | none |
+| `require` | always | none (encrypted, but not authenticated) |
+| `verify-ca` | always | the certificate chains to a trusted root; the host name is not checked |
+| `verify-full` | always | trusted root, and the certificate names the host you connect to |
+
+Trusted roots for `verify-ca` / `verify-full`: the PEM file in `sslrootcert`; else `~/.postgresql/root.crt` if
+it exists (as libpq); else the Mozilla roots built into pgbx plus your operating system's store
+(`sslrootcert=system` asks for these explicitly and, alone, means `verify-full`, as in libpq 16).
+
+Where the settings come from, first match wins, for each of the two:
+
+1. the connection string: `postgres://...?sslmode=verify-full&sslrootcert=/etc/pgbx/ca.pem`, or
+   `sslmode=... sslrootcert=...` in key=value form (an adapter's URL counts here);
+2. the profile's `sslmode:` / `sslrootcert:` keys (`$VAR`s and `~/` allowed);
+3. `PGSSLMODE` / `PGSSLROOTCERT`;
+4. the defaults above.
+
+A Unix socket never uses TLS (libpq ignores `sslmode` there too). `pg_restore` (for `db-restore --from-s3`) gets
+the same settings as `PGSSLMODE` / `PGSSLROOTCERT`; when pgbx used its default roots that is
+`PGSSLROOTCERT=system`, which needs `pg_restore` 16 or newer (older ones: set `sslrootcert` to a file). pgbx
+has no client certificates (`sslcert` / `sslkey`). TLS is rustls: no OpenSSL, still one static binary.
+
+```yaml
+profiles:
+  prod:
+    url: postgres://app:$PGPASSWORD@shop.cluster-xyz.eu-west-1.rds.amazonaws.com:5432/shop?sslmode=verify-full
+    sslrootcert: ~/.config/pgbx/rds-global-bundle.pem
+```
 
 ## `$VAR` references
 
@@ -172,11 +210,7 @@ their environment, never their arguments.
 A one-off command starts its adapter on its first connection and stops it when it finishes. `pgbx serve` keeps
 one adapter per connection for its whole run.
 
-:::caution[No TLS yet]
-The pgbx CLI connects to Postgres without TLS. A connection string with `sslmode=require`, or a server that
-forces TLS (RDS with `rds.force_ssl`, Azure flexible server by default), cannot be reached by the CLI yet. The
-Cloud SQL Auth Proxy works (the proxy encrypts the hop to Google), and so does an SSH forward.
-:::
+The URL an adapter returns may carry `sslmode` / `sslrootcert`; they win over the profile's keys (see [TLS](#tls)).
 
 ## Migrating from `profiles.json` (pgbx 0.5)
 

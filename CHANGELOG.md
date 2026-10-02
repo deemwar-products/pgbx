@@ -20,6 +20,14 @@
   environment, then the `secrets:` source (a .env file or a handler command run as `CMD NAME`). pgbx stores no
   secrets: literal passwords are refused, and every output masks passwords and expanded secrets.
   `pg_restore` gets the password through its environment.
+- **TLS to Postgres** for every CLI connection, with libpq's `sslmode`: `disable`, `allow` / `prefer` (the
+  default: TLS when the server offers it), `require`, `verify-ca`, `verify-full`, and `sslrootcert` (a PEM file,
+  else `~/.postgresql/root.crt`, else the built-in Mozilla roots plus the OS store). From the connection string,
+  then the profile's `sslmode:` / `sslrootcert:` keys, then `PGSSLMODE` / `PGSSLROOTCERT`. Servers that force
+  TLS (Azure flexible server, RDS with `rds.force_ssl`) and the aws / azure adapters' `sslmode=require` URLs
+  (`iam_auth`, `entra_auth`) now connect; `pg_restore` gets the same settings. rustls, so still no OpenSSL and one
+  static binary. A connection that fails says why (`invalid peer certificate: UnknownIssuer`, ...). Behaviour
+  change: a server with `ssl=on` is now reached over TLS by default, as `psql` does.
 - **Resource caps** (ADR 0001 §3): pg_dump / pg_restore run at `pgbx.job_nice` (10) and, on Linux, IO priority
   `pgbx.job_ionice` (best-effort-7), set before exec; their connections are named `pgbx_dump` / `pgbx_restore` /
   `pgbx_verify`.

@@ -6,8 +6,8 @@ one `config.yaml` (YAML; the TOML below was the sketch) with `adapters`, `profil
 environment, a .env file or a handler command; adapter protocol v1 (process group / Job Object, start and stop,
 one result line, timeouts, Ctrl-C); the ssh / aws / gcp / azure examples in `adapters/`; pgbx's built-in SSH
 (`tunnel.rs`, `pgbx tunnel`, `--ssh*`) removed and `profiles.json` migrated automatically. **Not built:** the
-`exec` action (Q1: host-side commands run on the host), the marketplace runner, and TLS for adapter URLs (the CLI
-still connects with NoTls, so servers that force TLS cannot be reached yet). Reference:
+`exec` action (Q1: host-side commands run on the host) and the marketplace runner. TLS for adapter URLs (and
+every CLI connection) followed on branch `cli-tls`: libpq `sslmode` over rustls. Reference:
 `site/src/content/docs/reference/config.md`.
 Builds on ADR 0002 (profiles, SSH tunnels, read queries).
 

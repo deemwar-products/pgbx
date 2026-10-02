@@ -91,12 +91,18 @@ pgbx profile add vm-db --adapter azure bastion=corp-bastion resource_group=rg-da
 | `user`, `password`, `dbname`, `sslmode` | | `sslmode` defaults to `require` |
 | `entra_auth` | | `true`: an Entra ID token as the password |
 
-:::caution[TLS]
-The pgbx CLI does not speak TLS to Postgres yet. A server that forces TLS cannot be reached: Azure flexible
-server by default, RDS with `rds.force_ssl` (the default from PostgreSQL 15), and anything that ends up with
-`sslmode=require` (`iam_auth`, `entra_auth`, the azure adapter's default). The ssh and gcp adapters, and Postgres
-that accepts plain connections from the tunnel's far end, work today.
-:::
+### TLS
+
+pgbx speaks TLS to Postgres with libpq's `sslmode` (see [TLS in the config reference](../../reference/config/#tls)),
+so servers that force it work: Azure flexible server, RDS with `rds.force_ssl` (the default from PostgreSQL 15),
+and every URL that says `sslmode=require` (`iam_auth`, `entra_auth`, the azure adapter's default). An adapter's
+`sslmode` setting goes into its URL, and that wins over everything else.
+
+To check the server's certificate, not only encrypt: through a tunnel (aws, azure bastion, ssh) pgbx connects to
+`127.0.0.1`, which is not the name in the certificate, so use `sslmode=verify-ca` with the provider's CA bundle in
+`sslrootcert` (for example AWS's `global-bundle.pem`); straight to a server (azure `host`) `verify-full` works,
+the public roots and your OS store are built in. The gcp adapter's local hop stays `sslmode=disable`: the proxy
+encrypts the way to Google.
 
 ## Write your own
 
