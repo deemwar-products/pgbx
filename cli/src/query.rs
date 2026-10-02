@@ -301,7 +301,19 @@ pub fn run(cx: &mut Ctx) -> Out {
     };
     let timeout = parse_duration(cx.a.get("timeout").unwrap_or("30s"))?;
     let db = cx.db();
-    let mut c = cx.connect(&db)?;
+    run_checked(cx, &db, &sql, max, timeout)
+}
+
+/// One statement through the same guard as `pgbx query` (used by `pgbx serve`): checks, then runs it read-only.
+pub fn run_sql(cx: &Ctx, db: &str, raw: &str, max: usize, timeout: Duration) -> Out {
+    let sql = single_statement(raw)?;
+    check_read_only(&sql)?;
+    run_checked(cx, db, &sql, max.max(1), timeout)
+}
+
+/// Layer d: `sql` already passed layers a-c.
+fn run_checked(cx: &Ctx, db: &str, sql: &str, max: usize, timeout: Duration) -> Out {
+    let mut c = cx.connect(db)?;
     let user: String = c.query_one("SELECT current_user::text", &[]).map_err(pe)?.get(0);
     let mut t = c.transaction().map_err(pe)?;
     let ms = timeout.as_millis();
@@ -309,7 +321,7 @@ pub fn run(cx: &mut Ctx) -> Out {
         "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = {ms}; SET LOCAL lock_timeout = {}",
         ms.min(5000)
     )).map_err(pe)?;
-    let stmt = t.prepare(&sql).map_err(pe)?;
+    let stmt = t.prepare(sql).map_err(pe)?;
     let columns: Vec<Value> = stmt.columns().iter().map(|c| json!({"name": c.name(), "type": c.type_().name()})).collect();
     if columns.is_empty() {
         return Err("pgbx query is for statements that return rows (SELECT, WITH, SHOW, EXPLAIN, VALUES, TABLE)".into());
@@ -322,7 +334,7 @@ pub fn run(cx: &mut Ctx) -> Out {
             // SHOW / EXPLAIN cannot be a subquery: run it as is, values as text
             t.execute("ROLLBACK TO SAVEPOINT w", &[]).map_err(pe)?;
             let mut v = vec![];
-            for m in t.simple_query(&sql).map_err(pe)? {
+            for m in t.simple_query(sql).map_err(pe)? {
                 if let postgres::SimpleQueryMessage::Row(r) = m {
                     let mut o = Map::new();
                     for (i, col) in r.columns().iter().enumerate() {

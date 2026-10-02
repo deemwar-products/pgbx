@@ -43,6 +43,7 @@ Every `--json` reply is one object with at least:
 | `doctor` | readonly | `healthy`, `postgres_up`, `checks[]` (`name, ok, detail, fix`); `diagnosis` when Postgres is down |
 | `diagnose [--log F] [--pgdata DIR]` | readonly | `postgres`, `probable_cause`, `evidence[]`, `steps[]`, `facts` |
 | `ui [--listen 127.0.0.1:8432] [--strict]` | readonly | serves the read-only [audit UI](../../guides/audit-ui/); `GET` only |
+| `serve [--listen 127.0.0.1:0] [--no-open] [--allow-safe]` | readonly / safe (`--allow-safe`) | the local [web app](../serve/): overview, database detail, restore helper, read-only query, health; per-run token; safe actions only with `--allow-safe`; start line: `url`, `listen`, `warnings` |
 | `logs [--lines N]` | readonly | `recent_failures[]` |
 | `jobs` | readonly | `jobs[]` (`database, job_id, kind, trigger, state, position, slot, detail, progress, eta_start, eta_finish, est_bytes, done_bytes`), `slots`; text mode: one line per job |
 | `jobs cancel ID [--db X] --yes` | guarded | `database`, `job_id`, `message`; `--db` may be left out when the id is unique in the queue |

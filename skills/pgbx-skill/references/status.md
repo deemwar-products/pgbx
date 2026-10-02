@@ -105,6 +105,9 @@ pgbx ui --user pgbx_ui --strict            # http://127.0.0.1:8432/ ; --listen I
 curl -s http://127.0.0.1:8432/api/timeline?days=30   # also /api/overview /api/db/<name> /api/health
 ```
 Viewer login (ask the human first): `CREATE ROLE pgbx_ui LOGIN PASSWORD '...' IN ROLE pgbx_viewer`.
+A human who wants a browser app (overview, restore helper, read-only query) can run `pgbx serve --profile <p>`
+themselves: it opens a local page with a per-run token. Suggest it; never start it for your own use (the CLI's
+`--json` answers everything it shows).
 Fallback (SQL, per database): `psql -XAtq -d myapp -c "SELECT json_agg(h) FROM (SELECT id, kind, state, who, trigger, coalesce(finished, requested_at) AS at, error FROM pgbx.history ORDER BY id DESC LIMIT 50) h"`
 
 **Expected response:** startup `{"ok":true,"url":..,"role":..,"warnings":[]}`; timeline rows `{database, kind, state, who, trigger, at, s3_key, error, params}`

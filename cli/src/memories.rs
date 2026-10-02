@@ -159,6 +159,95 @@ pub fn run(a: &Args, profile: Option<String>, env: Env) -> Result<Value, String>
     }
 }
 
+/// `PGBX_MEMORY=off` turns memory off: nothing is read or written.
+pub fn enabled(env: Env) -> bool {
+    env("PGBX_MEMORY").is_none_or(|v| !v.eq_ignore_ascii_case("off"))
+}
+
+/// `<root>/<connection>/<db>/memories.md`
+pub fn memories_file(env: Env, connection: &str, db: &str) -> Result<PathBuf, String> {
+    check_part("connection", connection)?;
+    check_part("database", db)?;
+    Ok(root(env)?.join(connection).join(db).join("memories.md"))
+}
+
+/// The saved questions in a memories.md: `## name`, lines of meaning, then a ```sql block (recipe MEM-W-1).
+/// Sections without a sql block are notes, not questions, and are skipped.
+pub fn questions(text: &str) -> Vec<Value> {
+    #[derive(Default)]
+    struct Section {
+        name: String,
+        note: Vec<String>,
+        sql: Option<Vec<String>>,
+        open: bool,
+    }
+    fn flush(c: Option<Section>, out: &mut Vec<Value>) {
+        if let Some(Section { name, note, sql: Some(sql), .. }) = c {
+            let sql = sql.join("\n").trim().to_string();
+            if !sql.is_empty() {
+                out.push(json!({"name": name, "note": note.join(" ").trim(), "sql": sql}));
+            }
+        }
+    }
+    let mut out = vec![];
+    let mut cur: Option<Section> = None;
+    for line in text.lines() {
+        let fence = line.trim_start().starts_with("```");
+        if let Some(c) = cur.as_mut().filter(|c| c.open) {
+            if fence {
+                c.open = false;
+            } else if let Some(s) = c.sql.as_mut() {
+                s.push(line.to_string());
+            }
+            continue;
+        }
+        if let Some(h) = line.strip_prefix("## ") {
+            flush(cur.take(), &mut out);
+            cur = Some(Section { name: h.trim().to_string(), ..Default::default() });
+        } else if let Some(c) = cur.as_mut() {
+            let t = line.trim();
+            if fence {
+                if c.sql.is_none() {
+                    c.sql = Some(vec![]);
+                    c.open = true;
+                }
+            } else if c.sql.is_none() && !t.is_empty() {
+                c.note.push(t.to_string());
+            }
+        }
+    }
+    flush(cur.take(), &mut out);
+    out
+}
+
+/// The text MEM-W-1 appends for one named question.
+pub fn question_block(name: &str, note: &str, sql: &str) -> Result<String, String> {
+    let name = name.trim();
+    let (note, sql) = (note.trim(), sql.trim());
+    if name.is_empty() || name.contains(['\n', '\r']) {
+        return Err("a saved question needs a one-line name".into());
+    }
+    if note.contains(['\n', '\r']) {
+        return Err("the note is one line of meaning".into());
+    }
+    if sql.is_empty() || sql.contains("```") {
+        return Err("the SQL must be non-empty and must not contain ```".into());
+    }
+    let note = if note.is_empty() { String::new() } else { format!("{note}\n") };
+    Ok(format!("\n## {name}\n{note}```sql\n{sql}\n```\n"))
+}
+
+/// Append (never rewrite) one question to `file`, creating its folder; returns the block written.
+pub fn append_question(file: &Path, name: &str, note: &str, sql: &str) -> Result<String, String> {
+    let block = question_block(name, note, sql)?;
+    let dir = file.parent().ok_or("bad memory path")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
+    f.write_all(block.as_bytes()).map_err(|e| format!("write {}: {e}", file.display()))?;
+    Ok(block)
+}
+
 pub fn run_sys(a: &Args, profile: Option<String>) -> Result<Value, String> {
     run(a, profile, &|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
 }
@@ -223,6 +312,31 @@ mod tests {
         assert!(parse_bundle(&json!({"pgbx_memories": 1, "connection": "p", "files": {"shop/memories.md": 5}})).is_err());
         assert!(check_part("connection", "a/b").is_err());
         assert!(check_part("connection", "..").is_err());
+    }
+
+    #[test]
+    fn saved_questions_round_trip() {
+        let d = tmp("q");
+        let env = |k: &str| (k == "PGBX_MEMORY_DIR").then(|| d.display().to_string());
+        let f = memories_file(&env, "prod", "shop").unwrap();
+        assert_eq!(f, d.join("prod/shop/memories.md"));
+        assert!(memories_file(&env, "prod", "../x").is_err());
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "# shop\nuser notes stay as written\n\n## a plain note\nno sql here\n").unwrap();
+        append_question(&f, "orders today", "Orders placed in the last 24 h.", "SELECT count(*)\nFROM orders").unwrap();
+        append_question(&f, "users", "", "SELECT 1").unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.starts_with("# shop\nuser notes stay as written\n"), "{text}");
+        assert!(text.ends_with("\n## users\n```sql\nSELECT 1\n```\n"), "{text}");
+        let q = questions(&text);
+        assert_eq!(q.len(), 2, "{q:?}");
+        assert_eq!((q[0]["name"].as_str(), q[0]["note"].as_str()), (Some("orders today"), Some("Orders placed in the last 24 h.")));
+        assert_eq!(q[0]["sql"], "SELECT count(*)\nFROM orders");
+        assert!(question_block("", "", "SELECT 1").is_err());
+        assert!(question_block("a\nb", "", "SELECT 1").is_err());
+        assert!(question_block("a", "", "SELECT '```'").is_err());
+        assert!(enabled(&|_| None) && !enabled(&|k| (k == "PGBX_MEMORY").then(|| "off".to_string())));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

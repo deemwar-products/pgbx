@@ -79,6 +79,13 @@ refuses writes and functions with side effects. This is a **best-effort guard fo
 boundary**: if you need a hard guarantee, connect as a role that can only read. Roles and permissions stay
 yours to manage; pgbx never creates one.
 
+### In a browser
+
+`pgbx serve --profile prod` opens a local web app on your machine: every database's backups at a glance, the
+job queue, a restore helper that writes the exact `pgbx db-restore` command, read-only queries and the health
+checks. It is the same CLI behind a screen, on 127.0.0.1 with a per-run token, read-only unless you start it
+with `--allow-safe`. See [pgbx serve](../../reference/serve/).
+
 ## The agent skill — on top of the CLI
 
 `pgbx-skill` teaches AI coding agents (Claude Code, Codex) to answer "is my database backed up?" or

@@ -16,6 +16,7 @@ mod policy;
 mod profile;
 mod query;
 mod s3restore;
+mod serve;
 mod setup;
 mod setup_client;
 mod skill;
@@ -36,7 +37,7 @@ const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite", "apply"];
+const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite", "apply", "no-open", "allow-safe"];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
@@ -46,7 +47,7 @@ const VALUE_FLAGS: &[&str] = &[
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
     "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel", "memories",
-    "jobs", "load",
+    "jobs", "load", "serve",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -120,6 +121,11 @@ read-only:
   pgbx ui       [--listen 127.0.0.1:8432] [--strict]
                                              read-only audit web UI (overview, 30-day timeline, health);
                                              --strict refuses a role that could change backups
+  pgbx serve    [--profile P] [--listen 127.0.0.1:0] [--no-open] [--allow-safe]
+                                             local web app (overview, database detail, restore helper, read-only
+                                             query, health); random port + per-run token, opens the browser;
+                                             --allow-safe enables backup now / verify now / restore into a NEW db /
+                                             cancel a queued job, each confirmed (never guarded or destructive)
 safe:
   pgbx now      [--db X] [--wait]            queue a backup
   pgbx verify   [--db X] [--wait]            queue a restore test
@@ -202,6 +208,7 @@ pub fn level(cmd: &str, a: &Args) -> Level {
         "verify-schedule" => Level::Safe,
         "jobs" if a.pos.first().map(String::as_str) == Some("cancel") => Level::Guarded,
         "load" => load::level_of(a),
+        "serve" if a.has("allow-safe") => Level::Safe,
         _ => Level::ReadOnly,
     }
 }
@@ -639,6 +646,7 @@ fn main() {
         "skill" => cmd_skill(&mut cx),
         "diagnose" => cmd_diagnose(&mut cx),
         "ui" => ui::run(&mut cx),
+        "serve" => serve::run(&mut cx),
         "setup" => match setup_sub.as_deref() {
             Some("client") => setup_client::run(&mut cx),
             Some("server") | None => setup::run(&mut cx),
@@ -785,6 +793,8 @@ mod tests {
         assert_eq!(level("schedule", &p(&["schedule", "suggest"])), Level::ReadOnly);
         assert_eq!(level("schedule", &p(&["schedule", "suggest", "--apply"])), Level::Safe);
         assert_eq!(level("jobs", &p(&["jobs", "cancel", "7"])), Level::Guarded);
+        assert_eq!(level("serve", &p(&["serve", "--no-open"])), Level::ReadOnly);
+        assert_eq!(level("serve", &p(&["serve", "--allow-safe"])), Level::Safe);
     }
 
     #[test]
