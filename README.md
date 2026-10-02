@@ -12,8 +12,10 @@ Full documentation: [`site/`](site/README.md) (Astro Starlight, published to Git
 ## Quick start (Linux, PostgreSQL 13–18)
 ```sh
 curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh
-sudo pgbx setup                               # S3 settings; prints the ONE restart command
+sudo pgbx setup server                        # S3 settings; prints the ONE restart command
 sudo systemctl restart postgresql@16-main     # (the command setup printed)
+# on your laptop:
+pgbx setup client prod --ssh ops@db.example.com --user postgres
 pgbx doctor
 ```
 Windows (CLI + agent skill): `powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"`.

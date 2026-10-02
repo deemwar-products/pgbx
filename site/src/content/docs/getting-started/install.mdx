@@ -1,6 +1,6 @@
 ---
 title: Install
-description: One-line install of the pgbx extension, CLI and agent skill; then pgbx setup and one restart.
+description: Install pgbx on the database server (pgbx setup server, one restart), then on your laptop (pgbx setup client).
 sidebar: { order: 1 }
 ---
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -9,36 +9,63 @@ The installer puts two things in place: the **pgbx extension** on the database s
 Postgres and does the backups) and the **pgbx CLI** (`pgbx`, the client you run commands with), plus the
 optional agent skill. See [How it works](../../concepts/how-it-works/).
 
+pgbx is set up in two places. Do the server once; do the laptop part on every machine you run `pgbx` from.
+
+## On the database server
+
+```sh
+curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh
+sudo pgbx setup server     # asks for your S3 bucket; prints the ONE restart command, e.g. sudo systemctl restart postgresql@16-main
+pgbx doctor                # after that restart
+```
+
+`sudo pgbx setup server` writes the S3 settings, the credentials file and `shared_preload_libraries`; it
+never restarts anything itself. Plain `sudo pgbx setup` does the same thing. For scripts, pass every value as a
+flag with `--yes` (see [What the installer does](#what-the-installer-does)).
+
+## On your laptop
+
+Install the pgbx CLI, then tell it how to reach the server. `setup client` needs no sudo.
+
 <Tabs syncKey="os">
 <TabItem label="Linux / macOS">
 
 ```sh
 curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh
-sudo pgbx setup            # S3 settings; prints the ONE restart command, e.g. sudo systemctl restart postgresql@16-main
-pgbx doctor                # after that restart
+pgbx setup client prod --ssh ops@db.example.com --user postgres     # over SSH (recommended)
+# or, when Postgres is reachable directly:
+pgbx setup client prod --host db.example.com --user postgres
 ```
 
 </TabItem>
-<TabItem label="Windows (CLI only)">
+<TabItem label="Windows">
 
 PowerShell:
 
 ```powershell
 powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"
+pgbx setup client prod --ssh ops@db.example.com --user postgres
 ```
 
 cmd.exe:
 
 ```bat
 curl -fsSL https://deemwar-products.github.io/pgbx/install.cmd -o install.cmd && install.cmd
+pgbx setup client prod --ssh ops@db.example.com --user postgres
 ```
 
-The pgbx extension runs on the Linux database server; on Windows you get the pgbx CLI, `pgbx.exe` (in
-`%LOCALAPPDATA%\pgbx\bin`, added to your user PATH) and the agent skill. Point it at the server:
-`pgbx status --host db.example.com --user postgres`.
+On Windows you get the pgbx CLI, `pgbx.exe` (in `%LOCALAPPDATA%\pgbx\bin`, added to your user PATH), and the
+agent skill; the extension itself always runs on the Linux database server.
 
 </TabItem>
 </Tabs>
+
+`setup client` saves a profile named `prod` (the default if it is your first), then tests it: it connects
+(through an SSH tunnel when you gave `--ssh`), and prints the Postgres version, the pgbx extension version and a
+backup status summary. If something is missing it prints the one next step, for example "extension not found:
+on the server run the install line and `sudo pgbx setup server`". Passwords are never stored in the profile:
+put them in `~/.pgpass`. Finally it offers to install the agent skill. After that, every command takes
+`--profile prod`, or uses the default: `pgbx status`.
 
 ## Requirements
 
@@ -64,7 +91,7 @@ says so (`pgbx's extension supports PostgreSQL 13–18; found N`).
    installs it; as root it skips it (run `pgbx skill install` as your user). Remove with `pgbx skill uninstall`.
 5. Never edits `postgresql.conf` and never restarts anything.
 
-`sudo pgbx setup` then writes **one** drop-in, `<config dir>/conf.d/pgbx.conf`, with `shared_preload_libraries`
+`sudo pgbx setup server` then writes **one** drop-in, `<config dir>/conf.d/pgbx.conf`, with `shared_preload_libraries`
 **merged** with what the server already loads, and the `pgbx.s3_*` / `server_name` / `credentials_file`
 settings; and the S3 credentials file (`/etc/pgbx/s3.credentials`, mode 0600, owned by `postgres`). Keys are
 read from environment variables (default `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or name others with
@@ -74,7 +101,7 @@ it only shows the plan. If `postgresql.conf` does not include `conf.d`, `--yes` 
 creates the extension in every database within seconds.
 
 ```sh
-sudo AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… pgbx setup --yes \
+sudo AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… pgbx setup server --yes \
   --s3-endpoint https://s3.eu-central-1.amazonaws.com --s3-bucket my-backups --s3-region eu-central-1 \
   --server-name db-prod-1
 ```
@@ -105,7 +132,7 @@ sudo install -m 644 pgbx-ext-pg16-linux-amd64/extension/* "$(pg_config --sharedi
 tar xzf pgbx-linux-amd64.tar.gz && sudo install -m 755 pgbx-linux-amd64/pgbx /usr/local/bin/
 ```
 
-Or configure by hand instead of `pgbx setup`: a credentials file readable by `postgres` only
+Or configure by hand instead of `pgbx setup server`: a credentials file readable by `postgres` only
 (`access_key_id=…` and `secret_access_key=…` lines), and in `postgresql.conf` or a `conf.d` file:
 
 ```ini

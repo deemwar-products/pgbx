@@ -65,7 +65,7 @@ pgbx query "SELECT now()" --profile prod  # later commands reuse it
                └─ kept open by a small background pgbx helper; closes after 10 minutes unused
 ```
 
-Commands that need the machine itself (`doctor`, `logs`, `diagnose`, `setup`) run there as
+Commands that need the machine itself (`doctor`, `logs`, `diagnose`, `setup server`) run there as
 `ssh ops@db... pgbx <command> --json`, so the server needs the pgbx CLI too (the install one-liner puts it
 there). `pgbx tunnel list` shows open tunnels; `pgbx tunnel close prod` closes one.
 
