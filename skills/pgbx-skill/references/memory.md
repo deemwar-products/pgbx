@@ -109,3 +109,24 @@ rm "${PGBX_MEMORY_DIR:-$HOME/pgbx}/<connection>/<db>/memories.md"   # tables.md 
 **Common errors:** the name matches more than one section → list them and ask which.
 
 **User-visible formatting:** "Removed 'orders today' from ~/pgbx/prod/shop/memories.md."
+
+---
+
+### MEM-W-4: Move memory to another machine or connection
+
+**When to use:** "export the memory", "take my notes to the new laptop", "copy prod's memory to staging".
+
+**Command:**
+```bash
+pgbx memories export --profile <connection> --json            # -> pgbx-memories-<connection>.json (add --db D for one database)
+pgbx memories import pgbx-memories-prod.json --as staging --json   # into another connection name
+```
+
+**Expected response:** export: `file`, `databases[]`, `files`. Import: `written[]`, `unchanged[]`, `conflicts[]`.
+Files that differ locally are kept and listed in `conflicts`; `ok` is false then.
+
+**Common errors:** conflicts → show the user which files differ and ask before re-running with `--overwrite`
+(that replaces their local edits; never add it on your own). "no memories under …" → nothing to export.
+
+**User-visible formatting:** "Exported 3 files (shop, crm) to pgbx-memories-prod.json." /
+"Imported 2 files into ~/pgbx/staging/; kept your edited shop/memories.md (use --overwrite to replace it)."

@@ -54,6 +54,17 @@ download links. They are your files: edit them by hand, keep them in git, or del
 | `PGBX_MEMORY_DIR` | `~/pgbx` | where the per-database folders live |
 | `PGBX_MEMORY` | `on` | `off`: the agent neither reads nor writes memory |
 
+Move memory between machines or connections:
+
+```sh
+pgbx memories export --profile prod                 # -> pgbx-memories-prod.json (one database: --db shop)
+pgbx memories import pgbx-memories-prod.json        # on the other machine
+pgbx memories import pgbx-memories-prod.json --as staging   # under another connection name
+```
+
+Import never replaces a file you edited locally: it lists it under `conflicts` and keeps yours, unless you add
+`--overwrite`. `pgbx memories path` prints where a connection's memory lives.
+
 ## Safety tiers
 
 | tier | examples | agent rule |

@@ -57,6 +57,9 @@ Every `--json` reply is one object with at least:
 | `verify-schedule TEXT\|never [--yes]` | safe / guarded (`never`) | `database`, result |
 | `skill install [--no-codex] \| uninstall \| where` | safe | `version`, `installed_to`, `files` / `removed`, `skipped` |
 | `query "SQL" [--db D] [--max-rows 1000] [--timeout 30s]` | readonly | `columns[]` (`name, type`), `rows[]`, `row_count`, `truncated`, `database`, `user` |
+| `memories export [FILE\|-] [--db D]` | readonly | `file`, `connection`, `databases[]`, `files`; one JSON bundle of `~/pgbx/<connection>/<db>/{memories,tables}.md` |
+| `memories import FILE [--as C] [--overwrite]` | safe | `written[]`, `unchanged[]`, `conflicts[]` (differing local files are kept unless `--overwrite`) |
+| `memories path` | readonly | `root`, `connection`, `dir` |
 | `tunnel [open]` / `tunnel list` / `tunnel close NAME\|--all` | readonly | `local_port`, `connect`, `tunnel` / `tunnels[]` / `closed[]` |
 | `profile add NAME [flags]` | safe | `profile` (`name, default, settings`), `replaced`, `file` |
 | `profile list` / `profile show NAME` | readonly | `default`, `profiles[]` / `profile` |

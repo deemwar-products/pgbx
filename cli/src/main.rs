@@ -8,6 +8,7 @@
 //!   guarded     pause, lowering retention, narrowing scope, verify-schedule never — require --yes
 
 mod diagnose;
+mod memories;
 mod policy;
 mod profile;
 mod query;
@@ -32,16 +33,16 @@ const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill"];
+const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite"];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
     "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "ssh", "ssh-port",
-    "ssh-jump", "tunnel-idle", "max-rows", "serve",
+    "ssh-jump", "tunnel-idle", "max-rows", "serve", "as",
 ];
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
-    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel",
+    "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel", "memories",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -145,6 +146,10 @@ profiles (one per server; never stores passwords or S3 keys):
                          --tunnel-idle 10m]   (the first profile becomes the default)
   pgbx profile list | show NAME | remove NAME | use NAME          (use = set the default)
   --profile NAME or PGBX_PROFILE on any command; precedence: flag > PGHOST/PGPORT/PGUSER > profile > default
+agent memory (${PGBX_MEMORY_DIR:-~/pgbx}/<connection>/<db>/memories.md + tables.md; connection = profile):
+  pgbx memories export [FILE | -] [--db D]    one JSON bundle (default pgbx-memories-<connection>.json)
+  pgbx memories import FILE [--as CONNECTION] [--overwrite]   differing local files are kept unless --overwrite
+  pgbx memories path                          where this connection's memory lives
 agent skill:
   pgbx skill install [--no-codex] | uninstall | where
 read queries (one statement, inside BEGIN READ ONLY, then ROLLBACK):
@@ -175,6 +180,7 @@ pub fn level(cmd: &str, a: &Args) -> Level {
         "now" | "verify" | "db-restore" | "resume" | "link" | "skill" => Level::Safe,
         "setup" if a.pos.first().map(String::as_str) == Some("client") => Level::Safe,
         "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "remove" | "use")) => Level::Safe,
+        "memories" if a.pos.first().map(String::as_str) == Some("import") => Level::Safe,
         "schedule" if shows => Level::ReadOnly,
         "schedule" => Level::Safe,
         "retention" | "scope" if shows => Level::ReadOnly,
@@ -570,6 +576,7 @@ fn main() {
     let r = match cmd.as_str() {
         _ if prof.is_err() => Err(prof.clone().unwrap_err()),
         "profile" => profile::run_sys(&cx.a),
+        "memories" => memories::run_sys(&cx.a, prof.clone().ok().flatten()),
         c if tunnel::runs_remotely(c, &cx.a) => tunnel::run_remote(c, &cx.a),
         "query" => query::run(&mut cx),
         "tunnel" => tunnel::run(&cx.a, cx.a.get("profile")),
