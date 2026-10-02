@@ -20,7 +20,8 @@ wait_up() { local ok=0; for _ in $(seq 240); do
   if P -c "SELECT 1" >/dev/null 2>&1; then ok=$((ok+1)); [ $ok -ge 3 ] && return 0; else ok=0; fi; sleep 1; done; return 1; }
 start() { # image extension-name
   docker rm -f "$C" >/dev/null 2>&1
-  docker run -d --name "$C" -e POSTGRES_PASSWORD=test-only-not-secret -v "$VOL":/var/lib/postgresql/data \
+  # PGDATA: postgres:18+ images default elsewhere; one layout for 13-18 (as in compose.test.yml)
+  docker run -d --name "$C" -e POSTGRES_PASSWORD=test-only-not-secret -e PGDATA=/var/lib/postgresql/data -v "$VOL":/var/lib/postgresql/data \
     -v "$PWD/test.credentials":/etc/$2/s3.credentials:ro "$1" postgres \
     -c shared_preload_libraries=$2 -c $2.s3_endpoint="$S3_ENDPOINT" -c $2.s3_bucket="$S3_BUCKET" \
     -c $2.s3_region="$S3_REGION" -c $2.server_name="$SERVER" \
