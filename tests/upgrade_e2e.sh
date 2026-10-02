@@ -61,7 +61,11 @@ check "template1 updated at worker start" "$(ver template1)" "$want"
 P -c "CREATE DATABASE born" >/dev/null
 check "a new database is born at $want" "$(ver born)" "$want"
 
-if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
+pg_major() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n 's/^PG_MAJOR=//p'; }
+if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1 && [ "$(pg_major "$PREV")" != "$(pg_major "$NEW")" ]; then
+  # one data directory is started by both images: they must be the same PostgreSQL major
+  echo "## 2. skipped: $PREV is PostgreSQL $(pg_major "$PREV"), $NEW is $(pg_major "$NEW") (tests/pitr_e2e.sh section 6 compares the 0.5.0 -> 0.6.0 catalog on any major)"
+elif [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
   echo "## 2. previous release ($PREV) -> $want: the update script"
   cleanup; start "$PREV" pgbx || { echo "previous server not up"; exit 1; }
   for _ in $(seq 60); do [ -n "$(ver postgres)" ] && break; sleep 2; done

@@ -6,13 +6,38 @@ use crate::{one, s3restore, s3x, Args, Ctx, Out};
 use serde_json::json;
 use std::path::PathBuf;
 
+/// The background push / prefetch processes are detached: once the archive_command or restore_command that started
+/// them exits, they are reparented to PID 1, which in a container is often the postmaster. The postmaster takes an
+/// unknown child that dies by a signal or with an exit code above 1 for a crashed backend and restarts the server, so
+/// these processes must only ever end with exit code 0 or 1: SIGTERM / SIGINT / SIGHUP exit 1, a panic exits 1.
+fn orphan_safe() {
+    #[cfg(unix)]
+    {
+        extern "C" fn quit(_: libc::c_int) {
+            unsafe { libc::_exit(1) };
+        }
+        let h = quit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGTERM, h);
+            libc::signal(libc::SIGINT, h);
+            libc::signal(libc::SIGHUP, h);
+        }
+    }
+    std::panic::set_hook(Box::new(|_| std::process::exit(1)));
+}
+
+fn daemon<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err("panicked".into()))
+}
+
 /// archive_command: exit 0 = archived (or deliberately dropped under wal_queue_max), non-zero = Postgres retries.
 pub fn wal_push_main(a: &Args) -> i32 {
     let conf = wal::conf_path(a.get("conf"));
     let r = wal::load_conf(&conf).and_then(|c| {
         let p = a.pos.first().ok_or("usage: pgbx wal-push <%p> [--conf FILE]")?;
         if a.has("async-daemon") {
-            wal::push_daemon(&c, p).map(|_| String::new())
+            orphan_safe();
+            daemon(|| wal::push_daemon(&c, p)).map(|_| String::new())
         } else {
             wal::wal_push(&c, p)
         }
@@ -47,7 +72,8 @@ pub fn wal_get_main(a: &Args) -> i32 {
         }
     };
     if a.has("prefetch-daemon") {
-        let _ = wal::prefetch_daemon(&c, name);
+        orphan_safe();
+        let _ = daemon(|| wal::prefetch_daemon(&c, name));
         return 0;
     }
     match wal::wal_get(&c, name, dest) {

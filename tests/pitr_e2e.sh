@@ -212,12 +212,28 @@ else
   echo "  SKIP upgrade check: no pgbx--0.5.0.sql in $OLD"
 fi
 
-echo "## 7. shutdown while a base backup runs"
+echo "## 7. a base backup is a job: pgbx jobs shows it, cancel stops it, shutdown does not wait for it"
 P -c "CREATE TABLE big AS SELECT g, md5(g::text) m FROM generate_series(1,3000000) g" >/dev/null
+nbb() { X pgbx pitr list --conf $CONF --json | grep -o '"label":"[0-9TZ]*"' | sort -u | wc -l | tr -d ' '; }
+n0=$(nbb)
+id=$(P -c "SELECT pgbx.pitr_backup_now()")
+for _ in $(seq 60); do [ "$(P -c "SELECT state FROM pgbx.history WHERE id=$id")" = running ] && break; sleep 0.2; done
+docker stop "$S3" >/dev/null   # its upload now waits on S3, so it is still running however fast this machine is
+check "pgbx jobs lists the running base backup" "$(X pgbx jobs --json | grep -o '"kind":"base_backup"[^}]*"state":"running"' | wc -l | tr -d ' ')" 1
+r=$(X pgbx jobs cancel "$id" --yes --json)
+for _ in $(seq 60); do s=$(P -c "SELECT state FROM pgbx.history WHERE id=$id"); [ "$s" = cancelled ] && break; sleep 0.5; done
+check "pgbx jobs cancel stops a running base backup (S3 not answering)" "$s" cancelled
+[ "$s" = cancelled ] || P -c "SELECT state, error, params FROM pgbx.history WHERE id=$id"
+docker start "$S3" >/dev/null; for _ in $(seq 30); do [ -n "$(nbb 2>/dev/null)" ] && [ "$(nbb)" -ge 1 ] && break; sleep 1; done
+check "the cancelled base backup never became one (no new backup.json in S3)" "$(nbb)" "$n0"
 P -c "SELECT pgbx.pitr_backup_now()" >/dev/null
 for _ in $(seq 30); do [ "$(P -c "SELECT count(*) FROM pgbx.history WHERE kind='base_backup' AND state='running'")" = 1 ] && break; sleep 0.5; done
 t0=$(date +%s); docker stop -t 60 "$DB" >/dev/null; took=$(( $(date +%s) - t0 ))
 check "Postgres stopped within 10 s during a base backup (${took}s)" "$([ $took -lt 10 ] && echo yes || echo no)" yes
+# a killed base backup must never leave pg_basebackup to the postmaster (PID 1 here): an unknown child that dies by a
+# signal makes it restart the whole server
+check "no server process died by a signal in the whole run (no crash restart)" "$(docker logs "$DB" 2>&1 | grep -c 'terminated by signal')" 0
+check "clean shutdown" "$(docker logs "$DB" 2>&1 | tail -3 | grep -c 'database system is shut down')" 1
 
 echo "== pitr_e2e PG $PG: $pass passed, $fail failed"
 [ $fail -eq 0 ]

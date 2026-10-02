@@ -3,15 +3,18 @@
 # Measures, and compares with pgBackRest installed in the same container for the benchmark only (it is never part of
 # pgbx; it talks to the same S3 through a TLS proxy because it speaks only https to S3):
 #   a. wal-push latency per 16 MB segment, sync, p50/p99 over N segments          (pgBackRest archive-push, sync)
-#   b. archiving throughput: pgbench writes with archiving blocked, then archive_command is switched on and the
-#      backlog drains through async wal-push (parallel look-ahead) -> segments/s   (pgBackRest archive-push async)
+#   b. archiving throughput: pgbench (-i, then a timed run) writes with archiving blocked, then archive_command is
+#      switched on and the backlog drains through async wal-push (parallel look-ahead) -> segments/s
+#                                                                                   (pgBackRest archive-push async)
 #   c. wal-get replay rate: N sequential restore_command calls, prefetch off vs on   (pgBackRest archive-get async)
 #   d. base backup + point-in-time restore of a ~2 GB database: backup, restore (download + verify + unpack), then
 #      recovery replays WAL to the latest moment and promotes; rows checked        (pgBackRest full backup / restore)
 # Prints numbers; misses are reported, not hidden. N=${N:-200} segments, SIZE_ROWS=${SIZE_ROWS:-14000000},
-# PGBENCH_SECS=${PGBENCH_SECS:-60}. Needs ~10 GB of free Docker disk. IMAGE (pgbx:test).
+# PGBENCH_SCALE=${PGBENCH_SCALE:-150} (pgbench -i: ~2.5 GB of WAL), PGBENCH_SECS=${PGBENCH_SECS:-30}. Needs ~12 GB of
+# free Docker disk. IMAGE (pgbx:test).
 set -u
-PG=${PG_MAJOR:-16}; IMAGE=${PITR_IMAGE:-pgbx:test}; N=${N:-200}; ROWS=${SIZE_ROWS:-14000000}; PBS=${PGBENCH_SECS:-60}
+PG=${PG_MAJOR:-16}; IMAGE=${PITR_IMAGE:-pgbx:test}; N=${N:-200}; ROWS=${SIZE_ROWS:-14000000}; PBS=${PGBENCH_SECS:-30}
+SCALE=${PGBENCH_SCALE:-150}
 NET=pgbx-pitr-bench-net; S3=pgbx-pitr-bench-s3; DB=pgbx-pitr-bench-db; TLS=pgbx-pitr-bench-tls; BIN=/usr/lib/postgresql/$PG/bin
 DATA=/var/lib/postgresql/data; CONF=/var/lib/postgresql/pgbx/pgbx-wal.conf
 P() { docker exec -u postgres "$DB" psql -v ON_ERROR_STOP=1 -qAt "$@"; }
@@ -32,10 +35,11 @@ docker run -d --rm --name "$DB" --network "$NET" -e POSTGRES_PASSWORD=test-only-
   sh -c 'mkdir -p /etc/pgbx && cp /etc/pgbx/s3.credentials.src /etc/pgbx/s3.credentials && chown postgres /etc/pgbx/s3.credentials && chmod 600 /etc/pgbx/s3.credentials && exec docker-entrypoint.sh "$@"' -- \
   postgres -c shared_preload_libraries=pgbx -c "pgbx.s3_endpoint=http://$S3:9000" -c pgbx.s3_bucket=pitr -c pgbx.server_name=bench \
   -c pgbx.credentials_file=/etc/pgbx/s3.credentials -c pgbx.poll_seconds=2 -c archive_mode=on \
-  -c "archive_command=/usr/local/bin/pgbx wal-push %p" -c pgbx.pitr=on -c pgbx.pitr_schedule='0 0 1 1 *' -c max_wal_size=8GB \
-  -c pgbx.wal_queue_max=off >/dev/null
+  -c pgbx.pitr=on -c pgbx.pitr_schedule='0 0 1 1 *' -c max_wal_size=16GB -c pgbx.wal_queue_max=off >/dev/null
 for _ in $(seq 120); do docker logs "$DB" 2>&1 | grep -q "init process complete" && break; sleep 1; done
 for _ in $(seq 60); do P -c "SELECT 1" >/dev/null 2>&1 && break; sleep 1; done
+# archive_command by ALTER SYSTEM, not -c: a command-line setting would outrank the switches in b.
+P -c "ALTER SYSTEM SET archive_command = '/usr/local/bin/pgbx wal-push %p'" -c "SELECT pg_reload_conf()" >/dev/null
 for _ in $(seq 60); do X test -f $CONF && break; sleep 1; done
 # the first base backup (queued at enable) must not overlap the measurements
 for _ in $(seq 300); do [ "$(P -c "SELECT count(*) FROM pgbx.history WHERE kind='base_backup' AND state IN ('queued','running')")" = 0 ] && break; sleep 1; done
@@ -101,6 +105,7 @@ fi
 drain() { # label archive_command -> generate a backlog with pgbench, switch archiving on, time the drain
   P -c "ALTER SYSTEM SET archive_command = '/bin/false'" -c "SELECT pg_reload_conf()" >/dev/null; sleep 2
   local c0 t0 tps n c1 secs
+  XS "pgbench -i -q -s $SCALE bench >/dev/null 2>&1"   # bulk load: most of the backlog
   tps=$(XS "pgbench -n -c 8 -j 4 -T $PBS bench 2>/dev/null | grep -o 'tps = [0-9.]*' | head -1")
   P -c "SELECT pg_switch_wal()" >/dev/null; sleep 1
   n=$(ready); c0=$(P -c "SELECT archived_count FROM pg_stat_archiver")
@@ -108,16 +113,16 @@ drain() { # label archive_command -> generate a backlog with pgbench, switch arc
   P -c "ALTER SYSTEM SET archive_command = '$2'" -c "SELECT pg_reload_conf()" >/dev/null
   for _ in $(seq 1800); do [ "$(ready)" = 0 ] && break; sleep 0.2; done
   secs=$(since "$t0"); c1=$(P -c "SELECT archived_count FROM pg_stat_archiver")
-  echo "  $1: pgbench ($PBS s, 8 clients, $tps) left a backlog of $n segments ($((n*16)) MB); drained $((c1-c0)) in $secs s =" \
+  echo "  $1: pgbench -i -s $SCALE + $PBS s of 8 clients ($tps) left a backlog of $n segments ($((n*16)) MB); drained $((c1-c0)) in $secs s =" \
        "$(awk -v n="$((c1-c0))" -v s="$secs" 'BEGIN{printf "%.1f segments/s (%.0f MB/s)", n/s, n*16/s}'); failed_count $(P -c "SELECT failed_count FROM pg_stat_archiver")"
 }
 echo "## b. archiving throughput: a pgbench backlog drained by the archiver (target >= 50 segments/s)"
 P -c "CREATE DATABASE bench" >/dev/null
 for _ in $(seq 30); do P -d bench -c "SELECT pgbx.pause('pitr bench: no per-database dumps during measurements')" >/dev/null 2>&1 && break; sleep 1; done
-XS "pgbench -i -q -s 20 bench >/dev/null 2>&1"
 drain "pgbx wal-push (async, process_max 4)" "/usr/local/bin/pgbx wal-push %p"
 [ $have_pgbr = 1 ] && drain "pgBackRest archive-push (async, process-max 4)" "$PGBR --archive-async archive-push %p"
 P -c "ALTER SYSTEM SET archive_command = '/usr/local/bin/pgbx wal-push %p'" -c "SELECT pg_reload_conf()" >/dev/null
+P -c "DROP DATABASE bench" >/dev/null   # disk: section d wants a ~2 GB server, not 2 GB more of pgbench tables
 
 echo "## c. wal-get replay: $N sequential restore_command calls"
 for pf in 0 16; do

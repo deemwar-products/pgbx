@@ -168,6 +168,18 @@ fn stop_all(s: &mut Sched) {
         drain_logs();
         std::thread::sleep(Duration::from_millis(100));
     }
+    // a child its thread has not reaped yet (the thread is stuck in an S3 request) must not outlive us unreaped:
+    // reparented to the postmaster (PID 1 in a container), a child that died by a signal looks like a crashed backend
+    for r in &s.running {
+        let pid = r.ctl.pid.load(Ordering::Relaxed);
+        // WNOHANG first: 0 = still our running child (kill it, then reap), pid = reaped now, -1 = not ours any more
+        if pid > 0 && unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+    }
     drain_logs();
 }
 

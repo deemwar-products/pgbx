@@ -17,7 +17,7 @@ trap '[ "${S3DOWN_KEEP:-0}" = 1 ] || cleanup' EXIT
 cleanup
 echo "== s3down_e2e image $IMAGE (S3 endpoint: a black hole)"
 # 10.255.255.1 is not routed: TCP connects hang until their timeout, the worst case for anything waiting on S3
-docker run -d --rm --name "$C" -e POSTGRES_PASSWORD=test-only-not-secret -e PGDATA=/var/lib/postgresql/data "$IMAGE" \
+docker run -d --name "$C" -e POSTGRES_PASSWORD=test-only-not-secret -e PGDATA=/var/lib/postgresql/data "$IMAGE" \
   sh -c 'mkdir -p /etc/pgbx && printf "access_key_id=x\nsecret_access_key=y\n" > /etc/pgbx/s3.credentials &&
          chown postgres /etc/pgbx/s3.credentials && chmod 600 /etc/pgbx/s3.credentials && exec docker-entrypoint.sh "$@"' -- \
   postgres -c shared_preload_libraries=pgbx -c pgbx.s3_endpoint=http://10.255.255.1:9000 -c pgbx.s3_bucket=none \
@@ -50,6 +50,8 @@ check "cancel stops the stuck backup (within the 60 s S3 request timeout)" "$s" 
 for _ in $(seq 20); do [ "$(P -c "SELECT count(*) FROM pgbx.server_queue WHERE state='running'")" -ge 1 ] && break; sleep 1; done
 t0=$(date +%s); docker stop -t 60 "$C" >/dev/null; took=$(( $(date +%s) - t0 ))
 check "Postgres stopped within 10 s while a backup waits on S3 (${took}s)" "$([ $took -lt 10 ] && echo yes || echo no)" yes
+check "no server process died by a signal (no crash restart)" "$(docker logs "$C" 2>&1 | grep -c 'terminated by signal')" 0
+check "clean shutdown" "$(docker logs "$C" 2>&1 | tail -3 | grep -c 'database system is shut down')" 1
 
 echo "== s3down_e2e: $pass passed, $fail failed"
 [ $fail -eq 0 ]

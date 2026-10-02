@@ -406,6 +406,35 @@ fn pg_tool(c: &Conf, name: &str) -> PathBuf {
 
 /// Take a base backup: pg_basebackup -D - -Ft -X none (server verifies page checksums) -> sha256 -> zstd
 /// (multi-threaded) -> parallel multipart upload; then backup.json; then expire.
+/// pg_basebackup must never outlive this process unreaped: in a container Postgres often runs as PID 1, an orphan is
+/// reparented to the postmaster, and the postmaster treats an unknown child that died by a signal (pg_basebackup
+/// gets SIGPIPE once we are gone) as a crashed backend: it restarts the whole server. So when the worker stops this
+/// process (cancel, shutdown: SIGTERM), stop pg_basebackup and reap it before exiting.
+#[cfg(unix)]
+fn reap_on_term(pid: u32) {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static CHILD: AtomicI32 = AtomicI32::new(0);
+    extern "C" fn on_term(_: libc::c_int) {
+        // async-signal-safe only: kill, waitpid, _exit
+        let pid = CHILD.load(Ordering::SeqCst);
+        unsafe {
+            if pid > 0 {
+                libc::kill(pid, libc::SIGTERM);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            libc::_exit(1);
+        }
+    }
+    CHILD.store(pid as i32, Ordering::SeqCst);
+    let h = on_term as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGINT, h);
+    }
+}
+#[cfg(not(unix))]
+fn reap_on_term(_pid: u32) {}
+
 pub fn base_backup(c: &Conf, expire_after: bool) -> Result<Value, String> {
     let mut pg = postgres::Config::new();
     pg.host(&c.socket_dir).port(c.port).user("postgres").dbname("postgres").application_name("pgbx pitr");
@@ -443,6 +472,7 @@ pub fn base_backup(c: &Conf, expire_after: bool) -> Result<Value, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("start pg_basebackup: {e}"))?;
+    reap_on_term(child.id());
     let stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let errt = std::thread::spawn(move || {
