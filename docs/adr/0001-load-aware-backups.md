@@ -60,10 +60,13 @@ worker schedules **across** databases instead of draining them one by one:
 4. **Coalescing.** At most one queued backup per database: `backup_now()` while one is queued returns that job's id
    (and upgrades its priority to manual) instead of adding another. Same for `verify_now()`. Restores never coalesce.
 5. **Overrun policy** `pgbx.overrun_policy` = `skip` (default) | `catch_up`. `skip`: slots missed while a dump of
-   that database was running are dropped and the next run is the next cron slot **after the previous dump
-   finished**, measured from `finished` not `requested_at`; history records `params.skipped_slots`. `catch_up` is
-   today's behaviour. `doctor()` warns `dump_longer_than_interval` when the last 3 dumps ran longer than the schedule
-   interval, with the suggested longer schedule as `fix`.
+   that database was running are dropped; the next run is the next cron slot after the dump **finished**
+   (history records `params.skipped_slots`). Guard against the skip making the gap too big: if waiting for that
+   slot would leave more than `pgbx.overrun_max_gap` × interval (default **1.5**) since the last good backup's
+   start, it runs once right away instead. So hourly + 70-min dump → next run at the next hour (no back-to-back);
+   daily dump that overran past 02:00 → it doesn't wait until tomorrow. `catch_up` = today's behaviour.
+   `doctor()` warns `dump_longer_than_interval` when the last 3 dumps ran longer than the interval, with the
+   suggested longer schedule as `fix`.
 6. **Same database, two jobs.** Never two dumps of one DB at once. A restore/verify of DB X may run while X is
    being dumped (different target DB). A dump of the database a restore is writing into is skipped (it is not live).
 7. **Cancel.** `pgbx.cancel(job_id)`: `queued` → `cancelled`; `running` → SIGTERM the child, aborts the S3 upload
@@ -95,7 +98,9 @@ The worker tags its own children `application_name=pgbx_dump`/`pgbx_restore` (PG
 - **Human-requested jobs** (`backup_now()`, `restore()`, `verify_now()`): **warn, don't block.** The SQL function
   runs the same sample synchronously and raises a `NOTICE` ("12 active sessions, 900 tps — this will compete with
   the app; it starts now"); the job runs immediately. CLI prints the same warning and asks `--yes` when interactive.
-- Gate state: `pgbx.load_gate = off | shadow | on` (default `off`). `shadow` evaluates and records
+- Gate state: `pgbx.load_gate = off | shadow | on` (default `shadow`, owner decision 2026-10-02). Clients see it
+  in `pgbx status` / `pgbx load` (last sample, `would_defer` count per job, top busy reasons) and enable it with
+  `pgbx configure --load-gate on` or `SELECT pgbx.configure(load_gate => 'on')`. `shadow` evaluates and records
   `params.would_defer` but never delays.
 
 ### 2. Quiet-window suggestion (learned, never auto-applied)
@@ -113,8 +118,9 @@ The worker tags its own children `application_name=pgbx_dump`/`pgbx_restore` (PG
   differ by > 2×), excluding windows already used by other databases' backups on this server to spread load.
   `confidence = 'low'` until ≥ 7 days of samples.
 - CLI: `pgbx schedule suggest [--db X]` prints the table plus the one-liner
-  `SELECT pgbx.configure(schedule => '30 4 * * *');`. `--apply` runs it (explicit opt-in). The worker never changes
-  `pgbx.config.schedule` itself.
+  `SELECT pgbx.configure(schedule => '30 4 * * *');` ready to copy; `--apply` runs it after a y/N prompt. The worker
+  never changes `pgbx.config.schedule` itself (owner decision 2026-10-02: never auto-apply, always show, user executes).
+  The web UI (`cli/src/ui.rs`) shows the suggestion with an Apply button that runs the same call.
 - `doctor()` adds a check `schedule_in_quiet_window`: warns when the current schedule's hour scores > 3× the
   suggested window, with the configure() call as `fix`.
 
@@ -155,7 +161,7 @@ the server value is a ceiling where noted.
 | GUC | default | range | per-DB override | why this default is safe |
 |---|---|---|---|---|
 | **gate** | | | | |
-| `pgbx.load_gate` | `off` | off/shadow/on | `config.load_gate` | today's behaviour until shadow data proves thresholds |
+| `pgbx.load_gate` | `shadow` | off/shadow/on | `config.load_gate` | records what it would defer, never delays; teams turn `on` themselves |
 | `pgbx.busy_active_backends` | 4 | 0-10000 (0 = ignore) | yes | small servers rarely exceed 4 non-idle sessions when quiet |
 | `pgbx.busy_tps` | 200 | 0-10^7 (0 = ignore) | yes | |
 | `pgbx.busy_long_xact` | 30s | 0-1h (0 = ignore) | no | don't stack on a migration |
@@ -169,7 +175,6 @@ the server value is a ceiling where noted.
 | `pgbx.activity_sampling` | on | on/off | yes | one stats read per tick |
 | `pgbx.activity_decay` | 0.9 | 0.5-0.99 | no | adapts in ~2 weeks |
 | `pgbx.suggest_min_days` | 7 | 1-90 | no | below it, confidence = low |
-| `pgbx.suggest_auto_apply` | off | off/on | yes | never moves your schedule unless you say so |
 | `pgbx.doctor_busy_ratio` | 3.0 | 1-100 | no | when doctor warns "busy hour" |
 | **resource caps** | | | | |
 | `pgbx.job_nice` | 10 | 0-19 | no | lower than the app, never higher |
@@ -177,6 +182,7 @@ the server value is a ceiling where noted.
 | `pgbx.max_concurrent_jobs` | 1 | 1-8 | no | today's behaviour, now enforced by advisory lock |
 | `pgbx.restore_lane` | on | on/off | no | restores never wait behind a dump |
 | `pgbx.overrun_policy` | skip | skip/catch_up | yes | no back-to-back dumps |
+| `pgbx.overrun_max_gap` | 1.5 | 1.0-10 (× interval) | yes | skipping never stretches RPO by more than half an interval |
 | `pgbx.coalesce_manual` | on | on/off | no | spamming backup_now() costs one dump |
 | `pgbx.dump_compression` | `auto` (exists) | | no | |
 | `pgbx.dump_compression_busy` | `zstd:1` / gzip 1 | | no | cheaper when forced under load |
