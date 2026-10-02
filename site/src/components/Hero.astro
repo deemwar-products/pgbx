@@ -15,6 +15,12 @@ const trust = [
 	'Tested on Postgres 13–18',
 	'MIT licensed',
 ];
+const asks = [
+	{ you: 'Is my database backed up?', cmd: 'pgbx status --json' },
+	{ you: "Why did last night's backup fail?", cmd: 'pgbx doctor --json' },
+	{ you: "Restore yesterday's copy of shop so I can check it", cmd: 'pgbx db-restore --db shop --into shop_check --time 2026-10-01T23:00:00Z' },
+	{ you: 'How many orders came in today?', cmd: `pgbx query "SELECT count(*) FROM orders WHERE created_at > now() - interval '1 day'"` },
+];
 ---
 
 <div class="product-hero">
@@ -41,6 +47,24 @@ const trust = [
 		<ul class="trust">
 			{trust.map((t) => <li>{t}</li>)}
 		</ul>
+		<div class="agent" id="agents">
+			<h2>Or let your AI agent look after it</h2>
+			<p>
+				pgbx comes with a skill for Claude Code and Codex. Ask in plain words; the agent runs the matching
+				<code>pgbx</code> command on your server, over SSH, without a shell. Every command has a
+				<a href={`${base}/concepts/safety-tiers/`}>safety level</a>: anything that pauses backups or deletes old ones
+				is refused unless you say yes, and no command ever overwrites a live database.
+			</p>
+			<ul class="asks">
+				{asks.map((a) => (
+					<li>
+						<span class="you">“{a.you}”</span>
+						<code>{a.cmd}</code>
+					</li>
+				))}
+			</ul>
+			<p class="skill">Add it with <code>pgbx skill install</code> (the installer offers it too).</p>
+		</div>
 	</section>
 </div>
 
@@ -146,6 +170,49 @@ const trust = [
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.4rem 0.5rem;
+	}
+	.agent {
+		margin-top: 2.25rem;
+		padding-top: 1.5rem;
+		border-top: 1px solid var(--sl-color-gray-5);
+	}
+	.agent h2 {
+		font-size: var(--sl-text-h4);
+		margin: 0 0 0.5rem;
+	}
+	.agent p {
+		color: var(--sl-color-gray-2);
+		margin: 0;
+	}
+	.asks {
+		list-style: none;
+		padding: 0;
+		margin: 1rem 0 0;
+		display: grid;
+		gap: 0.6rem;
+	}
+	.asks li {
+		margin: 0;
+		display: grid;
+		gap: 0.25rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 0.5rem;
+		padding: 0.6rem 0.875rem;
+		background: var(--sl-color-gray-6);
+	}
+	.you {
+		color: var(--sl-color-white);
+	}
+	.asks code {
+		background: none;
+		padding: 0;
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-accent-high);
+		overflow-x: auto;
+		white-space: nowrap;
+	}
+	.agent .skill {
+		margin-top: 0.875rem;
 	}
 	.trust li {
 		margin: 0;
