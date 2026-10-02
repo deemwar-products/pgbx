@@ -31,6 +31,10 @@ last_error, paused_reason, queued_jobs, location`.
 | `paused` | automatic backups stopped | manual still work; tell the human if > 1 h; POL-R-4 resume is safe if stale |
 | `worker error` (overview) | worker can't reach that db | quote `last_error` |
 
+No extension on the server: `{ok: true, backups: "off", status: null, info: "pgbx extension not installed on this
+server: backups are off; ..."}`. Say "Not backed up by pgbx: the extension is not installed on this server" and
+give the optional `next_steps` line once. Other routes that only read (STAT-R-7, memory) still work.
+
 **Common errors:**
 - "… run in database …" (admin database) → `overview()` only in the admin database (`postgres`).
 - "permission denied for schema pgbx" → caller needs `pgbx_viewer`.

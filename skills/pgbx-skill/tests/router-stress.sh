@@ -33,7 +33,7 @@ for rt in routes:
 for p, ids in owner.items():
     if len(ids) > 1: bad(f"phrase '{p}' claimed by {sorted(ids)}")
 expected = [rt.get("id") for rt in routes]
-for need in ["status","backup","backup-before-deploy","restore-db","disaster-restore","verify","policy","data-scope","download-link","troubleshoot","diagnose","audit-ui"]:
+for need in ["status","query","backup","backup-before-deploy","restore-db","disaster-restore","verify","policy","data-scope","download-link","troubleshoot","diagnose","audit-ui"]:
     if need not in expected: bad(f"missing route {need}")
 def route(text):
     t = text.lower(); best = None
@@ -63,6 +63,10 @@ corpus = [
     ("who paused backups last week?", "audit-ui"),
     ("open the audit ui", "audit-ui"),
     ("pgbx ui", "audit-ui"),
+    ("how big is the database?", "query"),
+    ("run a select on orders", "query"),
+    ("query the database through the jump host", "query"),
+    ("connect over ssh and count the users", "query"),
     ("remember this as orders today", "memory"),
     ("save this query as daily signups", "memory"),
     ("note the tables", "memory"),

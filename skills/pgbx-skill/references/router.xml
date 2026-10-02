@@ -1,7 +1,8 @@
 <activation-routing skill="pgbx-skill" version="1.0">
 
   <defaults>
-    <rule>Always run step-00-preflight.md first — verifies `pgbx` is on PATH and runs `pgbx doctor --json`. No mutation may run before this.</rule>
+    <rule>Always run step-00-preflight.md first — verifies `pgbx` is on PATH and picks the profile; backup routes also run `pgbx doctor --json`. No mutation may run before this.</rule>
+    <rule>Read-only questions (route query, memory) need NO doctor and NO pgbx extension: pgbx is a plain Postgres client too. A reply with `backups: "off"` is normal, not an error.</rule>
     <rule>Use this file as the intent router. Family files (status.md, backup.md, …) hold recipes; step files hold cross-cutting flows.</rule>
     <rule>Always pass `--json`. With SQL fallback use `psql -XAtq` and single-row statements.</rule>
     <rule>Safety tiers in workflow.md decide whether you act, ask, or require explicit approval. Destructive gates are enforced in code; never bypass them.</rule>
@@ -16,11 +17,20 @@
   <routes>
 
     <route id="status" mode="read-only">
-      <when>is postgres backed up, is it backed up, backup status, are backups working, last backup, list backups, show backups, when was the last backup, pgbx status, pgbx list, how big is the database, table sizes, how many connections, run a select, query the database, pgbx query</when>
+      <when>is postgres backed up, is it backed up, backup status, are backups working, last backup, list backups, show backups, when was the last backup, pgbx status, pgbx list</when>
       <goal>Answer "are we backed up?" in one line per database, from status JSON.</goal>
       <steps>
         <step ref="steps/step-00-preflight.md">Confirm pgbx; run doctor.</step>
         <step ref="status.md">STAT recipes.</step>
+      </steps>
+    </route>
+
+    <route id="query" mode="read-only">
+      <when>how big is the database, table sizes, how many connections, run a select, run a query, query the database, how many rows, show me the tables, which tables, connect to the database, connect over ssh, through the jump host, via the bastion, postgres client, pgbx query</when>
+      <goal>Answer a read question with `pgbx query` JSON through the profile (ssh tunnel included); works without the pgbx extension.</goal>
+      <steps>
+        <step ref="steps/step-00-preflight.md">Pick the profile; read the database memory. No doctor.</step>
+        <step ref="status.md">STAT-R-7.</step>
       </steps>
     </route>
 

@@ -1,6 +1,6 @@
 ---
 name: pgbx-skill
-description: "Zero-touch PostgreSQL backups to S3 via `pgbx` (pgbx): status, backup now, restore a database (also from S3 onto a new server), verify, schedule, retention. Trigger: is postgres backed up, take a backup, backup before deploy, restore the db, restore on a new server, backup failing, postgres is down, disk full, wal growing, pgbx."
+description: "Zero-touch PostgreSQL backups to S3 via `pgbx` (pgbx), and a plain Postgres client without them: read queries as JSON over SSH/jump-host profiles, per-database memory, status, backup now, restore a database (also from S3 onto a new server), verify, schedule, retention. Trigger: query the database, run a select, connect over ssh, is postgres backed up, take a backup, backup before deploy, restore the db, restore on a new server, backup failing, postgres is down, disk full, wal growing, pgbx."
 ---
 
 <!-- version: 0.5.0 -->
@@ -10,6 +10,9 @@ description: "Zero-touch PostgreSQL backups to S3 via `pgbx` (pgbx): status, bac
 A natural-language front door for pgbx, the PostgreSQL extension that backs
 every database up to S3 with no setup per database. `pgbx` is the engine; this
 skill owns intent routing and recipe knowledge.
+
+pgbx is also a plain Postgres client: profiles, SSH tunnels, `pgbx query` and the per-database memory work
+against ANY Postgres, with or without the extension. Many users never turn backups on.
 
 ## Core Rules
 
@@ -26,6 +29,11 @@ skill owns intent routing and recipe knowledge.
   or any shell command; never try to get around `pgbx query`'s SELECT-only guard.
 - **Discover before acting.** Run `pgbx status --json` / `pgbx doctor --json`
   (step-00) before any mutation. A `failing` database fails the next backup too.
+  Read-only questions (`pgbx query`, memory, profiles) skip doctor: pick the profile and ask.
+- **No extension is fine.** `backups: "off"` (status, setup client) or the `backups (pgbx extension)` info check
+  (doctor) means pgbx is a client on that server: answer read questions normally and do not push installing it.
+  Only a backup route (backup, restore from pgbx, verify, policy) needs it — then say backups are off on this
+  server and give the optional step from `next_steps` once.
 - **Never print credentials.** S3 keys live in `pgbx.credentials_file`
   (or `sec`). Read setting NAMES only; never `cat` the file or echo a key.
   `download_url()` output is a bearer link: use it, never paste it into chat.
@@ -52,6 +60,7 @@ and are written only when the user asks.
 
 ```
 pgbx_available:   true | false      # from step-00
+backups:          on | off           # off = no extension on this server: client use only, read routes still work
 profile:          prod               # from `pgbx profile list --json`; --profile on every call
 target_db:        myapp             # database the user means
 admin_db:         postgres          # pgbx.admin_db, for overview()/doctor()
@@ -63,7 +72,8 @@ memory_dir:       ~/pgbx/prod/myapp # ${PGBX_MEMORY_DIR:-~/pgbx}/<profile>/<db>;
 
 1. Read `references/router.xml` first — it routes the user's phrase to a route
    and lists the steps + family reference for it.
-2. Run `references/steps/step-00-preflight.md` (pgbx on PATH, `pgbx profile list --json`, `pgbx doctor --json`).
+2. Run `references/steps/step-00-preflight.md` (pgbx on PATH, `pgbx profile list --json`; `pgbx doctor --json`
+   only for backup routes — a read query needs no doctor and no extension).
 3. Read `references/workflow.md` for invariants, the safety tiers and failure handling.
 4. Follow the route's step file, if any:
    - Backup before deploy → `references/steps/step-01-backup-before-deploy.md`
@@ -85,7 +95,7 @@ Runs:
 
 | Family | Covers | Reference |
 |---|---|---|
-| Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries | `references/status.md` |
+| Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries (STAT-R-7, also with no extension) | `references/status.md` |
 | Backup | backup now, wait, backup id | `references/backup.md` |
 | Restore | db into a new database, from S3 onto a new server | `references/restore.md` |
 | Verify | restore tests, verify schedule, failures | `references/verify.md` |

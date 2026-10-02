@@ -30,6 +30,8 @@ pgbx profile list --json
 - **No profiles** — use the flags/env the user gave (`PGHOST` etc.); offer
   `pgbx setup client <name> --host H --port P --user U --yes --json` (safe, no sudo: saves the profile and tests
   it — connection, extension version, status — with `next_steps` on failure; never put a password or S3 key in it).
+  `ok: true` with `test.backups: "off"` is success: the server has no pgbx extension, so pgbx works as a client
+  there (queries, tunnels, memory). Its `next_steps` entry starts with "optional"; mention it once, do not insist.
   A server reachable only over SSH: `pgbx setup client <name> --ssh user@host [--ssh-port N] [--ssh-jump J] --yes --json`
   — pgbx starts the tunnel with the system ssh and reuses it; you never run `ssh` yourself.
   `pgbx tunnel list --json` shows open tunnels; `pgbx tunnel close <name>` closes one.
@@ -37,7 +39,10 @@ pgbx profile list --json
 Set `profile` in session context and pass `--profile <name>` on **every** later `pgbx` call
 (recipes show commands without it — add it). Check `profile_used` in each reply matches.
 
-## Health
+## Health (backup routes only)
+
+Skip this section for read-only questions — `pgbx query` (STAT-R-7), memory, profiles, tunnels. They need
+neither doctor nor the pgbx extension.
 
 ```bash
 pgbx doctor --json
@@ -51,6 +56,7 @@ Stop on unhealthy and give the plain-language fix, e.g.:
 | extension not preloaded | "Add `pgbx` to `shared_preload_libraries` and restart Postgres." |
 | S3 unreachable / auth failed | "Postgres can't write to the bucket. Check `pgbx.s3_endpoint`/`s3_bucket` and the credentials file (I won't read it)." |
 | `archive_mode` info row | "pgbx does not need `archive_mode`; leave it unless nothing else uses it." (info only) |
+| info `backups (pgbx extension)` (or status `backups: "off"`) | "This server has no pgbx extension, so backups are off; I can still query it." Set `backups=off`; read routes continue, backup routes stop here with the optional `next_steps` line. |
 | Postgres not reachable | "Postgres is down — only the CLI can help; see step-04 (or step-03 if the server is lost)." |
 
 Read-only intents may continue past warnings; mutations may not continue past failures.
