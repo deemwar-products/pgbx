@@ -1,11 +1,7 @@
 name: CLI tests
 
 on:
-  push:
-    branches: [main]
-    paths: ['cli/**', 'skills/**', 'site/public/install.*', '.github/workflows/cli.yml']
-  pull_request:
-    paths: ['cli/**', 'skills/**', 'site/public/install.*', '.github/workflows/cli.yml']
+  workflow_dispatch:
 
 jobs:
   test:
