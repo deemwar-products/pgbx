@@ -199,8 +199,8 @@ capped() { # id -> "<state> <MiB/s>" once finished
 within() { awk -v r="${1#* }" -v s="${1%% *}" 'BEGIN { print (s == "done" && r >= 1.8 && r <= 2.2) ? "yes" : "no (" s ", " r " MiB/s)" }'; }
 r=$(capped "$(P -d big -c "SELECT pgbx.backup_now()")"); echo "  backup: $r MiB/s"; check "upload at 2 MiB/s ±10%" "$(within "$r")" yes
 id=$(P -d big -c "SELECT pgbx.restore(into_db => 'big_capped')")
-# the pg_restore: nice / IO class / synchronous_commit=off (its env) / connection tag
-caps=$(docker compose -f compose.test.yml exec -T db sh -c 'for _ in $(seq 300); do for p in /proc/[0-9]*; do
+# the pg_restore: nice / IO class / synchronous_commit=off (its env; readable only as its own user) / connection tag
+caps=$(docker compose -f compose.test.yml exec -T -u postgres db sh -c 'for _ in $(seq 300); do for p in /proc/[0-9]*; do
   [ "$(cat $p/comm 2>/dev/null)" = pg_restore ] && { echo "$(cut -d" " -f19 $p/stat)|$(ionice -p ${p#/proc/})|$(tr "\0" "\n" < $p/environ | grep ^PGOPTIONS=)"; exit 0; }; done; sleep 0.1; done')
 check "pg_restore runs at nice 10, best-effort 7, synchronous_commit=off" "$caps" "10|best-effort: prio 7|PGOPTIONS=-c synchronous_commit=off"
 for _ in $(seq 20); do n=$(P -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='pgbx_restore' AND datname='big_capped'"); [ "$n" = 1 ] && break; sleep 0.5; done
