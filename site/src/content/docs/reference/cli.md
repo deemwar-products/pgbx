@@ -4,7 +4,8 @@ description: Every pgbx command, its flags, JSON output and safety level.
 sidebar: { order: 3 }
 ---
 
-With Postgres up, `pgbx` calls the extension's SQL. With Postgres down, `pgbx diagnose` explains why, and
+The pgbx CLI is the client: it talks to one or more Postgres servers (see [How it works](../../concepts/how-it-works/)).
+With Postgres up, `pgbx` calls the pgbx extension's SQL. With Postgres down, `pgbx diagnose` explains why, and
 `pgbx backups --from-s3` / `pgbx db-restore --from-s3` read dumps straight from S3 (no extension needed).
 
 ## Common flags
@@ -12,6 +13,7 @@ With Postgres up, `pgbx` calls the extension's SQL. With Postgres down, `pgbx di
 | flag | default |
 |---|---|
 | `--json` | one JSON object on stdout |
+| `--profile NAME` | a saved server (see [Profiles](#profiles)); also `PGBX_PROFILE`; else the default profile |
 | `--db X` | the database to act on |
 | `--host` / `--port` / `--user` | `/var/run/postgresql`, `5432`, `postgres` (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` honoured) |
 | `--admin-db` | `postgres` |
@@ -54,6 +56,11 @@ Every `--json` reply is one object with at least:
 | `scope [--include P1,P2] [--exclude P1,P2] [--reset] [--yes]` | readonly / guarded | `database`, `data_scope` |
 | `verify-schedule TEXT\|never [--yes]` | safe / guarded (`never`) | `database`, result |
 | `skill install [--no-codex] \| uninstall \| where` | safe | `version`, `installed_to`, `files` / `removed`, `skipped` |
+| `query "SQL" [--db D] [--max-rows 1000] [--timeout 30s]` | readonly | `columns[]` (`name, type`), `rows[]`, `row_count`, `truncated`, `database`, `user` |
+| `tunnel [open]` / `tunnel list` / `tunnel close NAME\|--all` | readonly | `local_port`, `connect`, `tunnel` / `tunnels[]` / `closed[]` |
+| `profile add NAME [flags]` | safe | `profile` (`name, default, settings`), `replaced`, `file` |
+| `profile list` / `profile show NAME` | readonly | `default`, `profiles[]` / `profile` |
+| `profile remove NAME` / `profile use NAME` | safe | `removed` / `default` |
 | `--version` | — | `{"ok": true, "version": "..."}` |
 
 ## S3 flags (`--from-s3`)
@@ -69,3 +76,79 @@ Every `--json` reply is one object with at least:
 `db-restore --from-s3` creates `--into` (refusing if it exists) on the server given by `--host/--port/--user`,
 then streams the dump into `pg_restore --no-owner`, resuming downloads with HTTP Range.
 Example: [Disaster recovery](../../guides/disaster-recovery/).
+
+## Profiles
+
+A profile is a named server, so you do not retype `--host/--port/--user` and the S3 flags:
+
+```sh
+pgbx profile add prod --host db.prod.example.com --port 5432 --user ops --admin-db postgres \
+  --s3-endpoint https://s3.eu-central-1.amazonaws.com --s3-bucket my-backups --s3-region eu-central-1 \
+  --server-name db-prod-1 --credentials-file ~/.config/pgbx/prod.credentials
+pgbx profile add local --host localhost
+pgbx profile use prod            # the default when no --profile is given (the first profile added is the default)
+pgbx status --profile local --db shop
+PGBX_PROFILE=local pgbx list --db shop
+pgbx profile list --json
+pgbx profile remove local
+```
+
+- Fields: `host`, `port`, `user`, `admin-db`, `s3-endpoint`, `s3-bucket`, `s3-region`, `server-name`,
+  `credentials-file`, `ssh`, `ssh-port`, `ssh-jump`, `tunnel-idle` (each is also a flag). `add` on an existing
+  name replaces it.
+- Precedence for each value: **flag > environment** (`PGHOST`, `PGPORT`, `PGUSER`) **> profile > built-in
+  default**. With no profile saved and none asked for, behaviour is unchanged.
+- Chosen by `--profile NAME`, else `PGBX_PROFILE`, else the default. Every `--json` reply then carries
+  `profile_used`. An unknown name is an error, never a silent fallback.
+- Stored in `~/.config/pgbx/profiles.json` (`$XDG_CONFIG_HOME/pgbx`; `%APPDATA%\pgbx` on Windows;
+  `PGBX_CONFIG_DIR` overrides), mode 0600.
+- **Never stores passwords or S3 keys.** Passwords: `~/.pgpass` or `PGPASSWORD`. S3 keys: the
+  `--credentials-file` (only its path is saved).
+
+## SSH (`--ssh`)
+
+| flag / profile field | meaning |
+|---|---|
+| `--ssh user@host` | reach the server through SSH (a `~/.ssh/config` Host name works too) |
+| `--ssh-port N`, `--ssh-jump J` | `ssh -p`, `ssh -J` |
+| `--tunnel-idle 10m` | close the shared tunnel after this long unused (`30s`, `10m`, `1h`) |
+| `--host`, `--port` | where Postgres listens **as seen from the SSH host** (default `localhost:5432`) |
+
+- Uses the system `ssh` (OpenSSH, also on Windows) with `BatchMode=yes`: keys, agent, `~/.ssh/config` and
+  ProxyJump are ssh's; pgbx never handles a key or a password prompt.
+- Postgres commands go through `ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L
+  127.0.0.1:<free port>:<pg host>:<pg port>`, owned by a detached pgbx helper. Later commands for the same
+  profile reuse it (the helper is alive and the port answers) and refresh its idle timer; otherwise a new one
+  starts. A lock file stops two commands starting two. State: `~/.cache/pgbx/tunnels/<profile>.json`
+  (`$XDG_CACHE_HOME`; `%LOCALAPPDATA%\pgbx\tunnels` on Windows; `PGBX_STATE_DIR` overrides), mode 0600.
+- `pgbx tunnel` opens (or reuses) the tunnel and prints the local port, for psql or a GUI.
+  `pgbx tunnel list` / `close NAME` / `close --all`.
+- `doctor`, `logs`, `diagnose` and `setup` run on the host: `ssh target pgbx <command> ... --json` (setup as
+  `sudo -n`), output and exit code relayed, plus `remote`. If pgbx is not installed there, the error gives the
+  install one-liner.
+- `PGBX_SSH` names another ssh binary or wrapper (the test suite uses it to add `-F config`).
+
+## `pgbx query`
+
+```sh
+pgbx query "SELECT datname, pg_database_size(datname) AS bytes FROM pg_database" --json
+```
+
+Checks, in order: exactly **one** statement; it starts with `SELECT`, `WITH`, `TABLE`, `VALUES`, `SHOW` or
+`EXPLAIN` (not `EXPLAIN ANALYZE`); no `INSERT`/`UPDATE`/`DELETE`/`MERGE` anywhere (so no data-modifying
+`WITH`), no `SELECT ... INTO`, no `FOR UPDATE`/`FOR SHARE`; no known side-effect functions
+(`pg_terminate_backend`, `pg_cancel_backend`, `pg_reload_conf`, `set_config`, `nextval`, `setval`,
+`pg_advisory*lock*`, `lo_*`, `dblink*`, `pg_switch_wal`, `txid_current`, `pg_sleep`, ...), and no `pgbx.*`
+function except the read ones (`status`, `overview`, `doctor`, `rowless_tables`, `to_cron`, `next_run_epoch`).
+Then it runs inside `BEGIN READ ONLY` with `SET LOCAL statement_timeout` (`--timeout`, default 30s) and
+`lock_timeout` (at most 5s), and always `ROLLBACK`s.
+
+Rows: numbers, booleans and nulls typed, JSON nested, everything else text (`SHOW`/`EXPLAIN`: all text);
+at most `--max-rows` (default 1000), `truncated: true` when there were more.
+
+:::caution
+This is a **best-effort guard for agents, not a security boundary**. A word-level check can be fooled, and
+`READ ONLY` does not stop every function with side effects. For a hard guarantee connect as a role that can
+only read (for example one granted `pg_read_all_data`); creating it is up to you, pgbx never creates roles.
+A keyword used as a quoted column name (`"update"`) is refused too.
+:::

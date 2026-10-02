@@ -1,7 +1,7 @@
 ---
 title: Data scope
 description: Which tables keep their rows in a per-database backup.
-sidebar: { order: 3 }
+sidebar: { order: 4 }
 ---
 
 Every table **definition** is always backed up, so a restore never misses a table.

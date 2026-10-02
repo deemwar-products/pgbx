@@ -1,7 +1,7 @@
 ---
 title: Safety tiers
 description: How pgbx and the agent skill classify every action.
-sidebar: { order: 5 }
+sidebar: { order: 6 }
 ---
 
 Every `pgbx` command has a safety level. It is enforced in code and printed as `safety` in `--json` output: `readonly`, `safe`, `guarded` or `destructive`.
