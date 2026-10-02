@@ -68,7 +68,7 @@ pub fn route(method: &str, target: &str) -> Route {
     }
 }
 
-fn query_param<'a>(q: &'a str, k: &str) -> Option<&'a str> {
+pub fn query_param<'a>(q: &'a str, k: &str) -> Option<&'a str> {
     q.split('&').find_map(|kv| kv.split_once('=').filter(|(a, _)| *a == k).map(|(_, v)| v))
 }
 
@@ -141,15 +141,19 @@ pub fn ro_connect(cx: &Ctx, db: &str) -> Result<Client, String> {
     Ok(c)
 }
 
-fn admin(cx: &Ctx) -> Result<Client, String> {
+pub(crate) fn admin(cx: &Ctx) -> Result<Client, String> {
     ro_connect(cx, cx.admin_db.as_deref().unwrap_or("postgres"))
 }
 
 fn api_overview(cx: &Ctx) -> Result<Value, String> {
-    let mut c = admin(cx)?;
-    let who = one(&mut c, "SELECT current_user AS role, current_setting('default_transaction_read_only') AS read_only, \
+    overview_with(&mut admin(cx)?)
+}
+
+/// The overview from an open (read-only) admin connection; `pgbx serve` keeps that connection open.
+pub(crate) fn overview_with(c: &mut Client) -> Result<Value, String> {
+    let who = one(c, "SELECT current_user AS role, current_setting('default_transaction_read_only') AS read_only, \
                             now() AS server_time, current_setting('pgbx.server_name', true) AS server_name", &[])?;
-    Ok(json!({"ok": true, "connection": who, "databases": rows(&mut c, "SELECT * FROM pgbx.overview()", &[])?}))
+    Ok(json!({"ok": true, "connection": who, "databases": rows(c, "SELECT * FROM pgbx.overview()", &[])?}))
 }
 
 /// History rows with a display kind (download_url / scope are recorded as 'config').
@@ -167,7 +171,11 @@ fn history_sql(where_: &str) -> String {
 }
 
 fn api_db(cx: &Ctx, name: &str) -> Result<Value, String> {
-    let mut a = admin(cx)?;
+    db_with(&mut admin(cx)?, cx, name)
+}
+
+/// One database's status, suggestion, backups and history; `a` is an open admin connection.
+pub(crate) fn db_with(a: &mut Client, cx: &Ctx, name: &str) -> Result<Value, String> {
     let exists: bool = a.query_one("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1 AND datallowconn)", &[&name])
         .map_err(pe)?.get(0);
     if !exists {
@@ -205,20 +213,26 @@ fn api_timeline(cx: &Ctx, days: i32) -> Result<Value, String> {
 
 /// The server-wide job queue (what runs, what waits and why), as the worker last wrote it.
 fn api_queue(cx: &Ctx) -> Result<Value, String> {
-    let mut c = admin(cx)?;
-    let jobs = rows(&mut c, "SELECT database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail,
+    queue_with(&mut admin(cx)?)
+}
+
+pub(crate) fn queue_with(c: &mut Client) -> Result<Value, String> {
+    let jobs = rows(c, "SELECT database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail,
                                     progress, eta_start, eta_finish, est_bytes, done_bytes, seen_at
                              FROM pgbx.server_queue ORDER BY state IN ('running', 'cancelling') DESC, position NULLS LAST, requested_at", &[])?;
-    let slots = one(&mut c, "SELECT current_setting('pgbx.max_concurrent_jobs', true) AS max_concurrent_jobs,
+    let slots = one(c, "SELECT current_setting('pgbx.max_concurrent_jobs', true) AS max_concurrent_jobs,
                                     current_setting('pgbx.restore_lane', true) AS restore_lane", &[])?;
     Ok(json!({"ok": true, "jobs": jobs, "slots": slots}))
 }
 
 /// The load gate: last sample, settings, per-database counts (same data as `pgbx load`).
 fn api_load(cx: &Ctx) -> Result<Value, String> {
-    let mut c = admin(cx)?;
-    Ok(json!({"ok": true, "sample": one(&mut c, crate::load::LOAD_SQL, &[])?, "settings": one(&mut c, crate::load::SETTINGS_SQL, &[])?,
-              "databases": rows(&mut c, crate::load::DBS_SQL, &[])?}))
+    load_with(&mut admin(cx)?)
+}
+
+pub(crate) fn load_with(c: &mut Client) -> Result<Value, String> {
+    Ok(json!({"ok": true, "sample": one(c, crate::load::LOAD_SQL, &[])?, "settings": one(c, crate::load::SETTINGS_SQL, &[])?,
+              "databases": rows(c, crate::load::DBS_SQL, &[])?}))
 }
 
 fn api_health(cx: &Ctx) -> Result<Value, String> {
@@ -293,7 +307,7 @@ fn handle(mut s: TcpStream, cx: &Ctx, loopback: bool) {
 }
 
 /// Privilege check at startup (admin database, read-only connection).
-fn check_role(cx: &Ctx, strict: bool) -> Result<(String, Option<String>), String> {
+pub(crate) fn check_role(cx: &Ctx, strict: bool) -> Result<(String, Option<String>), String> {
     let mut c = admin(cx)?;
     let fns: Vec<String> = WRITE_FUNCTIONS.iter().map(|s| s.to_string()).collect();
     let r = c.query_one(
@@ -335,7 +349,7 @@ pub fn run(cx: &mut Ctx) -> Result<Value, String> {
     Ok(json!({"ok": true}))
 }
 
-fn clone_args(a: &Args) -> Args {
+pub(crate) fn clone_args(a: &Args) -> Args {
     Args { cmd: a.cmd.clone(), pos: a.pos.clone(), flags: a.flags.clone() }
 }
 

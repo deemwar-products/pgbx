@@ -148,6 +148,19 @@ pub fn apply_from_disk(a: &mut Args) -> Result<Option<String>, String> {
     }
 }
 
+/// The profile store on disk (`pgbx serve` lists it for its connection switcher).
+pub fn load_sys() -> Result<Store, String> {
+    load(&sys_env)
+}
+
+/// Args for one named profile, filled the same way `--profile NAME` fills a command's flags.
+pub fn args_for(name: &str, st: &Store) -> Result<Args, String> {
+    let mut a = Args { cmd: "serve".into(), ..Default::default() };
+    a.flags.insert("profile".into(), name.to_string());
+    apply(&mut a, st, &sys_env)?;
+    Ok(a)
+}
+
 fn show(name: &str, st: &Store) -> Value {
     json!({"name": name, "default": st.default.as_deref() == Some(name), "settings": st.profiles[name]})
 }
