@@ -71,6 +71,15 @@ out=$(J query "SELECT state FROM pgbx.status()" --db shop); check "query pgbx.st
 out=$(J query "SELECT pgbx.backup_now()" --db shop); rc=$?; refused "query pgbx.backup_now() refused" "$out" $rc 1 "side effects"
 out=$(J query "DELETE FROM pgbx.history" --db shop); rc=$?; refused "query DELETE refused" "$out" $rc 1 "SELECT-style"
 
+echo "## e. setup client against this server (direct)"
+SC() { $DC exec -T -u postgres -e PGBX_CONFIG_DIR=/tmp/pgbx-sc db pgbx setup client "$@" --json 2>/dev/null; }
+X rm -rf /tmp/pgbx-sc
+out=$(SC local --host /var/run/postgresql --user postgres --db shop --yes); rc=$?
+check "setup client: ok, extension found, status read" "$(jq1 "$out" .ok)|$rc|$(jq1 "$out" '.test.extension_version != null')|$(jq1 "$out" '.test.status.state != null')" "true|0|true|true"
+check "setup client: first profile is the default" "$(jq1 "$out" .profile.default)" true
+out=$(X pgbx setup --json 2>/dev/null); check "plain setup is the server alias" "$(jq1 "$out" .hint)" "same as pgbx setup server"
+X rm -rf /tmp/pgbx-sc
+
 echo "## h. agent skill"
 X sh -c 'rm -rf /tmp/skh; mkdir -p /tmp/skh/claude; ln -s /tmp /tmp/skh/claude/foreign'
 SK() { $DC exec -T -u postgres -e HOME=/tmp/skh -e CLAUDE_SKILLS_DIR=/tmp/skh/claude db pgbx skill "$@" --no-codex --json 2>/dev/null; }

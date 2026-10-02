@@ -28,8 +28,9 @@ pgbx profile list --json
 - **Several profiles, no default, or the user named a server** — match the user's words to a profile name or
   `settings.host`; if still ambiguous, **ask** which one (list the names). Never guess between servers.
 - **No profiles** — use the flags/env the user gave (`PGHOST` etc.); offer
-  `pgbx profile add <name> --host H --port P --user U` (safe; never put a password or S3 key in it).
-  A server reachable only over SSH: `pgbx profile add <name> --ssh user@host [--ssh-port N] [--ssh-jump J]`
+  `pgbx setup client <name> --host H --port P --user U --yes --json` (safe, no sudo: saves the profile and tests
+  it — connection, extension version, status — with `next_steps` on failure; never put a password or S3 key in it).
+  A server reachable only over SSH: `pgbx setup client <name> --ssh user@host [--ssh-port N] [--ssh-jump J] --yes --json`
   — pgbx starts the tunnel with the system ssh and reuses it; you never run `ssh` yourself.
   `pgbx tunnel list --json` shows open tunnels; `pgbx tunnel close <name>` closes one.
 

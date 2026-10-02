@@ -50,6 +50,36 @@ connects as a role that can only read.
 The skill runs `pgbx profile list --json` first, passes `--profile` on every call, uses `pgbx query --json`
 for read questions, and never runs `ssh`/`psql` itself.
 
+### 5. Setup is two commands: server and client
+- `pgbx setup server`: unchanged behaviour of the old `pgbx setup` (on the DB host, with sudo: S3 settings,
+  credentials file, `shared_preload_libraries` drop-in, prints the one restart command; guarded, `--yes`).
+  Plain `pgbx setup` still works and adds the hint `same as pgbx setup server` (stderr; `hint` in JSON).
+  With an ssh profile it runs on the host as `sudo -n pgbx setup server ...`.
+- `pgbx setup client [NAME]`: on the user's machine, no sudo. Asks (or takes `--host/--port` or
+  `--ssh/--ssh-port/--ssh-jump`, `--user`, `--db`, and optional `--s3-endpoint/--s3-bucket/--s3-region/
+  --server-name/--credentials-file`) — locations only, never secrets. Saves the profile through `profile add`
+  (default if first), then tests it: connect (tunnel when ssh), server version, `pgbx` extension version,
+  `pgbx.status()` summary. Each failure has one `next_steps` line (ssh, password → ~/.pgpass, unreachable,
+  extension missing → install one-liner + `sudo pgbx setup server`, failing backups → doctor/logs). `ok` is
+  true when connected and the extension is present. Offers `pgbx skill install` on a terminal (default yes;
+  `--no-skill`); skipped without a terminal. Non-interactive (no TTY or `--json`): flags only, and without
+  `--yes` it returns the plan and writes nothing.
+
+## pgbx help / CLI reference text (for the marketing branch to fold into site/)
+
+```
+setup (guarded: shows the plan; --yes writes):
+  pgbx setup server [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
+              --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
+  pgbx setup client [NAME] [--host H --port P | --ssh T [--ssh-port N --ssh-jump J]] [--user U] [--db D]
+              [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F] [--no-skill] [--yes]
+```
+
+| command | safety | output (besides ok/command/safety) |
+|---|---|---|
+| `setup server [...] [--yes]` (alias `setup`) | guarded | plan / written files, restart command; `hint` for the alias |
+| `setup client [NAME] [...] [--yes]` | safe | `profile`, `file`, `test` (`connected, postgres_version, user, extension_version, status`), `next_steps[]`, `skill`; without `--yes` (non-interactive): `plan` |
+
 ## Consequences
 
 - Agents can inspect remote servers with one binary and no shell access.

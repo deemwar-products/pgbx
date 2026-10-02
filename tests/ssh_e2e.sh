@@ -72,7 +72,17 @@ out=$(J query "SELECT pg_sleep(5)" --timeout 1s); check "pg_sleep refused" "$(jq
 out=$(J query "SELECT count(*) FROM generate_series(1,100000000)" --timeout 1s); check "statement_timeout applies" "$(jq1 "$out" .error | grep -c 'statement timeout')" 1
 check "nothing was written" "$(docker exec $PG psql -qAtU postgres -c 'SELECT count(*) FROM t')" 50
 
-echo "## c. host-side commands run over ssh"
+echo "## c. setup client (no sudo; writes a profile, then tests it)"
+out=$(J setup client viassh --ssh pgbxtest --host $PG --user postgres); check "without --yes: plan only" "$(jq1 "$out" .ok)|$(jq1 "$out" .plan.profile)|$(J profile list | jq '[.profiles[].name] | index("viassh")')" "false|viassh|null"
+out=$(J setup client viassh --ssh pgbxtest --host $PG --user postgres --yes); rc=$?
+check "over ssh: connects, no extension -> install hint, exit 1" "$(jq1 "$out" .test.connected)|$(jq1 "$out" .test.extension_version)|$rc" "true|null|1"
+check "next step names install.sh and setup server" "$(jq1 "$out" '.next_steps[0]' | grep -c 'install.sh.*pgbx setup server')" 1
+check "profile saved" "$(J profile show viassh | jq -r .profile.settings.ssh)" pgbxtest
+check "no terminal: skill not installed" "$(jq1 "$out" .skill.installed)" false
+out=$(J setup client bad --host 127.0.0.1 --port 1 --yes); check "unreachable: clear next step" "$(jq1 "$out" .ok)|$(jq1 "$out" '.next_steps[0]' | grep -c 'cannot reach')" "false|1"
+J profile remove viassh >/dev/null; J profile remove bad >/dev/null
+
+echo "## d. host-side commands run over ssh"
 out=$(J doctor); check "doctor on a host without pgbx: install hint" "$(jq1 "$out" .error | grep -c 'install.sh')" 1
 
 echo "RESULT: $pass passed, $fail failed"; [ $fail -eq 0 ]

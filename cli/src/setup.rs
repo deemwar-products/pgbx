@@ -123,7 +123,7 @@ pub fn restart_command(config_file: &str, data_dir: &str) -> String {
     format!("sudo -u postgres pg_ctl -D {data_dir} restart")
 }
 
-fn prompt(label: &str, default: Option<&str>) -> Result<String, String> {
+pub(crate) fn prompt(label: &str, default: Option<&str>) -> Result<String, String> {
     let d = default.filter(|d| !d.is_empty());
     eprint!("{label}{}: ", d.map(|d| format!(" [{d}]")).unwrap_or_default());
     let _ = std::io::stderr().flush();

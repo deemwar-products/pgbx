@@ -42,6 +42,7 @@ pub fn now() -> u64 {
 /// Commands that need the machine itself, not just a Postgres connection.
 pub fn runs_remotely(cmd: &str, a: &Args) -> bool {
     a.flags.contains_key("ssh") && matches!(cmd, "doctor" | "logs" | "diagnose" | "setup")
+        && !(cmd == "setup" && a.pos.first().map(String::as_str) == Some("client"))
 }
 
 /// `ssh` options shared by the tunnel and remote commands, ending with the target.
@@ -554,6 +555,8 @@ mod tests {
         assert!(runs_remotely("doctor", &p(&["doctor", "--ssh", "h"])));
         assert!(!runs_remotely("doctor", &p(&["doctor"])));
         assert!(!runs_remotely("status", &p(&["status", "--ssh", "h"])));
+        assert!(runs_remotely("setup", &p(&["setup", "server", "--ssh", "h"])));
+        assert!(!runs_remotely("setup", &p(&["setup", "client", "x", "--ssh", "h"])));
         let a = p(&["logs", "--ssh", "h", "--profile", "x", "--host", "y", "--lines", "5", "--log", "/var/log/a b.log", "--json"]);
         assert_eq!(remote_cmdline("logs", &a), "pgbx logs --lines 5 --log '/var/log/a b.log' --json");
         assert_eq!(remote_cmdline("setup", &p(&["setup", "--ssh", "h", "--yes"])), "sudo -n pgbx setup --yes --json");
