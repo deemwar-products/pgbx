@@ -3,7 +3,7 @@ name: Release
 # Manual only: Actions -> Release -> Run workflow with an existing tag vX.Y.Z -> builds every artifact below and publishes a GitHub Release with SHA256SUMS.
 #   pgbx-ext-pg<N>-linux-<arch>.tar.gz   extension: lib/<name>.so + extension/<name>.control + all sql (incl. upgrades)
 #   pgbx-linux-<arch>.tar.gz             CLI, static musl binary
-#   pgbx-darwin-arm64.tar.gz             CLI only (the extension is Linux-only)
+#   pgbx-darwin-<arch>.tar.gz            CLI only (the extension is Linux-only)
 #   pgbx-windows-<arch>.zip              CLI only, pgbx.exe
 # Asset names carry NO version, so installers use the stable redirect
 #   https://github.com/deemwar-products/pgbx/releases/latest/download/<asset>   (no API call, no rate limit)
@@ -79,8 +79,10 @@ jobs:
         include:
           - { os: linux, arch: amd64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl }
           - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-          - { os: darwin, arch: arm64, runner: macos-14, target: aarch64-apple-darwin }
-    runs-on: ${{ matrix.runner }}
+          # macOS builds run on our own Mac (self-hosted runner label pgbx-mac); Intel is cross-compiled there
+          - { os: darwin, arch: arm64, runner: pgbx-mac, target: aarch64-apple-darwin }
+          - { os: darwin, arch: amd64, runner: pgbx-mac, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.runner == 'pgbx-mac' && fromJSON('["self-hosted","pgbx-mac"]') || matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with: { ref: '${{ env.TAG }}' }
@@ -104,15 +106,15 @@ jobs:
         with: { name: 'cli-${{ matrix.os }}-${{ matrix.arch }}', path: 'dist/*.tar.gz' }
 
   cli-windows:
+    # cross-compiled on Linux with cargo-xwin (MSVC CRT + SDK); the real-Windows check is install-test on our VM
     name: pgbx windows-${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: amd64, runner: windows-latest, target: x86_64-pc-windows-msvc }
-          - { arch: arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
-    runs-on: ${{ matrix.runner }}
-    defaults: { run: { shell: pwsh } }
+          - { arch: amd64, target: x86_64-pc-windows-msvc }
+          - { arch: arm64, target: aarch64-pc-windows-msvc }
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with: { ref: '${{ env.TAG }}' }
@@ -120,16 +122,15 @@ jobs:
         with: { targets: '${{ matrix.target }}' }
       - name: Build
         run: |
-          cargo test --manifest-path cli/Cargo.toml
-          cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
-          $ver = "$env:TAG".TrimStart('v')
-          $name = "pgbx-windows-${{ matrix.arch }}"
-          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item "cli/target/${{ matrix.target }}/release/pgbx.exe" "dist/$name/"
-          if (Test-Path LICENSE) { Copy-Item LICENSE "dist/$name/" }
-          Set-Content -NoNewline "dist/$name/VERSION" $ver
-          & "dist/$name/pgbx.exe" --version
-          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          sudo apt-get update -qq && sudo apt-get install -y -qq clang lld llvm zip
+          cargo install --locked cargo-xwin
+          cargo xwin build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
+          NAME=pgbx-windows-${{ matrix.arch }}
+          mkdir -p "dist/$NAME"
+          cp cli/target/${{ matrix.target }}/release/pgbx.exe "dist/$NAME/"
+          cp LICENSE "dist/$NAME/" 2>/dev/null || true
+          printf '%s' "${TAG#v}" > "dist/$NAME/VERSION"
+          (cd "dist/$NAME" && zip -q "../$NAME.zip" *)
       - uses: actions/upload-artifact@v4
         with: { name: 'cli-windows-${{ matrix.arch }}', path: 'dist/*.zip' }
 

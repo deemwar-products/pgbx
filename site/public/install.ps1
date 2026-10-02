@@ -3,6 +3,7 @@
 #   powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"
 #   & ([scriptblock]::Create((irm https://deemwar-products.github.io/pgbx/install.ps1))) -Version v0.5.0 -NoSkill
 #
+# Env: PGBX_SKILL=no (or yes) skips the skill prompt for the one-liner.
 # Parameters: -Version vX.Y.Z (default latest) -Skill (install skill without asking) -NoSkill
 #             -InstallDir DIR (default %LOCALAPPDATA%\pgbx\bin) -BaseUrl URL (mirror/testing)
 # Downloads come from https://github.com/deemwar-products/pgbx/releases/latest/download/<asset> (no API call)
@@ -71,8 +72,12 @@ try {
     $env:Path = "$InstallDir;$env:Path"
 
     $doSkill = $true
-    if ($NoSkill) { $doSkill = $false }
-    elseif (-not $Skill -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+    # PGBX_SKILL=no|yes lets the `irm | iex` one-liner (which cannot take parameters) skip the prompt
+    if ($NoSkill -or $env:PGBX_SKILL -eq 'no') { $doSkill = $false }
+    elseif ($Skill -or $env:PGBX_SKILL -eq 'yes') { $doSkill = $true }
+    # never prompt without a real console (CI, -NonInteractive, piped): Read-Host would hang
+    elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and
+            -not ([Environment]::GetCommandLineArgs() -match '^-NonI') -and -not $env:CI) {
         $ans = Read-Host "Install the pgbx agent skill for Claude Code / Codex (~/.claude/skills/pgbx-skill)? [Y/n]"
         if ($ans -match '^[Nn]') { $doSkill = $false }
     }

@@ -62,7 +62,6 @@ case "$(uname -m)" in
   aarch64|arm64) ARCH=arm64 ;;
   *) die "unsupported CPU $(uname -m) (amd64 and arm64 only)" ;;
 esac
-[ "$OS" = darwin ] && [ "$ARCH" != arm64 ] && die "macOS builds are arm64 only"
 
 IS_ROOT=0
 [ "$(id -u)" = 0 ] && IS_ROOT=1

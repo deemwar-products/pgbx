@@ -8,8 +8,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14, windows-latest]
-    runs-on: ${{ matrix.os }}
+        # macOS on our own Mac; Windows is covered by the release cross-build + install-test on our VM
+        host: [ubuntu-24.04, pgbx-mac]
+    runs-on: ${{ matrix.host == 'pgbx-mac' && fromJSON('["self-hosted","pgbx-mac"]') || matrix.host }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

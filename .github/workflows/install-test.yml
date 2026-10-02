@@ -1,0 +1,61 @@
+name: Install test
+
+# Manual only: runs the real published one-liners against a release.
+# Linux on GitHub runners; macOS and Windows on our own machines (self-hosted pgbx-mac / pgbx-win).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'release to install, e.g. v0.5.0 (empty = latest)'
+        required: false
+
+env:
+  DOCS: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+  VER: ${{ github.event.inputs.version }}
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: |
+          set -eux
+          ARGS="--no-skill"; [ -z "$VER" ] || ARGS="$ARGS --version $VER"
+          curl -fsSL "$DOCS/install.sh" | sh -s -- $ARGS
+          pgbx --version
+
+  macos:
+    runs-on: [self-hosted, pgbx-mac]
+    steps:
+      - run: |
+          set -eux
+          P="$RUNNER_TEMP/pgbx-bin"; rm -rf "$P"
+          ARGS="--no-skill --prefix $P"; [ -z "$VER" ] || ARGS="$ARGS --version $VER"
+          curl -fsSL "$DOCS/install.sh" | sh -s -- $ARGS
+          "$P/pgbx" --version
+          # Intel build, under Rosetta (skipped when the release has no darwin-amd64 yet)
+          if curl -fsSL "$DOCS/install.sh" -o i.sh && arch -x86_64 /bin/sh i.sh $ARGS --prefix "$P-x64"; then
+            arch -x86_64 "$P-x64/pgbx" --version; file "$P-x64/pgbx"
+          else echo "::warning::darwin-amd64 not installable from this release"; fi
+
+  windows:
+    runs-on: [self-hosted, pgbx-win]
+    steps:
+      - name: PowerShell one-liner (irm | iex), as a user would paste it
+        shell: powershell
+        env: { PGBX_SKILL: 'no' }
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'pgbx-ps'
+          if ($env:VER) { $s = [scriptblock]::Create((irm "$env:DOCS/install.ps1")); & $s -NoSkill -Version $env:VER -InstallDir $d }
+          else { powershell -NoProfile -c "`$env:PGBX_SKILL='no'; & ([scriptblock]::Create((irm $env:DOCS/install.ps1))) -InstallDir '$d'" }
+          & "$d\pgbx.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: cmd one-liner (install.cmd)
+        shell: cmd
+        run: |
+          curl -fsSL %DOCS%/install.cmd -o "%RUNNER_TEMP%\install.cmd" || exit /b 1
+          call "%RUNNER_TEMP%\install.cmd" -NoSkill -InstallDir "%RUNNER_TEMP%\pgbx-cmd" || exit /b 1
+          "%RUNNER_TEMP%\pgbx-cmd\pgbx.exe" --version
