@@ -16,3 +16,6 @@ Screens: **Overview** (every database: state, schedule, last/next backup, last r
 - A role that could change backups gets a warning; `--strict` refuses to start. Use a viewer login:
   `CREATE ROLE pgbx_ui LOGIN PASSWORD '...' IN ROLE pgbx_viewer;`
 - Binds to 127.0.0.1 by default. Prefer an SSH tunnel over exposing it.
+
+For a fuller local app (restore helper, read-only queries, saved questions, optional safe actions) see
+[pgbx serve](../../reference/serve/).
