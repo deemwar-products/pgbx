@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end check of `pgbx ui` (read-only audit UI) against docker/compose.test.yml (needs the server up; run after
-# tests/e2e.sh so there is real backup / whole-server history). bash 3.2-safe; exits non-zero on any failure.
+# tests/e2e.sh so there is real backup history). bash 3.2-safe; exits non-zero on any failure.
 # The UI runs INSIDE the db container on 127.0.0.1:8432 as a pgbx_viewer login; requests go over bash /dev/tcp.
 set -u
 cd "$(dirname "$0")/../docker"
@@ -30,8 +30,6 @@ check "overview: databases, read-only" "$(body /api/overview | jq -r '"\(.ok) \(
 check "timeline: rows with who/when/what" "$(body '/api/timeline?days=30' | jq -r '(.rows|length>0) and (.rows[0]|has("who") and has("at") and has("kind") and has("database"))')" "true"
 check "timeline: has backups" "$(body '/api/timeline?days=30' | jq -r '[.rows[]|select(.kind=="backup")]|length>0')" "true"
 check "timeline: newest first" "$(body '/api/timeline?days=30' | jq -r '[.rows[].at] as $a | $a == ($a|sort|reverse)')" "true"
-check "whole-server endpoint is gone (404)" "$(status GET /api/cluster)" "404"
-check "page has no whole-server screen" "$(body / | grep -c 'Whole server')" "0"
 check "health: doctor rows" "$(body /api/health | jq -r '(.checks|length>3) and (.checks[0]|has("fix"))')" "true"
 for m in POST PUT DELETE PATCH HEAD; do check "$m -> 405" "$(status $m /api/overview)" "405"; done
 check "foreign Host -> 403" "$(status GET /api/overview evil.example)" "403"

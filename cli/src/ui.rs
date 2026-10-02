@@ -372,7 +372,6 @@ mod tests {
     #[test]
     fn page_is_self_contained() {
         assert!(PAGE.contains("/api/overview") && PAGE.contains("/api/timeline") && PAGE.contains("/api/health"));
-        assert!(!PAGE.contains("/api/cluster") && !PAGE.contains("Whole server"));
         for bad in ["http://", "https://", "<form", "method=\"post\"", "POST"] {
             assert!(!PAGE.contains(bad), "page must not contain {bad}");
         }

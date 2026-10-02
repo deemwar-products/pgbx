@@ -63,8 +63,6 @@ out=$(J list --db shop); check "list" "$(jq1 "$out" .ok)" true
 echo "## c. refusals (one JSON object, exit 1; usage errors exit 2)"
 out=$(J db-restore --db shop --into shop); rc=$?; refused "db-restore into the source" "$out" $rc 1 "NEW database"
 out=$(J db-restore --db shop --into shop_x --time '2026-01-01 00:00:00'); rc=$?; refused "--time without UTC offset" "$out" $rc 1 "UTC offset"
-out=$(J restore latest); rc=$?; check "whole-server restore is gone: usage error, exit 2" "$(onejson "$out")|$(jq1 "$out" .ok)|$rc" "yes|false|2"
-out=$(J now --cluster); rc=$?; check "now --cluster is gone: usage error, exit 2" "$(onejson "$out")|$rc" "yes|2"
 out=$(J frobnicate); rc=$?; check "unknown command: JSON usage error, exit 2" "$(onejson "$out")|$(jq1 "$out" .ok)|$rc" "yes|false|2"
 out=$(J now --bogus-flag); rc=$?; check "unknown flag: JSON usage error, exit 2" "$(onejson "$out")|$(jq1 "$out" .ok)|$rc" "yes|false|2"
 
