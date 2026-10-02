@@ -1,53 +1,38 @@
 ---
-title: pgbx
-description: Zero-touch Postgres backups to S3. Create a database. It's backed up.
+title: Never lose your app's database.
+description: Automatic Postgres backups for developers, not database admins. Every database saved nightly to your own storage bucket; restore with one command.
 template: splash
 hero:
-  tagline: "Create a database. It's backed up."
+  tagline: "Automatic Postgres backups for developers, not database admins. Install once, give it a storage bucket, done: every database is saved every night, new ones within a minute. Restore with one command, even onto a new server. Free, open source, no account."
   actions:
-    - text: Get started
+    - text: Install guide
       link: getting-started/install/
       icon: right-arrow
-    - text: SQL reference
-      link: reference/sql/
+    - text: View on GitHub
+      link: https://github.com/deemwar-products/pgbx
+      icon: external
       variant: minimal
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
 <CardGrid>
-  <Card title="Zero touch" icon="rocket">
-    The extension lives in `template1`. Every new database gets a schema, a default schedule
-    (daily at 02:00, keep 14 backups, max 90 days) and a first backup within a minute.
+  <Card title="Nothing to remember" icon="rocket">
+    No cron jobs, no backup scripts. Databases you create later are picked up on their own and
+    backed up within a minute. Each one is kept for 14 days by default.
   </Card>
-  <Card title="Restore into a new name" icon="random">
-    Restore one database into a new name with SQL. Server gone? `pgbx db-restore --from-s3`
-    restores straight from S3 onto a fresh server, no extension needed.
+  <Card title="Any S3 storage" icon="seti:folder">
+    AWS S3, Cloudflare R2, Hetzner, Backblaze B2, MinIO: anything that speaks S3. Your backups sit
+    in your bucket, under your account.
   </Card>
-  <Card title="Works when Postgres is down" icon="setting">
-    `pgbx` is a standalone CLI. It restores from S3 directly, diagnoses why Postgres will not start,
-    and speaks `--json` for scripts and AI agents.
+  <Card title="Getting data back" icon="random">
+    `pgbx db-restore` brings a database back as a new copy, so you can check it before switching.
+    Server gone? It restores straight from your bucket onto a fresh one.
+  </Card>
+  <Card title="Tells you what's wrong" icon="setting">
+    `pgbx status` shows every database and its last backup. `pgbx doctor` explains a failed backup,
+    or why Postgres won't start, in plain words.
   </Card>
 </CardGrid>
 
-## Quick start
-
-```ini
-# postgresql.conf (one restart)
-shared_preload_libraries     = 'pgbx'
-pgbx.s3_endpoint      = 'https://hel1.your-objectstorage.com'
-pgbx.s3_bucket        = 'my-backups'
-pgbx.s3_region        = 'hel1'
-pgbx.server_name      = 'db-prod-1'
-pgbx.credentials_file = '/etc/pgbx/s3.credentials'
-```
-
-```sql
-CREATE DATABASE myapp;                          -- backed up within a minute
-\c myapp
-SELECT * FROM pgbx.status();             -- state, schedule, last + next backup
-SELECT pgbx.backup_now();                -- returns a job id
-SELECT pgbx.restore(into_db => 'myapp_restored', at => '2026-10-01 09:00');
-```
-
-Next: [install the extension](getting-started/install/), then [take your first backup](getting-started/first-backup/).
+New to this? Start with [install](getting-started/install/), then [your first backup](getting-started/first-backup/).

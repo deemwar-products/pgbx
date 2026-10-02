@@ -1,5 +1,5 @@
 /**
- * What this docs site is, for the splash canvas and the theme.
+ * The docs site theme.
  * Doc pages do not read this. The agent skill `docs-product-skin` does.
  *
  * Dark mode paints the primary button and the current sidebar item with
@@ -9,8 +9,6 @@
  */
 export const product = {
 	id: 'pgbx',
-	sentence:
-		'A database is created, pgbx backs it up to S3, and a restore comes back under a new name even if Postgres is down.',
 	colors: {
 		dark: {
 			low: 'hsl(26, 28%, 12%)',
@@ -43,24 +41,6 @@ export const product = {
 		signal: '#dea768',
 		inkLight: '#5c5148',
 		signalLight: '#8a4e1c',
-	},
-	/**
-	 * 0–1 inside the small canvas on the right of the splash, not the
-	 * whole hero. Keep labels inset so they are not clipped.
-	 */
-	architecture: {
-		nodes: [
-			{ id: 'pg', label: 'Postgres (pgbx inside)', x: 0.38, y: 0.5, labelAt: 'above', labelAlign: 'right' },
-			{ id: 's3', label: 'S3', x: 0.58, y: 0.28, labelAt: 'above' },
-			{ id: 'cli', label: 'CLI', x: 0.58, y: 0.76, labelAt: 'below' },
-			{ id: 'name', label: 'new name', x: 0.86, y: 0.42, labelAt: 'below' },
-		],
-		edges: [
-			{ from: 'pg', to: 's3', label: 'backs up' },
-			{ from: 's3', to: 'name', label: 'SQL' },
-			{ from: 's3', to: 'cli', label: 'server down' },
-			{ from: 'cli', to: 'name', label: 'restore' },
-		],
 	},
 } as const;
 

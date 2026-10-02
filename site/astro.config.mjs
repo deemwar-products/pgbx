@@ -13,7 +13,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'pgbx',
-      description: "Create a database. It's backed up. Zero-touch Postgres backups to S3.",
+      description: "Never lose your app's database. Automatic Postgres backups to your own S3 bucket.",
       components: {
         Head: './src/components/ProductHead.astro',
         Hero: './src/components/Hero.astro',
