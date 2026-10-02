@@ -29,12 +29,45 @@ How it works today (branch `load-aware-backups`, base `main`):
   (`src/worker.rs:633-657`); `verify` uses the same path (`:680`).
 - pg_dump takes `ACCESS SHARE` locks on every table for the whole dump. It does not block app reads/writes, but a
   queued `ALTER TABLE` behind it blocks everything behind *that* — the real way a backup "hurts" an app.
-- Status surfaces: `pgbx.server_overview` rows written by `publish_overview()` (`src/worker.rs:401`) and
-  `pgbx.doctor()` (`src/lib.rs:492`). There is no `pgbx.status()` function yet.
+- Status surfaces: `pgbx.server_overview` rows written by `publish_overview()` (`src/worker.rs:401`),
+  `pgbx.status()` (`src/lib.rs:248`) and `pgbx.doctor()` (`src/lib.rs:492`).
+- **One worker per server, one queue per database.** The extension is installed in every database (own `pgbx`
+  schema, `config`, `history`), but there is exactly one worker for the whole server. `pgbx.history` rows with
+  `state='queued'` are each database's queue; the worker drains them database by database in name order.
+  Consequences today: (a) a restore asked for in `zeta` waits for every queued job in `alpha`..`yotta` first
+  (head-of-line blocking); (b) a backup can't be double-queued by the schedule (`pending()`, `src/worker.rs:269`),
+  but missed cron slots during a long dump collapse into one catch-up that starts **immediately** after
+  (`is_due` on `max(requested_at)`, `src/worker.rs:251-266`), so an hourly schedule with 70-min dumps dumps
+  non-stop; (c) `backup_now()` (`src/lib.rs`) is not deduplicated — five calls queue five dumps.
 
 ## Decision
 
 Three mechanisms, all inside the existing worker, all off-by-default until the rollout below finishes.
+
+### 0. One server-wide job queue (prerequisite for the gate and caps)
+
+Keep `pgbx.history` in each database as the source of truth (teams see their own jobs; restores copy it), but the
+worker schedules **across** databases instead of draining them one by one:
+
+1. Each tick it collects `queued` rows from every database (it already connects to each one) into an in-memory
+   list, mirrored into `pgbx.server_queue` in the admin DB so `pgbx overview` / CLI show one server-wide queue.
+2. It picks the next job by **priority, then age**: `restore` (a human is waiting) > manual `backup` > scheduled /
+   first `backup` > `verify` > `prune`. Ties: round-robin over databases so one noisy DB cannot starve the rest.
+3. **Lanes.** `pgbx.max_concurrent_jobs` (default 1) is the total. `pgbx.restore_lane` (default on) reserves one
+   extra slot for restores only, so a restore never waits behind a 3-hour dump; it is a separate process into a
+   NEW database and runs at the same nice/ionice. Set it off on very small servers. Lanes run as child processes
+   polled by the worker loop (non-blocking `try_wait`), so the worker keeps ticking, sampling and answering SIGTERM.
+4. **Coalescing.** At most one queued backup per database: `backup_now()` while one is queued returns that job's id
+   (and upgrades its priority to manual) instead of adding another. Same for `verify_now()`. Restores never coalesce.
+5. **Overrun policy** `pgbx.overrun_policy` = `skip` (default) | `catch_up`. `skip`: slots missed while a dump of
+   that database was running are dropped and the next run is the next cron slot **after the previous dump
+   finished**, measured from `finished` not `requested_at`; history records `params.skipped_slots`. `catch_up` is
+   today's behaviour. `doctor()` warns `dump_longer_than_interval` when the last 3 dumps ran longer than the schedule
+   interval, with the suggested longer schedule as `fix`.
+6. **Same database, two jobs.** Never two dumps of one DB at once. A restore/verify of DB X may run while X is
+   being dumped (different target DB). A dump of the database a restore is writing into is skipped (it is not live).
+7. **Cancel.** `pgbx.cancel(job_id)`: `queued` → `cancelled`; `running` → SIGTERM the child, aborts the S3 upload
+   (existing path), state `cancelled`. CLI `pgbx jobs` / `pgbx jobs cancel <id>`.
 
 ### 1. Load gate before starting a job
 
@@ -142,6 +175,9 @@ the server value is a ceiling where noted.
 | `pgbx.job_nice` | 10 | 0-19 | no | lower than the app, never higher |
 | `pgbx.job_ionice` | `best-effort-7` | none/best-effort-0..7/idle | no | `idle` can starve forever |
 | `pgbx.max_concurrent_jobs` | 1 | 1-8 | no | today's behaviour, now enforced by advisory lock |
+| `pgbx.restore_lane` | on | on/off | no | restores never wait behind a dump |
+| `pgbx.overrun_policy` | skip | skip/catch_up | yes | no back-to-back dumps |
+| `pgbx.coalesce_manual` | on | on/off | no | spamming backup_now() costs one dump |
 | `pgbx.dump_compression` | `auto` (exists) | | no | |
 | `pgbx.dump_compression_busy` | `zstd:1` / gzip 1 | | no | cheaper when forced under load |
 | `pgbx.upload_kbps` | 0 (unlimited) | 0-10^7 | no | uploads already back-pressure pg_dump |
@@ -156,7 +192,7 @@ the server value is a ceiling where noted.
 ### Surfacing
 
 - `pgbx.server_overview.state` gains `deferred (busy: 12 active, 900 tps) until 02:16, deadline 06:00`.
-- New `pgbx.status()` (per database): next due, queued/running job, last gate sample, defer count, deadline,
+- `pgbx.status()` (per database, exists) gains: next due, queued/running job, last gate sample, defer count, deadline,
   suggested window. CLI `pgbx status` reads it.
 - `doctor()` adds: `load_gate` (mode, last sample), `forced_backups_7d` (warn if > 2: schedule sits in a busy
   window), `schedule_in_quiet_window`, `long_running_job`.
@@ -193,6 +229,9 @@ the server value is a ceiling where noted.
   start `pgbench -c 8 -T 600`; `backup_now()` → asserts NOTICE and immediate run; scheduled job → asserts
   `state='queued'` with `defer_reason` for ≥ 1 min, then `state='done'`, `params.forced=true` before deadline + 1 tick.
   Stop pgbench mid-way in a second case → job runs before the deadline with `forced` absent.
+- e2e queue: 3-min dump in DB A, `restore()` in DB B starts within one tick (restore lane); with lane off it
+  runs next, ahead of A's queued verify. `backup_now()` ×5 → one job id. Hourly schedule + slow dump →
+  `skip` leaves a gap and records `skipped_slots`. `cancel()` on a running dump leaves no object in S3.
 - e2e: `shadow` mode never delays but records `would_defer`.
 - e2e: hold `ACCESS EXCLUSIVE` on a table → dump fails fast on lock_timeout, re-queues, succeeds after release.
 - e2e: child `nice` value is 10 (`ps -o ni`), `ioprio` on Linux (`/proc/<pid>/io` via `ionice -p`).
