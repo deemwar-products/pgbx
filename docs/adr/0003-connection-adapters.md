@@ -1,6 +1,8 @@
 # ADR 0003: Connection adapters (and a marketplace note)
 
-Status: **Draft, for discussion with the owner. Do not build yet.**
+Status: **Draft, for discussion with the owner. Do not build yet.** Updated 2026-10-02 with the owner's
+decisions: pgbx stores no secrets (connection string used in memory only); the pitch is "own your own Postgres
+backups".
 Date: 2026-10-02. Builds on ADR 0002 (profiles, SSH tunnels, read queries).
 
 ## Context
@@ -43,18 +45,22 @@ ready_timeout = "30s"
 1. pgbx spawns `command` with no shell, in its **own process group**: `setsid` on Unix, a Job Object on
    Windows. stdin is closed, and stderr is captured (redacted, shown only on failure).
 2. The adapter prints **one JSON line** on stdout within `ready_timeout`:
-   - `{"v":1,"ready":true,"host":"127.0.0.1","port":54321}`, with optional `"user"`, `"dbname"`,
-     `"sslmode"`; or
-   - `{"v":1,"ready":false,"error":"no credentials for project acme-prod"}`.
-
-   A `"url":"postgres://..."` form is accepted too, but **must not contain a password**. pgbx refuses a URL
-   with one, so a secret never lands in state files, logs or agent output.
-3. Passwords stay where they are today: `~/.pgpass`, `PGPASSWORD`, or `sec`. An adapter that has to *mint*
-   a token (IAM auth, Cloud SQL IAM) returns `"password_env":"NAME"` and puts the token into the helper's own
-   environment, where it never reaches stdout. The open question is whether we allow this at all (Q2).
-4. Lifecycle reuses today's tunnel helper. The helper owns the adapter instead of `ssh`, so reuse across
-   commands and the 10-minute idle expiry work unchanged. The state file records `adapter`, `pid`, `pgid`
-   and `port`.
+   - `{"v":1,"ready":true,"url":"postgres://user:pass@127.0.0.1:54321/shop?sslmode=require"}`, the full
+     connection string, password included if needed; or
+   - `{"v":1,"ready":true,"host":"127.0.0.1","port":54321}`, the host/port form, with credentials from the
+     usual places (`~/.pgpass`, `PGPASSWORD`); or
+   - `{"v":1,"ready":false,"error":"..."}`.
+3. **pgbx does nothing with secrets** (owner decision, 2026-10-02). It uses the connection string in memory,
+   for that run only, and **saves nothing**: not in profiles, not in tunnel state files, not in memories,
+   not in logs. Any output that echoes a connection redacts the password (`postgres://user:***@...`). Child
+   tools (`pg_dump`, `pg_restore`) get the password through their environment, never their argv, so it can't
+   show up in `ps`. Profiles store only the adapter command and non-secret settings. The adapter, or the
+   user, owns the credentials, and pgbx only forwards and uses them.
+4. Lifecycle reuses today's tunnel helper. The helper owns the adapter instead of `ssh`, and the state file
+   records only `adapter`, `pid`, `pgid`, `host` and `port`, never the URL. Reuse across commands works as
+   today for the host/port form. When the adapter returned a URL with a password, that URL lives only in the
+   process that received it, so a later command can't reuse it from disk. Either the adapter is run again for
+   each command and stopped after it, or the helper hands it over a local, owner-only socket (open question Q2).
 5. Stopping: on idle expiry, `pgbx tunnel close`, a crash or a ready-timeout, the helper sends **SIGTERM to the
    group**, then **SIGKILL** after 5 s. On Windows it terminates the Job Object. No orphan proxies.
 6. Built-in adapters are thin wrappers around the vendor CLIs the user already has: `aws`, `cloud-sql-proxy`,
@@ -90,11 +96,12 @@ ready_timeout = "30s"
   without opening ports. This also widens the client-only use without changing pgbx's core.
 - New surface: process-group handling on Windows, ready-timeout tuning, and stderr redaction.
 - Testing: a fake adapter script in e2e (prints ready, then sleeps; prints an error; never prints; prints a URL
-  with a password, which must be refused; ignores SIGTERM, so SIGKILL must land).
+  with a password, which must work and then be found nowhere on disk or in output; ignores SIGTERM, so SIGKILL must
+  land).
 
 ## Marketplace (long term)
 
-**The pitch:** "own your Postgres backups." RDS/Cloud SQL snapshots restore only inside that provider. They can
+**The pitch (owner agreed):** "own your own Postgres backups." RDS/Cloud SQL snapshots restore only inside that provider. They can
 be copied across regions and accounts, but not restored on another cloud or on a laptop, and the RDS export to
 S3 is Parquet, not a restorable dump. pgbx dumps are plain `pg_dump` files in *your* bucket, with *your*
 retention,
@@ -119,7 +126,8 @@ and list the container first (it covers the most buyers), with the AMI as an eas
 ## Open questions for the owner
 
 1. Is SSH as the "default adapter" the right framing, or should adapters stay a separate, advanced feature?
-2. Do we allow adapters to mint passwords and tokens (`password_env`), or only to provide a port?
+2. A URL with a password can't be stored for reuse. Do we start the adapter again for each command (simplest,
+   slower), or let the helper hand the URL to later commands over a local owner-only socket (fast, more code)?
 3. Which built-ins first? Suggestion: `kubectl` and `aws-ssm` (most asked for), then `gcp-sql` and `azure-bastion`.
 4. Should adapters be shareable (a small registry or a docs page of recipes), or just documented as a contract?
 5. Marketplace: is the target managed Postgres (needs the runner) or self-managed (the AMI works sooner)?
