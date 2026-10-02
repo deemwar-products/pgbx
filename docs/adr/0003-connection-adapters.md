@@ -40,9 +40,32 @@ url = "postgres://$PGUSER:$PGPASSWORD@localhost:5432/shop"
 - **Credentials belong to the user.** A connection string naturally carries the user and password. pgbx expands
   `$VAR` / `${VAR}` references **anywhere in a profile or connection string** from the environment **at run time**
   (`$$` is a literal `$`). A missing variable is an error that names the variable, never a value. pgbx writes
-  nothing secret to disk: profiles hold the references, not the values. A secret store is **later, not now**.
+  nothing secret to disk: profiles hold the references, not the values. Where values come from is configurable (see Secrets below).
 - Expanded values and URLs are used in memory only. They never appear in logs or output (`postgres://user:***@...`),
   and child tools get the password through their environment, never their argv.
+
+### Secrets: where `$VAR` values come from
+
+One setting in pgbx's config says where secrets come from:
+
+```yaml
+secrets: env                         # DEFAULT: the process environment only
+# secrets: .secrets/.env             # a .env file (relative to the config file, or absolute)
+# secrets: node secret-handler.js    # a command (any executable, no shell)
+```
+
+Resolution order for each `$VAR`:
+1. the **process environment**, always first, so `PGPASSWORD=... pgbx ...` always wins;
+2. then the configured source, if any: a **.env file** (`KEY=value` lines, `#` comments, optional quotes), or a
+   **secret handler command**.
+
+For a command, pgbx runs it once per variable, with the **variable name** as its only argument
+(`node secret-handler.js PGPASSWORD`). The command prints the value on stdout (a trailing newline is stripped)
+and exits 0. A non-zero exit or empty output is an error that names the variable, never a value. The value is
+used in memory only, never stored or logged, and redacted in output.
+
+pgbx ships **no secret-manager integrations**. Users write their handler for AWS Secrets Manager, Vault, `sec`,
+1Password and so on, the same way as adapters (any language; a few lines). Timeouts: 10 s per variable by default.
 
 ### Adapter protocol (v1)
 
@@ -101,7 +124,7 @@ language. Node is never a pgbx dependency.
 
 ## Consequences
 
-- The core gets smaller: profiles, `$VAR` expansion, a two-message stdin protocol, one stdout line, and
+- The core gets smaller: profiles, `$VAR` expansion (env, .env or a handler command), a two-message stdin protocol, one stdout line, and
   process-group handling. `cli/src/tunnel.rs` moves out into `adapters/ssh`.
 - One rule for every connection, and nothing outlives pgbx.
 - Each one-off command pays its adapter's start-up (seconds for SSM or cloud-sql-proxy). `pgbx serve` pays it once.
@@ -112,7 +135,7 @@ language. Node is never a pgbx dependency.
   - pgbx: a fake adapter that answers ready; answers an error state; never answers (timeout, stderr shown);
     prints logs on stdout before the result (protocol error, clearly reported); ignores `stop` (the group is
     killed after the grace period); and pgbx killed mid-run (stdin closes, the adapter exits). `$VAR` expansion,
-    a missing variable, `$$`. No secret on disk or in output.
+    a missing variable, `$$`; .env parsing; a handler command that succeeds, fails, prints nothing or hangs. No secret on disk or in output.
   - Each default adapter: its own tests.
 
 ## Marketplace (long term)
@@ -143,7 +166,6 @@ and list the container first (it covers the most buyers), with the AMI as an eas
 
 1. **Host-side commands** (`doctor`, `logs`, `setup server`, `diagnose`) over an adapter: an optional `exec` action
    is undecided and **out of v1**.
-2. Secret store: later (not v1). Which one, if any (`sec`, OS keychain, 1Password/Vault CLIs via adapters)?
-3. Licence: MIT, or a one-time fee? This also decides the marketplace pricing model.
-4. Marketplace target: managed Postgres (needs a new runner mode) or self-managed (an AMI with today's extension)?
-5. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?
+2. Licence: MIT, or a one-time fee? This also decides the marketplace pricing model.
+3. Marketplace target: managed Postgres (needs a new runner mode) or self-managed (an AMI with today's extension)?
+4. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?
