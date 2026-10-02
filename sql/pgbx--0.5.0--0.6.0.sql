@@ -8,7 +8,7 @@ ALTER TABLE pgbx.server_overview ADD COLUMN interval_secs float8, ADD COLUMN dum
 CREATE OR REPLACE FUNCTION pgbx._doctor() RETURNS TABLE (name text, ok bool, detail text, fix text)
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
-    o record; v text; lim interval; n int; bad text; worst_ratio float8 := -1; su bool;
+    o record; v text; lim interval; n int; bad text; worst_ratio float8 := -1; su bool; p record;
 BEGIN
     PERFORM pgbx._require_admin_db();
     su := coalesce((SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = session_user), false);
@@ -82,17 +82,50 @@ BEGIN
     fix := CASE WHEN ok THEN NULL ELSE 'make sure pgbx is in shared_preload_libraries and restart Postgres; a crashed worker restarts within 10 s — check the Postgres log' END;
     RETURN NEXT;
 
-    -- informational only: pgbx itself never needs WAL archiving
-    name := 'archive_mode';
-    v := coalesce(current_setting('archive_command', true), '');
-    ok := true;
-    detail := 'archive_mode = ' || current_setting('archive_mode') ||
-              CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
-                   THEN ' with no archive_command: archive_mode=on with no archive_command set by pgbx is not needed for pgbx'
-                   ELSE '' END;
-    fix := CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
-                THEN 'optional: if nothing else uses WAL archiving, set archive_mode = off at the next planned restart' END;
-    RETURN NEXT;
+    -- point-in-time restore is optional (pgbx.pitr); per-database dumps never need WAL archiving
+    IF coalesce(current_setting('pgbx.pitr', true), 'off') NOT IN ('on', 'true', '1', 'yes') THEN
+        name := 'archive_mode';
+        v := coalesce(current_setting('archive_command', true), '');
+        ok := true;
+        detail := 'archive_mode = ' || current_setting('archive_mode') || '; point-in-time restore is off (pgbx.pitr)' ||
+                  CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
+                       THEN ' and archive_mode=on with no archive_command is not needed for pgbx'
+                       ELSE '' END;
+        fix := CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
+                    THEN 'optional: if nothing else uses WAL archiving, set archive_mode = off at the next planned restart' END;
+        RETURN NEXT;
+    ELSE
+        SELECT * INTO p FROM pgbx.pitr_status();
+        name := 'pitr archiving';
+        v := coalesce(current_setting('archive_command', true), '');
+        ok := current_setting('archive_mode') <> 'off' AND v ~ ' wal-push %p' AND NOT p.state LIKE 'archiving failing%';
+        detail := CASE
+            WHEN current_setting('archive_mode') = 'off' THEN 'pgbx.pitr is on but archive_mode is off: no WAL is archived'
+            WHEN v !~ ' wal-push %p' THEN 'archive_command is not pgbx wal-push: ' || CASE WHEN su THEN v ELSE '(set)' END
+            WHEN p.state LIKE 'archiving failing%' THEN coalesce(p.last_error, 'WAL archiving is failing')
+            ELSE format('WAL archived until %s; %s file(s) waiting (%s)', p.wal_archived_until, p.backlog_segments, pg_size_pretty(p.backlog_bytes)) END;
+        fix := CASE
+            WHEN current_setting('archive_mode') = 'off' THEN 'run pgbx setup pitr --yes, then restart Postgres once'
+            WHEN v !~ ' wal-push %p' THEN 'run pgbx setup pitr --yes (it refuses to replace an archive_command another tool set)'
+            WHEN NOT ok THEN 'check S3 reachability and credentials; the Postgres log shows the pgbx wal-push error' END;
+        RETURN NEXT;
+
+        name := 'pitr base backups';
+        lim := pgbx._overdue_after(coalesce(nullif(current_setting('pgbx.pitr_schedule', true), ''), 'daily at 01:00'));
+        ok := p.last_base_backup_at IS NOT NULL AND (lim IS NULL OR now() - p.last_base_backup_at <= lim);
+        detail := CASE WHEN p.last_base_backup_at IS NULL THEN 'no base backup yet, so no point-in-time restore is possible yet'
+                       ELSE format('newest base backup %s (%s ago); restorable from %s; %s kept', p.last_base_backup,
+                                   date_trunc('second', now() - p.last_base_backup_at), p.restorable_from, p.base_backups) END;
+        fix := CASE WHEN ok THEN NULL ELSE 'SELECT pgbx.pitr_backup_now(); then SELECT * FROM pgbx.pitr_status() (see last_error)' END;
+        RETURN NEXT;
+
+        name := 'pitr gaps';
+        ok := p.open_gaps = 0;
+        detail := CASE WHEN ok THEN coalesce('no open WAL gap; earlier: ' || p.gaps, 'no WAL gap recorded')
+                       ELSE 'WAL was dropped (pgbx.wal_queue_max): no restore to ' || p.gaps END;
+        fix := CASE WHEN ok THEN NULL ELSE 'fix archiving (see pitr archiving); a base backup is queued automatically once WAL reaches S3 again and closes the gap' END;
+        RETURN NEXT;
+    END IF;
 
     name := 'replication_slots';
     SELECT string_agg(format('%s (%s, %s, holds %s)', r.slot_name, r.slot_type, coalesce(r.wal_status, '?'),
@@ -321,13 +354,16 @@ BEGIN
                    true, NULL, NULL, now(), NULL, NULL, NULL, NULL)::pgbx.config;
     END IF;
     SELECT * INTO lb FROM pgbx.history WHERE kind='backup' AND history.state='done' ORDER BY id DESC LIMIT 1;
-    SELECT * INTO le FROM pgbx.history WHERE history.state='failed' ORDER BY id DESC LIMIT 1;
+    -- the admin database's server-wide PITR rows (base_backup, wal_gap, wal_archive) are not this database's jobs
+    SELECT * INTO le FROM pgbx.history WHERE history.state='failed'
+       AND history.kind NOT IN ('base_backup', 'wal_gap', 'wal_archive') ORDER BY id DESC LIMIT 1;
     SELECT * INTO lv FROM pgbx.history WHERE kind='verify' AND history.state IN ('done','failed') ORDER BY id DESC LIMIT 1;
     SELECT max(requested_at) INTO last_auto FROM pgbx.history WHERE kind='backup' AND trigger IN ('schedule','first');
     RETURN QUERY SELECT
         current_database()::name,
         CASE WHEN NOT cfg.enabled THEN 'paused'
-             WHEN EXISTS (SELECT 1 FROM pgbx.history h WHERE h.state='running') THEN 'running'
+             WHEN EXISTS (SELECT 1 FROM pgbx.history h WHERE h.state='running'
+                          AND h.kind NOT IN ('base_backup', 'wal_gap', 'wal_archive')) THEN 'running'
              WHEN lb.id IS NULL THEN 'waiting for first backup'
              WHEN le.id > lb.id THEN 'failing'
              ELSE 'active' END,
@@ -354,10 +390,11 @@ BEGIN
         format('s3://%s/%s/%s/', current_setting('pgbx.s3_bucket', true),
                coalesce(nullif(current_setting('pgbx.server_name', true), ''), '<hostname>'),
                coalesce(cfg.path, current_database())),
-        (SELECT max(h.id) FROM pgbx.history h WHERE h.state='running'),
+        (SELECT max(h.id) FROM pgbx.history h WHERE h.state='running' AND h.kind NOT IN ('wal_gap', 'wal_archive')),
         nq.id, (nq.params->>'queue_position')::int,
         coalesce(nq.params->>'wait_reason', CASE WHEN nq.id IS NOT NULL THEN 'queued; the worker picks it up within pgbx.poll_seconds' END),
-        (SELECT j.progress FROM pgbx.history h, pgbx.job_eta(h.id) j WHERE h.state='running' ORDER BY h.id DESC LIMIT 1),
+        (SELECT j.progress FROM pgbx.history h, pgbx.job_eta(h.id) j WHERE h.state='running' AND h.kind NOT IN ('wal_gap', 'wal_archive')
+          ORDER BY h.id DESC LIMIT 1),
         CASE WHEN nq.id IS NOT NULL THEN (SELECT j.progress FROM pgbx.job_eta(nq.id) j)
              WHEN cfg.enabled THEN format('next backup %s, takes ~%s',
                  CASE WHEN last_auto IS NULL THEN 'within a minute (first backup)'
@@ -743,3 +780,96 @@ END $$;
 REVOKE ALL ON FUNCTION pgbx._gfs_span(text), pgbx.set_retention(int, int, text) FROM PUBLIC;
 ALTER FUNCTION pgbx.set_retention(int, int, text) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.set_retention(int, int, text) TO pgbx_admin;
+
+-- optional point-in-time restore (pgbx.pitr): history kinds 'base_backup' (a job of the server-wide queue),
+-- 'wal_gap' and 'wal_archive' (open incidents: state 'running'), trigger 'wal_gap', pgbx.pitr_state, pitr_status(),
+-- pitr_backup_now(); status() ignores these server-wide rows; doctor() reports archiving health when pgbx.pitr is on
+ALTER TABLE pgbx.history DROP CONSTRAINT IF EXISTS history_kind_check;
+ALTER TABLE pgbx.history ADD CONSTRAINT history_kind_check
+    CHECK (kind IN ('backup', 'restore', 'config', 'pause', 'resume', 'prune', 'verify', 'base_backup', 'wal_gap', 'wal_archive'));
+ALTER TABLE pgbx.history DROP CONSTRAINT IF EXISTS history_trigger_check;
+ALTER TABLE pgbx.history ADD CONSTRAINT history_trigger_check CHECK (trigger IN ('manual', 'schedule', 'first', 'migration', 'wal_gap'));
+-- Point-in-time restore (optional, pgbx.pitr = on): state written by the worker in the admin database.
+CREATE TABLE pgbx.pitr_state (
+    id           int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    system_id    text,
+    work_dir     text,
+    base_backups jsonb NOT NULL DEFAULT '[]',      -- backup.json of every kept base backup, oldest first
+    updated_at   timestamptz
+);
+
+-- One row answering "can I restore this server to any moment, and from when?". Admin database only.
+CREATE OR REPLACE FUNCTION pgbx.pitr_status() RETURNS TABLE (
+    enabled bool, state text, archive_mode text, schedule text, retention text,
+    last_base_backup_at timestamptz, last_base_backup text, base_backups int,
+    restorable_from timestamptz, wal_archived_until timestamptz,
+    open_gaps bigint, gaps text, backlog_segments bigint, backlog_bytes bigint,
+    last_error text, location text
+) LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    st pgbx.pitr_state; lb pgbx.history; le pgbx.history; inc pgbx.history; og pgbx.history;
+    en bool; n bigint; seg bigint; rf timestamptz;
+BEGIN
+    PERFORM pgbx._require_admin_db();
+    en := coalesce(current_setting('pgbx.pitr', true), 'off') IN ('on', 'true', '1', 'yes');
+    SELECT * INTO st FROM pgbx.pitr_state s WHERE s.id = 1;
+    SELECT * INTO lb FROM pgbx.history h WHERE h.kind = 'base_backup' AND h.state = 'done' ORDER BY h.id DESC LIMIT 1;
+    SELECT * INTO le FROM pgbx.history h WHERE h.kind = 'base_backup' AND h.state = 'failed' ORDER BY h.id DESC LIMIT 1;
+    SELECT * INTO inc FROM pgbx.history h WHERE h.kind = 'wal_archive' AND h.state = 'running' ORDER BY h.id DESC LIMIT 1;
+    SELECT * INTO og FROM pgbx.history h WHERE h.kind = 'wal_gap' AND h.state = 'running' ORDER BY h.id DESC LIMIT 1;
+    seg := pg_size_bytes(current_setting('wal_segment_size'));
+    SELECT count(*) INTO n FROM pg_ls_archive_statusdir() s WHERE s.name LIKE '%.ready';
+    SELECT min((b->>'stop_time')::timestamptz) INTO rf FROM jsonb_array_elements(coalesce(st.base_backups, '[]')) b;
+    rf := coalesce(rf, (lb.params->>'stop_time')::timestamptz);
+    RETURN QUERY SELECT
+        en,
+        CASE WHEN NOT en THEN 'off'
+             WHEN current_setting('archive_mode') = 'off' THEN 'restart needed (archive_mode is off)'
+             WHEN og.id IS NOT NULL THEN 'gap: WAL was dropped; restores refused from ' ||
+                  ((og.params->>'safe_until')::timestamptz - make_interval(secs => coalesce((og.params->>'margin_s')::int, 60)))::text
+             WHEN inc.id IS NOT NULL THEN 'archiving failing'
+             WHEN EXISTS (SELECT 1 FROM pgbx.history h WHERE h.kind = 'base_backup' AND h.state = 'running') AND lb.id IS NULL
+                  THEN 'first base backup running'
+             WHEN lb.id IS NULL THEN 'waiting for first base backup'
+             WHEN le.id > lb.id THEN 'base backups failing'
+             ELSE 'active' END,
+        current_setting('archive_mode'),
+        coalesce(nullif(current_setting('pgbx.pitr_schedule', true), ''), 'daily at 01:00'),
+        coalesce(nullif(current_setting('pgbx.pitr_retention', true), ''), '7 days'),
+        lb.finished, lb.params->>'label',
+        greatest(jsonb_array_length(coalesce(st.base_backups, '[]')), CASE WHEN lb.id IS NULL THEN 0 ELSE 1 END),
+        rf,
+        CASE WHEN og.id IS NOT NULL
+             THEN (og.params->>'safe_until')::timestamptz - make_interval(secs => coalesce((og.params->>'margin_s')::int, 60))
+             ELSE (SELECT a.last_archived_time FROM pg_stat_archiver a) END,
+        (SELECT count(*) FROM pgbx.history h WHERE h.kind = 'wal_gap' AND h.state = 'running'),
+        (SELECT string_agg(format('#%s %s .. %s', h.id,
+                    date_trunc('second', (h.params->>'safe_until')::timestamptz - make_interval(secs => coalesce((h.params->>'margin_s')::int, 60))),
+                    coalesce(date_trunc('second', (h.params->>'healed_at')::timestamptz)::text, 'open')), '; ' ORDER BY h.id)
+           FROM pgbx.history h WHERE h.kind = 'wal_gap'
+            AND (h.state = 'running' OR rf IS NULL OR (h.params->>'healed_at')::timestamptz > rf)),
+        n, n * seg,
+        coalesce(inc.error, CASE WHEN le.id > coalesce(lb.id, 0) THEN le.error END),
+        format('s3://%s/%s/%s/', current_setting('pgbx.s3_bucket', true),
+               coalesce(nullif(current_setting('pgbx.server_name', true), ''), '<hostname>'), coalesce(st.system_id, '<system id>'));
+END $$;
+
+-- Queue a base backup now (superuser; admin database). Returns the history id.
+CREATE OR REPLACE FUNCTION pgbx.pitr_backup_now() RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE jid bigint;
+BEGIN
+    PERFORM pgbx._require_admin_db();
+    IF NOT coalesce((SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = session_user), false) THEN
+        RAISE EXCEPTION 'pgbx: pitr_backup_now() needs a superuser';
+    END IF;
+    IF coalesce(current_setting('pgbx.pitr', true), 'off') NOT IN ('on', 'true', '1', 'yes') THEN
+        RAISE EXCEPTION 'pgbx: point-in-time restore is off on this server (pgbx.pitr); enable it with: pgbx setup pitr --yes';
+    END IF;
+    INSERT INTO pgbx.history (kind, trigger) VALUES ('base_backup', 'manual') RETURNING id INTO jid;
+    RETURN jid;
+END $$;
+REVOKE ALL ON pgbx.pitr_state FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgbx.pitr_status(), pgbx.pitr_backup_now() FROM PUBLIC;
+GRANT SELECT ON pgbx.pitr_state TO pgbx_viewer;
+ALTER FUNCTION pgbx.pitr_status() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.pitr_status() TO pgbx_viewer;

@@ -18,7 +18,7 @@ pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  PASS $1"; pass=$((pass+1)); else echo "  FAIL $1 (got '$2', want '$3')"; fail=$((fail+1)); fi; }
 has() { case "$2" in *"$3"*) echo "  PASS $1"; pass=$((pass+1));; *) echo "  FAIL $1 ('$3' not in: $(echo "$2" | head -c 400))"; fail=$((fail+1));; esac; }
 P() { local c=$1; shift; docker exec -u postgres "$c" psql -v ON_ERROR_STOP=1 -qAt "$@"; }
-cleanup() { docker rm -f "$PG1" "$PG2" "$S3" "$HOOK" >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; [ -n "${WORK:-}" ] && rm -rf "$WORK"; }
+cleanup() { docker rm -fv "$PG1" "$PG2" "$S3" "$HOOK" >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; [ -n "${WORK:-}" ] && rm -rf "$WORK"; }
 trap '[ "${PGBX_X6_KEEP:-0}" = 1 ] || cleanup' EXIT
 cleanup
 WORK=$(mktemp -d)
@@ -32,7 +32,7 @@ AWS() { docker run --rm --network "$NET" -v "$WORK:/w" -e AWS_ACCESS_KEY_ID="$AK
 
 echo "== extras_e2e image $IMAGE (server folder $SERVER)"
 docker network create "$NET" >/dev/null
-docker run -d --name "$S3" --network "$NET" -e RUSTFS_ACCESS_KEY="$AK" -e RUSTFS_SECRET_KEY="$SK" rustfs/rustfs >/dev/null
+docker run -d --rm --name "$S3" --network "$NET" -e RUSTFS_ACCESS_KEY="$AK" -e RUSTFS_SECRET_KEY="$SK" rustfs/rustfs >/dev/null
 for _ in $(seq 30); do AWS s3 mb "s3://$BUCKET" 2>&1 | grep -qE 'make_bucket|BucketAlready' && break; sleep 1; done
 # webhook sink: every POST body becomes one line of /w/hook.log
 cat > "$WORK/sink.py" <<'PY'
@@ -44,12 +44,12 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 http.server.HTTPServer(('0.0.0.0', 8080), H).serve_forever()
 PY
-docker run -d --name "$HOOK" --network "$NET" -v "$WORK:/w" python:3.11-slim python3 /w/sink.py >/dev/null
+docker run -d --rm --name "$HOOK" --network "$NET" -v "$WORK:/w" python:3.11-slim python3 /w/sink.py >/dev/null
 put() { # container src dest mode
   docker cp "$2" "$1:$3" >/dev/null && docker exec -u root "$1" sh -c "chown postgres:postgres $3 && chmod $4 $3"; }
 start() { # name extra-args...
   local n=$1; shift
-  docker run -d --name "$n" --network "$NET" -e POSTGRES_PASSWORD=test-only-not-secret -e PGDATA=/var/lib/postgresql/data \
+  docker run -d --rm --name "$n" --network "$NET" -e POSTGRES_PASSWORD=test-only-not-secret -e PGDATA=/var/lib/postgresql/data \
     "$IMAGE" postgres -c shared_preload_libraries=pgbx -c pgbx.s3_endpoint="http://$S3:9000" -c pgbx.s3_bucket="$BUCKET" \
     -c pgbx.s3_region=us-east-1 -c pgbx.server_name="$SERVER" -c pgbx.credentials_file=/etc/pgbx/s3.credentials \
     -c pgbx.poll_seconds=2 "$@" >/dev/null

@@ -153,7 +153,10 @@ fn api_overview(cx: &Ctx) -> Result<Value, String> {
     let mut c = admin(cx)?;
     let who = one(&mut c, "SELECT current_user AS role, current_setting('default_transaction_read_only') AS read_only, \
                             now() AS server_time, current_setting('pgbx.server_name', true) AS server_name", &[])?;
-    Ok(json!({"ok": true, "connection": who, "databases": rows(&mut c, "SELECT * FROM pgbx.overview()", &[])?}))
+    // point-in-time restore window (optional; absent on older extension versions)
+    let pitr = one(&mut c, "SELECT enabled, state, restorable_from, wal_archived_until, last_base_backup_at, open_gaps, gaps \
+                            FROM pgbx.pitr_status()", &[]).unwrap_or(Value::Null);
+    Ok(json!({"ok": true, "connection": who, "pitr": pitr, "databases": rows(&mut c, "SELECT * FROM pgbx.overview()", &[])?}))
 }
 
 /// History rows with a display kind (download_url / scope are recorded as 'config').
@@ -229,7 +232,8 @@ fn api_health(cx: &Ctx) -> Result<Value, String> {
     let mut c = admin(cx)?;
     let checks = rows(&mut c, "SELECT * FROM pgbx.doctor()", &[])?;
     let healthy = checks.iter().all(|r| r["ok"] == true);
-    Ok(json!({"ok": true, "healthy": healthy, "checks": checks}))
+    let pitr = one(&mut c, "SELECT * FROM pgbx.pitr_status()", &[]).unwrap_or(Value::Null);
+    Ok(json!({"ok": true, "healthy": healthy, "checks": checks, "pitr": pitr}))
 }
 
 // ---------------------------------------------------------------- http

@@ -135,3 +135,20 @@ pub(crate) fn send_event(cfg: &JobCfg, ev: notify::Event) {
 }
 
 
+
+/// From the main thread: run pgbx.alert_command and the pgbx.notify channels for a whole-server incident on a
+/// thread of their own, so a slow webhook or SMTP server never holds up the worker's poll loop.
+pub(crate) fn incident_async(cfg: JobCfg, server: String, kind: &'static str, id: i64, msg: String, failed: bool) {
+    let r = std::thread::Builder::new().name("pgbx notify".into()).spawn(move || {
+        if failed || kind.ends_with("_recovered") {
+            crate::worker::alert(cfg.alert_command.as_deref(), &server, "(whole server)", kind, id, &msg);
+        }
+        send_event(&cfg, notify::Event {
+            failed, server, database: "(whole server)".into(), kind: kind.trim_end_matches("_recovered").into(), job_id: id,
+            error: msg, at: chrono::Utc::now().to_rfc3339(),
+        });
+    });
+    if let Err(e) = r {
+        log(&format!("notify: could not start a thread: {e}"));
+    }
+}

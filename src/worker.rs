@@ -86,7 +86,7 @@ pub(crate) fn stop_reason() -> &'static str {
 }
 
 /// Remember the job's child process, so the main thread can stop it on cancel or shutdown.
-fn set_child(pid: u32) {
+pub(crate) fn set_child(pid: u32) {
     if let Some(j) = this_job() {
         j.pid.store(pid as i32, Ordering::Relaxed);
     }
@@ -149,6 +149,7 @@ pub extern "C-unwind" fn pgbx_worker_main(_arg: pg_sys::Datum) {
         }
     }
     stop_all(&mut s);
+    crate::pitr::stop();
     log("worker stopping");
 }
 
@@ -249,6 +250,8 @@ pub(crate) struct JobCfg {
     pub(crate) role_passwords: bool,
     pub(crate) notify: Option<String>,
     pub(crate) notify_secrets_file: Option<String>,
+    // point-in-time restore: (<work_dir>/pgbx-wal.conf, the pgbx CLI) for base backup jobs
+    pub(crate) pitr: Option<(PathBuf, PathBuf)>,
 }
 
 impl JobCfg {
@@ -273,6 +276,7 @@ impl JobCfg {
             role_passwords: BACKUP_ROLE_PASSWORDS.get(),
             notify: setting(&NOTIFY),
             notify_secrets_file: setting(&NOTIFY_SECRETS_FILE),
+            pitr: crate::pitr::job_conf(),
         }
     }
 
@@ -329,12 +333,13 @@ struct Cand {
     gate: Option<String>, // this database's load_gate (NULL = the server's)
 }
 
-/// Pick order (ADR 0001 §0): restore (a human waits) > manual backup > scheduled / first backup > verify > prune.
+/// Pick order (ADR 0001 §0): restore (a human waits) > manual backup > scheduled / first backup (and PITR base
+/// backups, which keep the restore window) > verify > prune.
 pub(crate) fn priority(kind: &str, trigger: &str, params: &str) -> u8 {
     match kind {
         "restore" => 0,
         "backup" if trigger == "manual" || parse_flat_json(params).get("manual").is_some_and(|v| v == "true") => 1,
-        "backup" => 2,
+        "backup" | "base_backup" => 2,
         "verify" => 3,
         "prune" => 4,
         _ => 5,
@@ -379,8 +384,10 @@ fn tick(s: &mut Sched) -> Result<(), String> {
             && !CLEANED.swap(true, Ordering::Relaxed)
             && let Ok(b) = bucket()
         {
-            transfer::abort_remembered(&b);
-            transfer::abort_orphans(&b, &format!("{}/", c.server));
+            // listed uploads: only those older than 10 minutes (S3's clock may lag ours; the list file covers the rest)
+            let (prefix, list, cutoff) = (format!("{}/", c.server), transfer::take_remembered(), Utc::now() - chrono::Duration::minutes(10));
+            transfer::abort_remembered(&b, &list);
+            transfer::abort_orphans(&b, &prefix, cutoff);
         }
     }
     let dbs: Vec<String> = admin
@@ -417,6 +424,8 @@ fn tick(s: &mut Sched) -> Result<(), String> {
         }
     }
     let _ = admin.execute("DELETE FROM pgbx.server_overview WHERE NOT (database::text = ANY($1))", &[&dbs]);
+    // point-in-time restore (optional): conf, gaps, archiving watch, base backups queued as jobs (admin database)
+    crate::pitr::tick(&c, &mut admin);
     let waiting = start_jobs(&c, &admin_db, s, cands, &mut conns);
     flush_server_activity(&mut admin, &admin_db, s, &mut conns);
     publish_queue(&mut admin, s, &waiting, &deferred, &mut conns);
@@ -600,9 +609,10 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<Scann
     // 'running' rows no job thread of this worker owns were cut off by a restart or copied in by a restore
     let mine: Vec<i64> = s.running.iter().filter(|r| r.db == db).map(|r| r.id).collect();
     cl.execute("INSERT INTO pgbx.config DEFAULT VALUES ON CONFLICT (id) DO NOTHING", &[]).map_err(pe)?;
+    // ('wal_gap' / 'wal_archive' rows are open PITR incidents, not jobs: 'running' means still open)
     cl.execute(
         "UPDATE pgbx.history SET state='failed', finished=now(), error='interrupted (worker restart or copied by restore)'
-          WHERE state='running' AND NOT (id = ANY($1))",
+          WHERE state='running' AND NOT (id = ANY($1)) AND kind NOT IN ('wal_gap', 'wal_archive')",
         &[&mine],
     )
     .map_err(pe)?;
@@ -660,8 +670,8 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<Scann
                          THEN format('deferred (%s) until %s UTC, runs anyway from %s UTC', coalesce(params->>'defer_reason', '?'),
                                      to_char((params->>'deferred_until')::timestamptz AT TIME ZONE 'UTC', 'HH24:MI:SS'),
                                      coalesce(to_char((params->>'deadline')::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI'), '?')) END
-               FROM pgbx.history WHERE state='queued' ORDER BY id",
-            &[],
+               FROM pgbx.history WHERE state='queued' AND (kind <> 'base_backup' OR current_database() = $1) ORDER BY id",
+            &[&setting(&ADMIN_DB).unwrap_or("postgres".into())], // base backups are whole-server jobs of the admin database
         )
         .map_err(pe)?
     {
@@ -728,9 +738,10 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
         if j.kind == "restore" && lane_free {
             slots.push(0); // the restore lane: a restore never waits behind a long dump
         }
-        // never two dumps of one database at once
-        if j.kind == "backup" && s.running.iter().any(|r| r.db == j.db && r.kind == "backup") {
-            waiting.push((j, "waits for the backup of this database that is running".to_string()));
+        // never two dumps of one database at once, never two base backups
+        if (j.kind == "backup" || j.kind == "base_backup") && s.running.iter().any(|r| r.db == j.db && r.kind == j.kind) {
+            let why = format!("waits for the {} that is running", if j.kind == "backup" { "backup of this database" } else { "base backup" });
+            waiting.push((j, why));
             continue;
         }
         if slots.is_empty() {
@@ -1550,6 +1561,7 @@ fn execute(j: &Job) -> Result<Done, String> {
             verify(&j.c, &j.cfg, &mut admin, &mut src, &j.path, &scratch, &mut progress)
         }
         "prune" => Ok(Done::default()),
+        "base_backup" => crate::pitr::run_base_backup(&j.cfg),
         other => Err(format!("unknown job kind {other}")),
     }
 }
@@ -1586,10 +1598,17 @@ fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), St
                     Err(e) => log(&format!("{db}: prune failed: {e}")),
                 }
             }
+            // a base backup's result is the CLI's JSON: a few of its fields go into params, its kept list into pitr_state
+            let extra = if kind == "base_backup" {
+                crate::pitr::record_base_backup(cl, id, &done.extra)?;
+                "{}"
+            } else {
+                done.extra.as_str()
+            };
             cl.execute(
                 "UPDATE pgbx.history SET state='done', finished=now(), s3_key=$2, bytes=$3,
                         params = params || $4::text::jsonb WHERE id=$1",
-                &[&id, &done.key, &done.bytes, &done.extra],
+                &[&id, &done.key, &done.bytes, &extra],
             )
             .map_err(pe)?;
             log(&format!("{db}: {kind} #{id} done ({}, {} bytes)", done.key.as_deref().unwrap_or("-"), done.bytes));
@@ -1730,10 +1749,10 @@ fn publish_overview(admin: &mut Client, cl: &mut Client, db: &str, cron: &str) -
 }
 
 /// What a finished job reports back into its history row.
-struct Done {
-    key: Option<String>,
-    bytes: i64,
-    extra: String, // JSON object merged into params; always a valid object ("{}" when there is nothing to add)
+pub(crate) struct Done {
+    pub(crate) key: Option<String>,
+    pub(crate) bytes: i64,
+    pub(crate) extra: String, // JSON object merged into params; always a valid object ("{}" when there is nothing to add)
 }
 
 impl Default for Done {

@@ -16,6 +16,7 @@ pub mod crypt;
 mod extras;
 pub mod globals;
 mod notify;
+mod pitr;
 mod retention;
 mod schedule;
 mod transfer;
@@ -121,6 +122,16 @@ pub static ENCRYPTION_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Optio
 pub static BACKUP_ROLE_PASSWORDS: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static NOTIFY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static NOTIFY_SECRETS_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+// point-in-time restore (optional, off by default): WAL archiving with `pgbx wal-push` + scheduled base backups
+pub static PITR: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static PITR_SCHEDULE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"daily at 01:00"));
+pub static PITR_RETENTION: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"7 days"));
+pub static WAL_QUEUE_MAX: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"4GB"));
+pub static WAL_GAP_MARGIN: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"60s"));
+pub static WAL_ALERT_AFTER: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"15 min"));
+pub static WAL_ALERT_SIZE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"2GB"));
+pub static WORK_DIR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+pub static CLI_PATH: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static OVERRUN_POLICY: GucSetting<Overrun> = GucSetting::<Overrun>::new(Overrun::Skip);
 pub static OVERRUN_MAX_GAP: GucSetting<f64> = GucSetting::<f64>::new(1.5);
 
@@ -181,6 +192,15 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_bool_guc(c"pgbx.backup_role_passwords", c"Keep role password hashes in the roles file stored with each backup", c"off (default): pg_dumpall --no-role-passwords; restored roles have no password", &BACKUP_ROLE_PASSWORDS, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_string_guc(c"pgbx.notify", c"Notification channels by name: slack:NAME, telegram:NAME, webhook:NAME, email:NAME", c"names only; URLs and tokens go in pgbx.notify_secrets_file", &NOTIFY, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_string_guc(c"pgbx.notify_secrets_file", c"File with the URLs/tokens of the pgbx.notify channels", c"chmod 600, owned by postgres; e.g. slack.ops.url = https://hooks.slack.com/...", &NOTIFY_SECRETS_FILE, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_bool_guc(c"pgbx.pitr", c"Point-in-time restore: archive WAL with pgbx wal-push and take scheduled base backups", c"needs archive_mode=on and archive_command='<pgbx> wal-push %p' (pgbx setup pitr)", &PITR, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.pitr_schedule", c"When base backups for point-in-time restore run", c"same forms as set_schedule(); default 'daily at 01:00'", &PITR_SCHEDULE, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.pitr_retention", c"How far back point-in-time restore must reach", c"e.g. '7 days'; older base backups and WAL are deleted, the newest base backup is always kept", &PITR_RETENTION, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.wal_queue_max", c"WAL waiting to be archived above which pgbx wal-push drops WAL (recorded as a gap) instead of filling the disk", c"e.g. '4GB'; 'off' = never drop", &WAL_QUEUE_MAX, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.wal_gap_margin", c"Safety margin before a recorded WAL gap in which restores are refused", c"default '60s'", &WAL_GAP_MARGIN, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.wal_alert_after", c"Alert when the oldest WAL waiting to be archived is older than this", c"default '15 min'", &WAL_ALERT_AFTER, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.wal_alert_size", c"Alert when this much WAL waits to be archived", c"default '2GB'; 'off' = never", &WAL_ALERT_SIZE, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.work_dir", c"Directory for point-in-time restore state (conf, spool, drop log)", c"default <data_directory>/../pgbx; must be OUTSIDE the data directory", &WORK_DIR, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.cli_path", c"Path of the pgbx command line program the worker runs for base backups", c"default /usr/local/bin/pgbx or /usr/bin/pgbx", &CLI_PATH, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_float_guc(c"pgbx.overrun_max_gap", c"With overrun_policy=skip, never wait for a slot more than this many schedule intervals after the last good backup finished", c"1.0-10; past it the backup runs right away", &OVERRUN_MAX_GAP, 1.0, 10.0, GucContext::Sighup, GucFlags::default());
 
     // Only register the worker when loaded at server start (shared_preload_libraries),
@@ -329,8 +349,9 @@ CREATE TABLE pgbx.config (
 -- Every backup / restore, queued manual or automatic. The worker claims rows in state 'queued'.
 CREATE TABLE pgbx.history (
     id           bigserial PRIMARY KEY,
-    kind         text NOT NULL CHECK (kind IN ('backup', 'restore', 'config', 'pause', 'resume', 'prune', 'verify')),
-    trigger      text NOT NULL DEFAULT 'manual' CHECK (trigger IN ('manual', 'schedule', 'first', 'migration')),
+    kind         text NOT NULL CHECK (kind IN ('backup', 'restore', 'config', 'pause', 'resume', 'prune', 'verify',
+                                               'base_backup', 'wal_gap', 'wal_archive')),
+    trigger      text NOT NULL DEFAULT 'manual' CHECK (trigger IN ('manual', 'schedule', 'first', 'migration', 'wal_gap')),
     params       jsonb NOT NULL DEFAULT '{}',
     state        text NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired', 'cancelled')),
     requested_at timestamptz NOT NULL DEFAULT now(),
@@ -474,13 +495,16 @@ BEGIN
                    true, NULL, NULL, now(), NULL, NULL, NULL, NULL)::pgbx.config;
     END IF;
     SELECT * INTO lb FROM pgbx.history WHERE kind='backup' AND history.state='done' ORDER BY id DESC LIMIT 1;
-    SELECT * INTO le FROM pgbx.history WHERE history.state='failed' ORDER BY id DESC LIMIT 1;
+    -- the admin database's server-wide PITR rows (base_backup, wal_gap, wal_archive) are not this database's jobs
+    SELECT * INTO le FROM pgbx.history WHERE history.state='failed'
+       AND history.kind NOT IN ('base_backup', 'wal_gap', 'wal_archive') ORDER BY id DESC LIMIT 1;
     SELECT * INTO lv FROM pgbx.history WHERE kind='verify' AND history.state IN ('done','failed') ORDER BY id DESC LIMIT 1;
     SELECT max(requested_at) INTO last_auto FROM pgbx.history WHERE kind='backup' AND trigger IN ('schedule','first');
     RETURN QUERY SELECT
         current_database()::name,
         CASE WHEN NOT cfg.enabled THEN 'paused'
-             WHEN EXISTS (SELECT 1 FROM pgbx.history h WHERE h.state='running') THEN 'running'
+             WHEN EXISTS (SELECT 1 FROM pgbx.history h WHERE h.state='running'
+                          AND h.kind NOT IN ('base_backup', 'wal_gap', 'wal_archive')) THEN 'running'
              WHEN lb.id IS NULL THEN 'waiting for first backup'
              WHEN le.id > lb.id THEN 'failing'
              ELSE 'active' END,
@@ -507,10 +531,11 @@ BEGIN
         format('s3://%s/%s/%s/', current_setting('pgbx.s3_bucket', true),
                coalesce(nullif(current_setting('pgbx.server_name', true), ''), '<hostname>'),
                coalesce(cfg.path, current_database())),
-        (SELECT max(h.id) FROM pgbx.history h WHERE h.state='running'),
+        (SELECT max(h.id) FROM pgbx.history h WHERE h.state='running' AND h.kind NOT IN ('wal_gap', 'wal_archive')),
         nq.id, (nq.params->>'queue_position')::int,
         coalesce(nq.params->>'wait_reason', CASE WHEN nq.id IS NOT NULL THEN 'queued; the worker picks it up within pgbx.poll_seconds' END),
-        (SELECT j.progress FROM pgbx.history h, pgbx.job_eta(h.id) j WHERE h.state='running' ORDER BY h.id DESC LIMIT 1),
+        (SELECT j.progress FROM pgbx.history h, pgbx.job_eta(h.id) j WHERE h.state='running' AND h.kind NOT IN ('wal_gap', 'wal_archive')
+          ORDER BY h.id DESC LIMIT 1),
         CASE WHEN nq.id IS NOT NULL THEN (SELECT j.progress FROM pgbx.job_eta(nq.id) j)
              WHEN cfg.enabled THEN format('next backup %s, takes ~%s',
                  CASE WHEN last_auto IS NULL THEN 'within a minute (first backup)'
@@ -906,7 +931,7 @@ $$;
 CREATE FUNCTION pgbx._doctor() RETURNS TABLE (name text, ok bool, detail text, fix text)
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
-    o record; v text; lim interval; n int; bad text; worst_ratio float8 := -1; su bool;
+    o record; v text; lim interval; n int; bad text; worst_ratio float8 := -1; su bool; p record;
 BEGIN
     PERFORM pgbx._require_admin_db();
     su := coalesce((SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = session_user), false);
@@ -980,17 +1005,50 @@ BEGIN
     fix := CASE WHEN ok THEN NULL ELSE 'make sure pgbx is in shared_preload_libraries and restart Postgres; a crashed worker restarts within 10 s — check the Postgres log' END;
     RETURN NEXT;
 
-    -- informational only: pgbx itself never needs WAL archiving
-    name := 'archive_mode';
-    v := coalesce(current_setting('archive_command', true), '');
-    ok := true;
-    detail := 'archive_mode = ' || current_setting('archive_mode') ||
-              CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
-                   THEN ' with no archive_command: archive_mode=on with no archive_command set by pgbx is not needed for pgbx'
-                   ELSE '' END;
-    fix := CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
-                THEN 'optional: if nothing else uses WAL archiving, set archive_mode = off at the next planned restart' END;
-    RETURN NEXT;
+    -- point-in-time restore is optional (pgbx.pitr); per-database dumps never need WAL archiving
+    IF coalesce(current_setting('pgbx.pitr', true), 'off') NOT IN ('on', 'true', '1', 'yes') THEN
+        name := 'archive_mode';
+        v := coalesce(current_setting('archive_command', true), '');
+        ok := true;
+        detail := 'archive_mode = ' || current_setting('archive_mode') || '; point-in-time restore is off (pgbx.pitr)' ||
+                  CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
+                       THEN ' and archive_mode=on with no archive_command is not needed for pgbx'
+                       ELSE '' END;
+        fix := CASE WHEN current_setting('archive_mode') <> 'off' AND v IN ('', '(disabled)')
+                    THEN 'optional: if nothing else uses WAL archiving, set archive_mode = off at the next planned restart' END;
+        RETURN NEXT;
+    ELSE
+        SELECT * INTO p FROM pgbx.pitr_status();
+        name := 'pitr archiving';
+        v := coalesce(current_setting('archive_command', true), '');
+        ok := current_setting('archive_mode') <> 'off' AND v ~ ' wal-push %p' AND NOT p.state LIKE 'archiving failing%';
+        detail := CASE
+            WHEN current_setting('archive_mode') = 'off' THEN 'pgbx.pitr is on but archive_mode is off: no WAL is archived'
+            WHEN v !~ ' wal-push %p' THEN 'archive_command is not pgbx wal-push: ' || CASE WHEN su THEN v ELSE '(set)' END
+            WHEN p.state LIKE 'archiving failing%' THEN coalesce(p.last_error, 'WAL archiving is failing')
+            ELSE format('WAL archived until %s; %s file(s) waiting (%s)', p.wal_archived_until, p.backlog_segments, pg_size_pretty(p.backlog_bytes)) END;
+        fix := CASE
+            WHEN current_setting('archive_mode') = 'off' THEN 'run pgbx setup pitr --yes, then restart Postgres once'
+            WHEN v !~ ' wal-push %p' THEN 'run pgbx setup pitr --yes (it refuses to replace an archive_command another tool set)'
+            WHEN NOT ok THEN 'check S3 reachability and credentials; the Postgres log shows the pgbx wal-push error' END;
+        RETURN NEXT;
+
+        name := 'pitr base backups';
+        lim := pgbx._overdue_after(coalesce(nullif(current_setting('pgbx.pitr_schedule', true), ''), 'daily at 01:00'));
+        ok := p.last_base_backup_at IS NOT NULL AND (lim IS NULL OR now() - p.last_base_backup_at <= lim);
+        detail := CASE WHEN p.last_base_backup_at IS NULL THEN 'no base backup yet, so no point-in-time restore is possible yet'
+                       ELSE format('newest base backup %s (%s ago); restorable from %s; %s kept', p.last_base_backup,
+                                   date_trunc('second', now() - p.last_base_backup_at), p.restorable_from, p.base_backups) END;
+        fix := CASE WHEN ok THEN NULL ELSE 'SELECT pgbx.pitr_backup_now(); then SELECT * FROM pgbx.pitr_status() (see last_error)' END;
+        RETURN NEXT;
+
+        name := 'pitr gaps';
+        ok := p.open_gaps = 0;
+        detail := CASE WHEN ok THEN coalesce('no open WAL gap; earlier: ' || p.gaps, 'no WAL gap recorded')
+                       ELSE 'WAL was dropped (pgbx.wal_queue_max): no restore to ' || p.gaps END;
+        fix := CASE WHEN ok THEN NULL ELSE 'fix archiving (see pitr archiving); a base backup is queued automatically once WAL reaches S3 again and closes the gap' END;
+        RETURN NEXT;
+    END IF;
 
     name := 'replication_slots';
     SELECT string_agg(format('%s (%s, %s, holds %s)', r.slot_name, r.slot_type, coalesce(r.wal_status, '?'),
@@ -1166,6 +1224,87 @@ BEGIN
                 ELSE format('backups keep every table definition; rows skipped for %s table(s) right now — see pgbx.rowless_tables()', n) END;
 END $$;
 
+-- Point-in-time restore (optional, pgbx.pitr = on): state written by the worker in the admin database.
+CREATE TABLE pgbx.pitr_state (
+    id           int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    system_id    text,
+    work_dir     text,
+    base_backups jsonb NOT NULL DEFAULT '[]',      -- backup.json of every kept base backup, oldest first
+    updated_at   timestamptz
+);
+
+-- One row answering "can I restore this server to any moment, and from when?". Admin database only.
+CREATE FUNCTION pgbx.pitr_status() RETURNS TABLE (
+    enabled bool, state text, archive_mode text, schedule text, retention text,
+    last_base_backup_at timestamptz, last_base_backup text, base_backups int,
+    restorable_from timestamptz, wal_archived_until timestamptz,
+    open_gaps bigint, gaps text, backlog_segments bigint, backlog_bytes bigint,
+    last_error text, location text
+) LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    st pgbx.pitr_state; lb pgbx.history; le pgbx.history; inc pgbx.history; og pgbx.history;
+    en bool; n bigint; seg bigint; rf timestamptz;
+BEGIN
+    PERFORM pgbx._require_admin_db();
+    en := coalesce(current_setting('pgbx.pitr', true), 'off') IN ('on', 'true', '1', 'yes');
+    SELECT * INTO st FROM pgbx.pitr_state s WHERE s.id = 1;
+    SELECT * INTO lb FROM pgbx.history h WHERE h.kind = 'base_backup' AND h.state = 'done' ORDER BY h.id DESC LIMIT 1;
+    SELECT * INTO le FROM pgbx.history h WHERE h.kind = 'base_backup' AND h.state = 'failed' ORDER BY h.id DESC LIMIT 1;
+    SELECT * INTO inc FROM pgbx.history h WHERE h.kind = 'wal_archive' AND h.state = 'running' ORDER BY h.id DESC LIMIT 1;
+    SELECT * INTO og FROM pgbx.history h WHERE h.kind = 'wal_gap' AND h.state = 'running' ORDER BY h.id DESC LIMIT 1;
+    seg := pg_size_bytes(current_setting('wal_segment_size'));
+    SELECT count(*) INTO n FROM pg_ls_archive_statusdir() s WHERE s.name LIKE '%.ready';
+    SELECT min((b->>'stop_time')::timestamptz) INTO rf FROM jsonb_array_elements(coalesce(st.base_backups, '[]')) b;
+    rf := coalesce(rf, (lb.params->>'stop_time')::timestamptz);
+    RETURN QUERY SELECT
+        en,
+        CASE WHEN NOT en THEN 'off'
+             WHEN current_setting('archive_mode') = 'off' THEN 'restart needed (archive_mode is off)'
+             WHEN og.id IS NOT NULL THEN 'gap: WAL was dropped; restores refused from ' ||
+                  ((og.params->>'safe_until')::timestamptz - make_interval(secs => coalesce((og.params->>'margin_s')::int, 60)))::text
+             WHEN inc.id IS NOT NULL THEN 'archiving failing'
+             WHEN EXISTS (SELECT 1 FROM pgbx.history h WHERE h.kind = 'base_backup' AND h.state = 'running') AND lb.id IS NULL
+                  THEN 'first base backup running'
+             WHEN lb.id IS NULL THEN 'waiting for first base backup'
+             WHEN le.id > lb.id THEN 'base backups failing'
+             ELSE 'active' END,
+        current_setting('archive_mode'),
+        coalesce(nullif(current_setting('pgbx.pitr_schedule', true), ''), 'daily at 01:00'),
+        coalesce(nullif(current_setting('pgbx.pitr_retention', true), ''), '7 days'),
+        lb.finished, lb.params->>'label',
+        greatest(jsonb_array_length(coalesce(st.base_backups, '[]')), CASE WHEN lb.id IS NULL THEN 0 ELSE 1 END),
+        rf,
+        CASE WHEN og.id IS NOT NULL
+             THEN (og.params->>'safe_until')::timestamptz - make_interval(secs => coalesce((og.params->>'margin_s')::int, 60))
+             ELSE (SELECT a.last_archived_time FROM pg_stat_archiver a) END,
+        (SELECT count(*) FROM pgbx.history h WHERE h.kind = 'wal_gap' AND h.state = 'running'),
+        (SELECT string_agg(format('#%s %s .. %s', h.id,
+                    date_trunc('second', (h.params->>'safe_until')::timestamptz - make_interval(secs => coalesce((h.params->>'margin_s')::int, 60))),
+                    coalesce(date_trunc('second', (h.params->>'healed_at')::timestamptz)::text, 'open')), '; ' ORDER BY h.id)
+           FROM pgbx.history h WHERE h.kind = 'wal_gap'
+            AND (h.state = 'running' OR rf IS NULL OR (h.params->>'healed_at')::timestamptz > rf)),
+        n, n * seg,
+        coalesce(inc.error, CASE WHEN le.id > coalesce(lb.id, 0) THEN le.error END),
+        format('s3://%s/%s/%s/', current_setting('pgbx.s3_bucket', true),
+               coalesce(nullif(current_setting('pgbx.server_name', true), ''), '<hostname>'), coalesce(st.system_id, '<system id>'));
+END $$;
+
+-- Queue a base backup now (superuser; admin database). Returns the history id.
+CREATE FUNCTION pgbx.pitr_backup_now() RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE jid bigint;
+BEGIN
+    PERFORM pgbx._require_admin_db();
+    IF NOT coalesce((SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = session_user), false) THEN
+        RAISE EXCEPTION 'pgbx: pitr_backup_now() needs a superuser';
+    END IF;
+    IF coalesce(current_setting('pgbx.pitr', true), 'off') NOT IN ('on', 'true', '1', 'yes') THEN
+        RAISE EXCEPTION 'pgbx: point-in-time restore is off on this server (pgbx.pitr); enable it with: pgbx setup pitr --yes';
+    END IF;
+    INSERT INTO pgbx.history (kind, trigger) VALUES ('base_backup', 'manual') RETURNING id INTO jid;
+    RETURN jid;
+END $$;
+
+
 -- Queue a backup now. Returns the history id; watch it in pgbx.history. While a backup of this database is still
 -- queued it returns that one instead (pgbx.coalesce_manual), so calling it five times costs one dump.
 CREATE FUNCTION pgbx.backup_now() RETURNS bigint LANGUAGE plpgsql AS $$
@@ -1208,7 +1347,7 @@ GRANT USAGE ON SCHEMA pgbx TO pgbx_viewer;
 
 -- viewer: read-only
 GRANT SELECT ON pgbx.config, pgbx.history, pgbx.backups, pgbx.server_overview, pgbx.server_queue, pgbx.server_capacity,
-      pgbx.activity_hourly TO pgbx_viewer;
+      pgbx.activity_hourly, pgbx.pitr_state TO pgbx_viewer;
 GRANT EXECUTE ON FUNCTION pgbx.status(), pgbx.overview(), pgbx.to_cron(text),
       pgbx.next_run_epoch(text, double precision), pgbx._require_admin_db(),
       pgbx.rowless_tables(), pgbx._like(text), pgbx._dur(double precision), pgbx._estimate(text) TO pgbx_viewer;
@@ -1220,6 +1359,9 @@ GRANT EXECUTE ON FUNCTION pgbx.suggest_window(int) TO pgbx_viewer;
 -- doctor() reads server-wide settings and slots: runs as the extension owner, viewers may call it
 ALTER FUNCTION pgbx.doctor() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.doctor() TO pgbx_viewer;
+-- pitr_status() reads the archiver and archive_status: runs as the extension owner, viewers may call it
+ALTER FUNCTION pgbx.pitr_status() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.pitr_status() TO pgbx_viewer;
 
 -- admin: management functions run as the extension owner (so admins never need write access to the tables)
 DO $lock$
@@ -1236,7 +1378,8 @@ BEGIN
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pgbx_admin', f);
     END LOOP;
 END $lock$;
--- internals (_presign, _log, _check_days, _queue_manual, _notice_eta, _activity_add, _gfs_span): superuser only — no grants.
+-- internals (_presign, _log, _check_days, _queue_manual, _notice_eta, _activity_add, _gfs_span) and pitr_backup_now():
+-- superuser only — no grants.
 -- (_estimate only reads: status() calls it as the viewer.)
 "#,
     name = "lockdown",

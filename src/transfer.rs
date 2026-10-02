@@ -212,22 +212,28 @@ fn forget_upload(id: &str) {
 }
 
 /// At worker start: abort every upload a crash left in the list (they are never a backup and cost storage).
-pub fn abort_remembered(b: &Bucket) {
+/// Take the list (on the main thread, before any job starts: a local file, instant), so uploads remembered later
+/// by new jobs are never in it. Returns (key, upload id) pairs.
+pub fn take_remembered() -> Vec<(String, String)> {
     let _g = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(text) = std::fs::read_to_string(OPEN_UPLOADS) else { return };
-    let mut left = String::new();
-    for l in text.lines() {
-        let Some((key, id)) = l.split_once('\t') else { continue };
+    let Ok(text) = std::fs::read_to_string(OPEN_UPLOADS) else { return vec![] };
+    let _ = std::fs::remove_file(OPEN_UPLOADS);
+    text.lines().filter_map(|l| l.split_once('\t').map(|(k, i)| (k.to_string(), i.to_string()))).collect()
+}
+
+/// Abort the uploads `take_remembered` returned (on a cleanup thread: S3 may be slow or down). One that cannot be
+/// aborted now goes back on the list for the next start.
+pub fn abort_remembered(b: &Bucket, list: &[(String, String)]) {
+    for (key, id) in list {
         match b.abort_upload(key, id) {
             Ok(_) => log(&format!("aborted orphaned upload {key}")),
             Err(e) if e.to_string().contains("NoSuchUpload") || e.to_string().contains("404") => {}
             Err(e) => {
                 log(&format!("abort orphaned upload {key}: {e}; retried at the next start"));
-                left.push_str(&format!("{l}\n"));
+                remember_upload(key, id);
             }
         }
     }
-    let _ = if left.is_empty() { std::fs::remove_file(OPEN_UPLOADS) } else { std::fs::write(OPEN_UPLOADS, left) };
 }
 
 /// Writer wrapper that remembers whether the *destination* failed (pg_restore died) vs the network.
@@ -316,11 +322,15 @@ pub fn download_resumable<W: Write + Send>(
 }
 
 /// Abort multipart uploads under `prefix` that a crash left behind (they cost storage and are never a backup).
-pub fn abort_orphans(b: &Bucket, prefix: &str) {
+/// Only the worker's own kinds of object (dumps and their roles files): a point-in-time base backup that a
+/// `pgbx pitr backup` process is uploading right now under the same server folder must never be cut off.
+/// Only uploads initiated before `before` (the worker's start): one a job of this worker started since is live.
+pub fn abort_orphans(b: &Bucket, prefix: &str, before: chrono::DateTime<chrono::Utc>) {
+    let old = |t: &str| chrono::DateTime::parse_from_rfc3339(t).is_ok_and(|t| t < before);
     match b.list_multiparts_uploads(Some(prefix), None) {
         Ok(pages) => {
             for page in pages {
-                for u in page.uploads {
+                for u in page.uploads.into_iter().filter(|u| is_worker_object(&u.key) && old(&u.initiated)) {
                     if b.abort_upload(&u.key, &u.id).is_ok() {
                         log(&format!("aborted orphaned upload {}", u.key));
                     }
@@ -331,9 +341,22 @@ pub fn abort_orphans(b: &Bucket, prefix: &str) {
     }
 }
 
+/// Objects the worker uploads itself: `<server>/<db>/<ts>.dump` and `<ts>.globals.sql.zst`.
+pub fn is_worker_object(key: &str) -> bool {
+    key.ends_with(".dump") || key.ends_with(".globals.sql.zst")
+}
+
 #[cfg(test)]
 mod t {
     use super::*;
+
+    #[test]
+    fn orphan_abort_spares_base_backups() {
+        assert!(is_worker_object("srv/shop/2026-10-01T02-00-00Z.dump"));
+        assert!(is_worker_object("srv/shop/2026-10-01T02-00-00Z.globals.sql.zst"));
+        assert!(!is_worker_object("srv/7300000000000000000/base/20261001T010000Z/base.tar.zst"));
+        assert!(!is_worker_object("srv/7300000000000000000/wal/00000001/000000010000000000000003.zst"));
+    }
 
     #[test]
     fn medians() {
