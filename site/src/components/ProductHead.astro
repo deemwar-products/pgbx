@@ -1,0 +1,7 @@
+---
+import Default from '@astrojs/starlight/components/Head.astro';
+import { accentCss } from '../product';
+---
+
+<Default />
+<Fragment set:html={`<style>${accentCss()}</style>`} />

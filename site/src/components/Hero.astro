@@ -1,0 +1,29 @@
+---
+import Default from '@astrojs/starlight/components/Hero.astro';
+import Sketch from '../assets/architecture.svg';
+---
+
+<div class="product-hero">
+	<Default />
+	<figure class="arch-sketch">
+		<Sketch />
+	</figure>
+</div>
+
+<style>
+	.product-hero {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.arch-sketch {
+		width: min(100% - 2rem, 72rem);
+		margin: 0.5rem auto 0.25rem;
+	}
+
+	.arch-sketch :global(svg) {
+		display: block;
+		width: 100%;
+		height: auto;
+	}
+</style>

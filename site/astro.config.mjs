@@ -14,6 +14,10 @@ export default defineConfig({
     starlight({
       title: 'pgbx',
       description: "Create a database. It's backed up. Zero-touch Postgres backups to S3.",
+      components: {
+        Head: './src/components/ProductHead.astro',
+        Hero: './src/components/Hero.astro',
+      },
       // editLink: add { baseUrl: 'https://github.com/<org>/pgbx/edit/main/site/' } once the repo exists
       sidebar: [
         { label: 'Getting started', items: [{ autogenerate: { directory: 'getting-started' } }] },
