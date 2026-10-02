@@ -1,0 +1,7 @@
+{
+  "name": "pgbx-adapters",
+  "private": true,
+  "description": "Example connection adapters for pgbx (ADR 0003). No dependencies; Node 18+.",
+  "license": "MIT",
+  "scripts": { "test": "node --test test/adapters.test.js" }
+}
