@@ -197,6 +197,8 @@ read queries (one statement, inside BEGIN READ ONLY, then ROLLBACK):
       -> columns[{name,type}], rows[], row_count, truncated
 common: --json --profile NAME --url URL --host --port --user --admin-db --timeout SECS
         (PGBX_URL, PGBX_PROFILE, PGHOST/PGPORT/PGUSER honoured; PGPASSWORD when the url has no password)
+        TLS: libpq sslmode (default prefer; require, verify-ca, verify-full + sslrootcert) from the url,
+        the profile's sslmode/sslrootcert keys, or PGSSLMODE/PGSSLROOTCERT
 TS always carries a UTC offset: '2026-01-31 14:00:00+00'";
 
 // ---------------------------------------------------------------- safety
