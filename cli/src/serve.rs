@@ -12,7 +12,7 @@
 //!   - actions are OFF unless `--allow-safe`, and then only the safe tier (backup now, verify now, restore into a
 //!     NEW database, cancel a queued job), through the CLI's own code paths. Never guarded or destructive ones.
 
-use crate::{client_only, jobs, memories, profile, query, rows, ui, Args, Ctx, Level};
+use crate::{client_only, memories, profile, query, rows, ui, Args, Ctx, Level};
 use postgres::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -374,11 +374,21 @@ fn api_action(s: &Session, kind: &str, b: &Value) -> Result<Value, String> {
         "verify" => crate::cmd_verify(&mut cx),
         "restore" => crate::cmd_db_restore(&mut cx),
         _ => {
+            // queued only, atomically: the row lock holds off the worker, whose start re-checks state='queued',
+            // so a job that would start right now is either cancelled before it starts or refused here
             let id = b["job_id"].as_i64().unwrap_or(0);
-            let mut c = ui::ro_connect(&s.cx, &db)?;
-            let st = crate::one(&mut c, "SELECT state FROM pgbx.history WHERE id = $1", &[&id])?;
-            match st["state"].as_str() {
-                Some("queued") => jobs::run(&mut cx),
+            let mut c = cx.connect(&db)?;
+            let mut t = c.transaction().map_err(crate::pe)?;
+            let st: Option<String> = t
+                .query_opt("SELECT state FROM pgbx.history WHERE id = $1 FOR UPDATE", &[&id])
+                .map_err(crate::pe)?
+                .map(|r| r.get(0));
+            match st.as_deref() {
+                Some("queued") => {
+                    let msg: String = t.query_one("SELECT pgbx.cancel($1)", &[&id]).map_err(crate::pe)?.get(0);
+                    t.commit().map_err(crate::pe)?;
+                    Ok(json!({"ok": true, "database": db, "job_id": id, "message": msg}))
+                }
                 Some(x) => Err(format!("job {id} in {db} is {x}: the UI only cancels queued jobs; \
                                         a running one: pgbx jobs cancel {id} --db {db} --yes")),
                 None => Err(format!("no job {id} in {db}")),
