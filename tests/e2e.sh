@@ -209,6 +209,24 @@ r=$(capped "$id"); echo "  restore: $r MiB/s"; check "download at 2 MiB/s ±10%"
 check "capped restore is complete" "$(P -d big_capped -c 'SELECT count(*) FROM blob')" 1000000
 P -c "ALTER SYSTEM RESET pgbx.upload_kbps" -c "ALTER SYSTEM RESET pgbx.download_kbps" -c "SELECT pg_reload_conf()" >/dev/null
 
+echo "## 18. coalesced backup_now() / verify_now() and cancel() of a queued job"
+# one transaction, so the worker cannot pick the job up between the calls
+r=$(P -d shop -c "BEGIN" -c "SELECT pgbx.backup_now()" -c "SELECT pgbx.backup_now()" -c "SELECT pgbx.backup_now()" -c "SELECT pgbx.backup_now()" -c "SELECT pgbx.backup_now()" -c "COMMIT" 2>/dev/null | sort -u)
+check "5x backup_now() in a row = one job" "$(echo "$r" | wc -l | tr -d ' ')" 1
+check "coalesced count recorded" "$(P -d shop -c "SELECT params->>'coalesced' FROM pgbx.history WHERE id=$r")" 4
+r=$(wait_job shop "$r"); check "that one job runs" "${r%% *}" done
+r=$(P -d shop -c "BEGIN" -c "SELECT pgbx.verify_now()" -c "SELECT pgbx.verify_now()" -c "COMMIT" 2>/dev/null | sort -u)
+check "2x verify_now() = one job" "$(echo "$r" | wc -l | tr -d ' ')" 1
+P -d shop -c "SELECT pgbx.cancel($r)" >/dev/null
+check "queued restore test cancelled" "$(P -d shop -c "SELECT state FROM pgbx.history WHERE id=$r")" cancelled
+sleep 3; check "a cancelled job never starts" "$(P -d shop -c "SELECT state||'|'||(started IS NULL) FROM pgbx.history WHERE id=$r")" "cancelled|true"
+bad=$(P -d shop -c "SELECT pgbx.cancel($r)" 2>&1); case "$bad" in *"only a queued job can be cancelled"*) echo "  PASS cancel of a finished job refused"; pass=$((pass+1));; *) echo "  FAIL: $bad"; fail=$((fail+1));; esac
+P -c "ALTER SYSTEM SET pgbx.coalesce_manual = off" -c "SELECT pg_reload_conf()" >/dev/null; sleep 1
+r=$(P -d shop -c "BEGIN" -c "SELECT pgbx.backup_now()" -c "SELECT pgbx.backup_now()" -c "COMMIT" 2>/dev/null | sort -u)
+check "coalesce_manual=off queues each call" "$(echo "$r" | wc -l | tr -d ' ')" 2
+for j in $r; do P -d shop -c "SELECT pgbx.cancel($j)" >/dev/null 2>&1; done
+P -c "ALTER SYSTEM RESET pgbx.coalesce_manual" -c "SELECT pg_reload_conf()" >/dev/null
+
 echo "## status()"; P -d shop -x -c "SELECT * FROM pgbx.status()" | sed 's/^/  /'
 echo "## backups"; P -d shop -c "SELECT id, taken_at::timestamp(0), trigger, size, s3_key FROM pgbx.backups" | sed 's/^/  /'
 echo "## history of shop"; P -d shop -c "SELECT id, kind, trigger, state, coalesce(s3_key,'-') FROM pgbx.history ORDER BY id" | sed 's/^/  /'

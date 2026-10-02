@@ -50,6 +50,10 @@ your app's locks.
 
 The child connections show in `pg_stat_activity` as `pgbx_dump`, `pgbx_restore` and `pgbx_verify`.
 
+| setting | default | |
+|---|---|---|
+| `pgbx.coalesce_manual` | `on` | `backup_now()` / `verify_now()` return the job of that kind already queued instead of adding another |
+
 ## Removed in 0.5.0
 
 `cluster_backups`, `cluster_schedule`, `cluster_retention_full`, `cluster_full_every`, `cluster_process_max`,

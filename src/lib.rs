@@ -68,6 +68,7 @@ pub static DOCTOR_LONG_JOB: GucSetting<i32> = GucSetting::<i32>::new(3600); // s
 pub static DEFER_BACKOFF: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"1,2,4,8,15"));
 pub static MAX_DEFER: GucSetting<i32> = GucSetting::<i32>::new(4 * 3600); // s
 pub static MAX_DEFER_FIRST: GucSetting<i32> = GucSetting::<i32>::new(15 * 60); // s
+pub static COALESCE_MANUAL: GucSetting<bool> = GucSetting::<bool>::new(true);
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.s3_endpoint", c"S3 endpoint URL", c"e.g. https://hel1.your-objectstorage.com", &S3_ENDPOINT, GucContext::Sighup, GucFlags::default());
@@ -94,6 +95,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.defer_backoff", c"Minutes between retries of a deferred backup", c"comma list, each 1-60; the last value repeats", &DEFER_BACKOFF, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.max_defer", c"A deferred backup runs anyway this long after it was queued", c"capped at the schedule interval; backups are never skipped", &MAX_DEFER, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
     GucRegistry::define_int_guc(c"pgbx.max_defer_first", c"max_defer for a new database's first backup", c"", &MAX_DEFER_FIRST, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_bool_guc(c"pgbx.coalesce_manual", c"backup_now() / verify_now() return the job already queued instead of adding another", c"", &COALESCE_MANUAL, GucContext::Sighup, GucFlags::default());
 
     // Only register the worker when loaded at server start (shared_preload_libraries),
     // not when a backend loads the library for CREATE EXTENSION.
@@ -160,7 +162,7 @@ CREATE TABLE pgbx.history (
     kind         text NOT NULL CHECK (kind IN ('backup', 'restore', 'config', 'pause', 'resume', 'prune', 'verify')),
     trigger      text NOT NULL DEFAULT 'manual' CHECK (trigger IN ('manual', 'schedule', 'first', 'migration')),
     params       jsonb NOT NULL DEFAULT '{}',
-    state        text NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired')),
+    state        text NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired', 'cancelled')),
     requested_at timestamptz NOT NULL DEFAULT now(),
     started      timestamptz,
     finished     timestamptz,
@@ -322,10 +324,46 @@ BEGIN
                coalesce(cfg.path, current_database()));
 END $$;
 
--- Restore test: restore the newest backup into a scratch database, check it, drop it.
-CREATE FUNCTION pgbx.verify_now() RETURNS bigint LANGUAGE sql AS $$
-    INSERT INTO pgbx.history (kind, trigger) VALUES ('verify', 'manual') RETURNING id
-$$;
+-- internal: queue a manual job, or (pgbx.coalesce_manual, default on) return the one of that kind already queued
+-- in this database
+CREATE FUNCTION pgbx._queue_manual(k text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE j bigint;
+BEGIN
+    IF coalesce(current_setting('pgbx.coalesce_manual', true), 'on') <> 'off' THEN
+        PERFORM pg_advisory_xact_lock(hashtext('pgbx_coalesce'), hashtext(k));
+        SELECT id INTO j FROM pgbx.history WHERE kind = k AND state = 'queued' ORDER BY id LIMIT 1;
+        IF j IS NOT NULL THEN
+            UPDATE pgbx.history SET params = params || jsonb_build_object('manual', true,
+                       'coalesced', coalesce((params->>'coalesced')::int, 0) + 1)
+             WHERE id = j;
+            RAISE NOTICE 'pgbx: % job % is already queued; returning it instead of adding another', k, j;
+            RETURN j;
+        END IF;
+    END IF;
+    INSERT INTO pgbx.history (kind, trigger) VALUES (k, 'manual') RETURNING id INTO j;
+    RETURN j;
+END $$;
+
+-- Cancel a queued job of this database: it never starts and ends as 'cancelled'.
+CREATE FUNCTION pgbx.cancel(job_id bigint) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE h pgbx.history;
+BEGIN
+    SELECT * INTO h FROM pgbx.history WHERE id = job_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgbx: no job % in database %', job_id, current_database();
+    ELSIF h.state = 'queued' THEN
+        UPDATE pgbx.history SET state = 'cancelled', finished = now(), error = 'cancelled by ' || session_user WHERE id = job_id;
+        RETURN format('%s job %s cancelled before it started', h.kind, job_id);
+    END IF;
+    RAISE EXCEPTION 'pgbx: job % is % (only a queued job can be cancelled)', job_id, h.state;
+END $$;
+
+-- Restore test: restore the newest backup into a scratch database, check it, drop it. Like backup_now(), returns
+-- the restore test already queued (pgbx.coalesce_manual) instead of adding another.
+CREATE FUNCTION pgbx.verify_now() RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN pgbx._queue_manual('verify');
+END $$;
 
 -- 'weekly on sunday at 04:00', 'daily at 05:00', ... or 'never'.
 CREATE FUNCTION pgbx.set_verify_schedule(schedule text) RETURNS text LANGUAGE plpgsql AS $$
@@ -577,10 +615,12 @@ BEGIN
                 ELSE format('backups keep every table definition; rows skipped for %s table(s) right now — see pgbx.rowless_tables()', n) END;
 END $$;
 
--- Queue a backup now. Returns the history id; watch it in pgbx.history.
-CREATE FUNCTION pgbx.backup_now() RETURNS bigint LANGUAGE sql AS $$
-    INSERT INTO pgbx.history (kind, trigger) VALUES ('backup', 'manual') RETURNING id
-$$;
+-- Queue a backup now. Returns the history id; watch it in pgbx.history. While a backup of this database is still
+-- queued it returns that one instead (pgbx.coalesce_manual), so calling it five times costs one dump.
+CREATE FUNCTION pgbx.backup_now() RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN pgbx._queue_manual('backup');
+END $$;
 
 -- Queue a restore of this database's newest backup taken at or before `at` into a NEW database `into_db`.
 -- The live database is never touched; swap names yourself once the restore is verified.
@@ -620,13 +660,13 @@ BEGIN
         'pgbx.set_retention(int, int)', 'pgbx.pause(text)', 'pgbx.resume()',
         'pgbx.backup_now()', 'pgbx.restore(text, timestamptz)', 'pgbx.verify_now()',
         'pgbx.set_verify_schedule(text)', 'pgbx.download_url(bigint, interval)',
-        'pgbx.set_data_scope(text[], text[])']
+        'pgbx.set_data_scope(text[], text[])', 'pgbx.cancel(bigint)']
     LOOP
         EXECUTE format('ALTER FUNCTION %s SECURITY DEFINER SET search_path = pg_catalog, pgbx', f);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pgbx_admin', f);
     END LOOP;
 END $lock$;
--- internals (_presign, _log, _check_days): superuser only — no grants.
+-- internals (_presign, _log, _check_days, _queue_manual): superuser only — no grants.
 "#,
     name = "lockdown",
     finalize

@@ -148,7 +148,8 @@ impl<W: Write> Write for Tracked<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if shutting_down() {
             *self.dest_failed = true;
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Postgres is shutting down"));
+            // not Interrupted: write_all retries that forever and the shutdown would hang
+            return Err(std::io::Error::other("Postgres is shutting down"));
         }
         match self.inner.write(buf) {
             Ok(k) => {

@@ -12,6 +12,9 @@
 - pg_restore runs with `synchronous_commit=off` (`pgbx.restore_synchronous_commit`).
 - Bandwidth caps `pgbx.upload_kbps` / `pgbx.download_kbps` (KiB/s, 0 = unlimited).
 - doctor(): `long_running_job` (`pgbx.doctor_long_job`, 1h).
+- `backup_now()` / `verify_now()` return the job already queued instead of adding another (`pgbx.coalesce_manual`,
+  on); new `pgbx.cancel(job_id)` cancels a queued job (state `cancelled`). Cancelling a running job is not in 0.6.0.
+- Fix: a shutdown during a restore download no longer hangs (the writer returned `Interrupted`, which `write_all` retries).
 - Schema update script `pgbx--0.5.0--0.6.0.sql` (the worker applies it by itself).
 
 ## 0.5.0

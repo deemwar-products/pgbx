@@ -124,3 +124,59 @@ BEGIN
                      || 'or skip the rows of big tables with pgbx.set_data_scope()' END;
     RETURN NEXT;
 END $$;
+
+-- coalesced manual jobs and cancel (ADR 0001 §0); the server-wide queue itself is not in 0.6.0
+ALTER TABLE pgbx.history DROP CONSTRAINT IF EXISTS history_state_check;
+ALTER TABLE pgbx.history ADD CONSTRAINT history_state_check
+    CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired', 'cancelled'));
+
+-- internal: queue a manual job, or (pgbx.coalesce_manual, default on) return the one of that kind already queued
+-- in this database
+CREATE OR REPLACE FUNCTION pgbx._queue_manual(k text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE j bigint;
+BEGIN
+    IF coalesce(current_setting('pgbx.coalesce_manual', true), 'on') <> 'off' THEN
+        PERFORM pg_advisory_xact_lock(hashtext('pgbx_coalesce'), hashtext(k));
+        SELECT id INTO j FROM pgbx.history WHERE kind = k AND state = 'queued' ORDER BY id LIMIT 1;
+        IF j IS NOT NULL THEN
+            UPDATE pgbx.history SET params = params || jsonb_build_object('manual', true,
+                       'coalesced', coalesce((params->>'coalesced')::int, 0) + 1)
+             WHERE id = j;
+            RAISE NOTICE 'pgbx: % job % is already queued; returning it instead of adding another', k, j;
+            RETURN j;
+        END IF;
+    END IF;
+    INSERT INTO pgbx.history (kind, trigger) VALUES (k, 'manual') RETURNING id INTO j;
+    RETURN j;
+END $$;
+
+-- Cancel a queued job of this database: it never starts and ends as 'cancelled'.
+CREATE OR REPLACE FUNCTION pgbx.cancel(job_id bigint) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE h pgbx.history;
+BEGIN
+    SELECT * INTO h FROM pgbx.history WHERE id = job_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgbx: no job % in database %', job_id, current_database();
+    ELSIF h.state = 'queued' THEN
+        UPDATE pgbx.history SET state = 'cancelled', finished = now(), error = 'cancelled by ' || session_user WHERE id = job_id;
+        RETURN format('%s job %s cancelled before it started', h.kind, job_id);
+    END IF;
+    RAISE EXCEPTION 'pgbx: job % is % (only a queued job can be cancelled)', job_id, h.state;
+END $$;
+
+CREATE OR REPLACE FUNCTION pgbx.verify_now() RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN pgbx._queue_manual('verify');
+END $$;
+
+CREATE OR REPLACE FUNCTION pgbx.backup_now() RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN pgbx._queue_manual('backup');
+END $$;
+
+REVOKE ALL ON FUNCTION pgbx._queue_manual(text), pgbx.cancel(bigint) FROM PUBLIC;
+ALTER FUNCTION pgbx.cancel(bigint) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+GRANT EXECUTE ON FUNCTION pgbx.cancel(bigint) TO pgbx_admin;
+-- CREATE OR REPLACE resets SECURITY DEFINER / search_path: restore them as the install's lockdown sets them
+ALTER FUNCTION pgbx.backup_now() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+ALTER FUNCTION pgbx.verify_now() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
