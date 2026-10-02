@@ -102,8 +102,8 @@ P -d gate -c "SELECT pgbx.set_schedule('every 2 minutes')" >/dev/null
 for _ in $(seq 150); do sid=$(P -d gate -c "SELECT id FROM pgbx.history WHERE kind='backup' AND trigger='schedule' ORDER BY id DESC LIMIT 1"); [ -n "$sid" ] && break; sleep 1; done
 for _ in $(seq 15); do r=$(P -d gate -c "SELECT state||'|'||coalesce(params->>'defer_reason','-') FROM pgbx.history WHERE id=$sid"); case "$r" in queued\|busy*) break;; esac; sleep 1; done
 check "on: the scheduled backup is deferred (busy)" "$(echo "$r" | cut -c1-12)" "queued|busy:"
-sleep 4
-check "pgbx load lists it as deferred" "$(J load | jq -r --arg i "$sid" '[.deferred_jobs[]|select((.job_id|tostring)==$i)]|length')" 1
+for _ in $(seq 20); do n=$(J load | jq -r --arg i "$sid" '[.deferred_jobs[]|select((.job_id|tostring)==$i)]|length'); [ "$n" = 1 ] && break; sleep 1; done
+check "pgbx load lists it as deferred" "$n" 1
 sleep 50; check "still queued after 50 s" "$(state gate "$sid")" queued
 check "it ran at its deadline, forced" "$(wait_end gate "$sid" 120)|$(P -d gate -c "SELECT (params->>'forced')||'|'||(started <= (params->>'deadline')::timestamptz + interval '10 seconds')||'|'||((params->>'busy_deferrals')::int >= 1)::text FROM pgbx.history WHERE id=$sid")" "done|true|true|true"
 # the next slot: deferred, then the load stops -> it runs before the deadline, not forced
