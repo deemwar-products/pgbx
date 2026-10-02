@@ -170,7 +170,9 @@ check "its connection is tagged pgbx_dump" "$(P -c "SELECT count(*) FROM pg_stat
 sleep 3; check "doctor(): long_running_job sees it" "$(P -c "SELECT ok||' '||(detail LIKE '%pgbx_dump in locked%') FROM pgbx.doctor() WHERE name='long_running_job'")" "false true"
 for _ in $(seq 30); do r=$(P -d locked -c "SELECT state||' '||coalesce(params->>'lock_timeouts','-')||' '||(params ? 'deferred_until') FROM pgbx.history WHERE id=$id"); [ "$r" = "queued 1 true" ] && break; sleep 1; done
 check "lock timeout re-queues the backup (not failed)" "$r" "queued 1 true"
-check "logged once" "$(docker compose -f compose.test.yml logs --since "$since" db 2>&1 | grep -c "locked: backup #$id could not get its table locks")" 1
+# job threads hand their log lines to the worker's main loop, which writes them within a second
+for _ in $(seq 10); do n=$(docker compose -f compose.test.yml logs --since "$since" db 2>&1 | grep -c "locked: backup #$id could not get its table locks"); [ "$n" -ge 1 ] && break; sleep 1; done
+check "logged once" "$n" 1
 wait $holder
 for _ in $(seq 120); do r=$(P -d locked -c "SELECT state FROM pgbx.history WHERE id=$id"); case "$r" in done|failed) break;; esac; sleep 1; done
 check "runs after the lock is released" "$r" done
