@@ -3,32 +3,46 @@ title: Testing & guarantees
 description: What the test suites prove, and the known limits.
 ---
 
-All suites run against fresh containers. Check counts are **to be re-measured** for 0.5.0.
+All suites run against fresh containers. Counts below are from `tests/run_all.sh` on PostgreSQL 16, 13 and 18
+(2026-10-02, the same count on each major unless noted).
 
 | suite | checks | proves |
 |---|---|---|
-| `tests/e2e.sh` | to be re-measured | auto-install in new databases, first backup, schedules, retention, pause/resume, data scope, roles, one-database restore, verify, download links, against a real S3 bucket |
-| `tests/cli_e2e.sh` | to be re-measured | every `pgbx` command, `--json` shape, safety gates (`--yes`), `db-restore --from-s3` onto a plain Postgres container without the extension, Postgres-down paths, diagnose |
-| `tests/ui_e2e.sh` | to be re-measured | `pgbx ui`: pages, JSON, GET only, viewer role; no whole-server endpoint |
+| `tests/e2e.sh` | 85 | auto-install in new databases, first backup, schedules, retention, pause/resume, data scope, roles, one-database restore, verify, download links, against a real S3 bucket |
+| `tests/cli_e2e.sh` | 68 | every `pgbx` command, `--json` shape, safety gates (`--yes`), `db-restore --from-s3` onto a plain Postgres container without the extension, Postgres-down paths, diagnose |
+| `tests/ui_e2e.sh` | 23 | `pgbx ui`: pages, JSON, GET only, viewer role; no whole-server endpoint |
 | `tests/client_only_e2e.sh` | 28 passed | pgbx as a plain client: stock `postgres:16` with no extension and no S3, directly and over SSH to a host without pgbx; setup client, query, status, doctor, memories, skill exit 0; backup commands refuse plainly |
-| `tests/upgrade_e2e.sh` | to be re-measured | worker auto-update (`ALTER EXTENSION pgbx UPDATE`, incl. `template1`) |
+| `tests/upgrade_e2e.sh` | 19 (PG16, with a 0.5.0 image), 6 (PG13 / PG18: no 0.5.0 image of that major, so the update-script section is skipped; `pitr_e2e.sh` checks it there) | worker auto-update (`ALTER EXTENSION pgbx UPDATE`, incl. `template1`); with `PGBX_PREV_IMAGE` (a 0.5.0 image) the 0.5.0 → 0.6.0 update script gives exactly a fresh 0.6.0 install (functions, columns, privileges) and old call forms keep working |
+| `tests/queue_e2e.sh` | 63 | the server-wide job queue: slots, pick order, overrun skip, cancel, time estimates, crash recovery |
+| `tests/load_e2e.sh` | 32 | quiet-window suggestion and the load gate under pgbench load |
+| `tests/extras_e2e.sh` | 59 | 0.6 extras in throwaway containers with their own S3: encrypted dumps (ciphertext in S3, restore tests and restores decrypt, older plain dumps still restore), wrong / missing key, truncated and tampered files fail loudly, `pgbx decrypt`; roles file next to every dump, `restore(with_roles)` keeps owners and never changes existing roles, `--from-s3 --with-roles` on a new server creates only the referenced roles and is idempotent; webhook notifications (one per incident, one recovered, no URL leaked); GFS retention; `pgbx metrics` and `GET /metrics` |
+| `tests/pitr_e2e.sh` | 52 | point-in-time restore in throwaway containers: `setup pitr` refuses a foreign `archive_command`; base backup job; restore to a time into a copy (rows before the time present, after it absent; the copy never archives); wal-push idempotency and checksum refusal; S3 down → drops past `pgbx.wal_queue_max` → gap + alert, no false "recovered", a new database still gets the extension at once, restore inside the gap refused, healing base backup closes it; status / doctor / privileges; 0.5.0 → 0.6.0 update == fresh catalog; prompt shutdown during a base backup |
+| `tests/s3down_e2e.sh` | 11 | S3 that never answers: the worker's poll loop never waits for it (new databases get the extension within seconds, heartbeat moves, `pgbx jobs` answers), cancel of a stuck backup, prompt shutdown |
 | `tests/diag_smoke.sh`, `tests/ui_smoke.sh` | to be re-measured | throwaway-container smokes: doctor/diagnose with pg_wal piling up; UI + audit retention |
-| `tests/bench_local.sh` | to be re-measured | ~1.2 GB against a local S3: backup and restore throughput, S3 outages, fast shutdown |
+| `tests/bench_local.sh` | 11 | ~1.2 GB against a local S3: backup and restore throughput, S3 outages, fast shutdown |
+| `tests/pitr_bench.sh` | numbers, not checks | wal-push latency, archiving throughput of a pgbench backlog, wal-get replay with and without prefetch, ~2 GB base backup + point-in-time restore, each next to pgBackRest in the same container (benchmark only) |
 
 `tests/run_all.sh` rebuilds, starts fresh containers, uses a unique S3 folder and runs the suites.
 Set `PG_MAJOR=13`…`18` to run them on another Postgres major (needs a dev image built with that `PG_MAJOR`).
-`cd cli && cargo test` covers the CLI's unit tests (argument parsing, safety levels, S3 key selection, diagnose classification).
+Unit tests: `cd cli && cargo test` (105: argument parsing, safety levels, S3 key selection, diagnose classification,
+policy, metrics, PITR target/retention/gap rules, WAL names) and `cargo test --lib` in the dev image (49: encryption
+format incl. tamper / truncation / reorder / wrong key, roles plan, GFS, notifications against local fakes, worker).
+Ignored on purpose (they need a real S3 or measure speed): `crypt_throughput`, `s3_roundtrip_large`.
 
 ## Robustness built in
 
 - Streaming: `pg_dump` → 16 MB multipart parts → S3, no temp file. Restore streams S3 → `pg_restore`.
 - Each part is retried with backoff (~2 min). A restore download resumes from the byte it reached.
-- Half-finished uploads are aborted; orphaned ones are cleaned at startup.
-- A Postgres shutdown never waits on a backup (stops within ~1 s; the job is marked interrupted).
+- Half-finished uploads are aborted; orphaned ones (the worker's own dumps and roles files, older than 10 minutes)
+  are cleaned at startup on a thread of their own, so a base backup another `pgbx` process is uploading is never cut
+  off and an unreachable S3 never holds up the worker.
+- A Postgres shutdown never waits on a backup (stops within ~1 s, at most 5 s even when an S3 request hangs; the job
+  is marked interrupted).
 
 ## Known limits
 
 - A restore is only as fine-grained as the database's schedule: you get the newest dump at or before the
   time you ask for. Back up more often (`every 15 minutes`) where that matters.
-- No point-in-time restore between dumps (no WAL archiving).
-- Built and tested on PostgreSQL 16.
+- Between dumps, point-in-time restore needs the optional whole-server [PITR](../guides/point-in-time-restore/)
+  (`pgbx.pitr`, 0.6.0).
+- The full suite runs on PostgreSQL 13, 16 and 18 (`PG_MAJOR`); 14, 15 and 17 were not run for this release.

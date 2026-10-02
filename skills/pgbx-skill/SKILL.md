@@ -97,9 +97,12 @@ Runs:
 |---|---|---|
 | Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries (STAT-R-7, also with no extension), job queue + ETA + cancel (`pgbx jobs`), server load / gate (`pgbx load`) | `references/status.md` |
 | Backup | backup now, wait, backup id | `references/backup.md` |
-| Restore | db into a new database, from S3 onto a new server | `references/restore.md` |
+| Restore | db into a new database, from S3 onto a new server, with roles (`--with-roles`), encrypted dumps (`--key-file`) | `references/restore.md` |
 | Verify | restore tests, verify schedule, failures | `references/verify.md` |
-| Policy | schedule, quietest time to back up (`pgbx schedule suggest`, never auto-applied), retention, pause/resume, data scope | `references/policy.md` |
+| Policy | schedule, quietest time to back up (`pgbx schedule suggest`, never auto-applied), retention (incl. GFS), pause/resume, data scope | `references/policy.md` |
 | Access | roles, download links | `references/access.md` |
+| Security | encryption on/off, decrypt a downloaded dump | `references/security.md` |
+| Alerts | Slack/Telegram/email/webhook notifications, Prometheus metrics | `references/alerts.md` |
+| PITR | whole-server point-in-time restore (optional): status, enable (`pgbx setup pitr`), base backups, restore to a moment into a new directory | `references/pitr.md` |
 | Memory | per-database memories.md / tables.md: read first, write only when asked | `references/memory.md` |
 | Diagnose | postgres down, disk full, WAL growing, OOM, corruption — cause + tiered steps | `references/diagnose.md` |

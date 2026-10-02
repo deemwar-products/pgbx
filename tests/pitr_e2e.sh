@@ -199,9 +199,11 @@ ORDER BY 1;
 SQL
   docker cp "$TMPD/cat.sql" "$DB:/tmp/cat.sql"
   P -c "CREATE DATABASE up_old TEMPLATE template0" -c "CREATE DATABASE up_new TEMPLATE template0"
-  P -d up_old -c "CREATE EXTENSION IF NOT EXISTS pgbx VERSION '0.5.0'" >/dev/null 2>&1
-  v=$(P -d up_old -c "SELECT extversion FROM pg_extension WHERE extname='pgbx'")
-  [ "$v" = 0.5.0 ] && P -d up_old -c "ALTER EXTENSION pgbx UPDATE TO '0.6.0'"
+  # the worker installs the current version in every new database within a poll: replace it with 0.5.0 in ONE
+  # transaction (reading the version inside it), then update; if the worker updated it first, that was this script too
+  v=$(P -d up_old -c "BEGIN" -c "DROP EXTENSION IF EXISTS pgbx" -c "CREATE EXTENSION pgbx VERSION '0.5.0'" \
+        -c "SELECT extversion FROM pg_extension WHERE extname='pgbx'" -c "COMMIT" 2>/dev/null | grep -x '[0-9.]*')
+  P -d up_old -c "ALTER EXTENSION pgbx UPDATE TO '0.6.0'" >/dev/null 2>&1
   P -d up_new -c "CREATE EXTENSION IF NOT EXISTS pgbx" >/dev/null
   check "old database started at 0.5.0" "$v" 0.5.0
   P -d up_old -f /tmp/cat.sql > "$TMPD/old.cat"; P -d up_new -f /tmp/cat.sql > "$TMPD/new.cat"

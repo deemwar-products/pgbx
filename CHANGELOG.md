@@ -44,7 +44,51 @@
 - Fix: multipart uploads cut off by a crash are aborted at the next worker start even where the S3 listing of
   open uploads cannot be parsed (RustFS): the worker keeps its own list (`pgbx_open_uploads` in the data directory).
 - Fix: a shutdown during a restore download no longer hangs (the writer returned `Interrupted`, which `write_all` retries).
-- Schema update script `pgbx--0.5.0--0.6.0.sql` (the worker applies it by itself).
+- **Client-side encryption** (off by default): `pgbx.encryption_key_file` (32 random bytes, base64 or hex, chmod 600)
+  encrypts every dump and its roles file with AES-256-GCM in 4 MiB authenticated frames, streamed (no temp files,
+  constant memory). Restores, restore tests and `pgbx db-restore --from-s3 --key-file` decrypt in the stream;
+  tampering, truncation, reordered frames and a wrong key fail loudly; older unencrypted dumps still restore.
+  `pgbx decrypt` for download links (they serve the ciphertext). `history.params.encrypted`.
+- **Roles with every backup**: `<ts>.globals.sql.zst` next to each dump (`pg_dumpall --globals-only`, no passwords
+  unless `pgbx.backup_role_passwords = on`) plus the roles the database references. `restore(..., with_roles => true,
+  roles => 'referenced'|'all')`, `pgbx db-restore [--from-s3] --with-roles [--roles R]`: missing roles are created,
+  existing ones never changed, owners kept; running it twice changes nothing. Pruning deletes each dump's roles file.
+- **Notifications**: `pgbx.notify = 'slack:NAME, telegram:NAME, webhook:NAME, email:NAME'`, URLs and tokens only in
+  `pgbx.notify_secrets_file` (chmod 600); one message per incident plus one "OK again", sent from the job's thread.
+  A URL written into `pgbx.notify` is refused and the error never repeats it. `pgbx.alert_command` unchanged.
+- **Prometheus**: `GET /metrics` on `pgbx ui`, `pgbx metrics`; `server_overview` gained `last_backup_bytes`,
+  `failures_total`, `queued_jobs`, `last_verify_ok`, `last_backup_encrypted`.
+- **GFS retention**: `set_retention(gfs => '7d,4w,12m')` (`'off'` clears it; a span beyond `pgbx.max_days_limit` is
+  refused), `pgbx retention --gfs` (changing or clearing an existing spec needs `--yes`); `status()` shows it.
+- **Point-in-time restore** (optional, whole server, no pgBackRest): `pgbx setup pitr [--yes]` (alias
+  `setup --pitr`; ALTER SYSTEM archive_mode / archive_command / `pgbx.pitr`, refuses a foreign archive_command, one
+  restart). `pgbx wal-push` (archive_command: zstd + sha256, never overwrites a different checksum, async spool with
+  parallel look-ahead, drops WAL past `pgbx.wal_queue_max` instead of filling the disk and records the gap) and
+  `pgbx wal-get` (restore_command: verifies every file, parallel prefetch). Base backups (`pg_basebackup` → zstd →
+  parallel multipart) are jobs of the server-wide queue (kind `base_backup` in the admin database: `pgbx jobs`,
+  cancel, prompt shutdown), on `pgbx.pitr_schedule`, kept for `pgbx.pitr_retention` together with their WAL; a gap
+  is healed by a base backup queued automatically. `pgbx pitr status|list|backup-now|restore --time TS|latest
+  --target DIR` (never starts Postgres; a copy gets archive_mode=off and its own server_name; in place only with
+  `--yes-replace-whole-server` on a stopped server, moved aside). WAL archiving incidents and gaps alert through
+  `pgbx.alert_command` and `pgbx.notify`, from a thread. SQL `pitr_status()`, `pitr_backup_now()`,
+  `pgbx.pitr_state`; history kinds `base_backup`, `wal_gap`, `wal_archive`, trigger `wal_gap`; doctor() rows
+  `pitr archiving`, `pitr base backups`, `pitr gaps`; a PITR card in `pgbx ui`. Settings `pgbx.pitr`,
+  `pgbx.pitr_schedule`, `pgbx.pitr_retention`, `pgbx.wal_queue_max`, `pgbx.wal_gap_margin`, `pgbx.wal_alert_after`,
+  `pgbx.wal_alert_size`, `pgbx.work_dir`, `pgbx.cli_path`. Designs ported from pgBackRest (MIT, see `NOTICE`).
+- SQL signature changes: `set_retention(int, int, text)`, `restore(text, timestamptz, bool, text)`; old calls keep
+  working through the defaults.
+- Fix: the startup cleanup of orphaned multipart uploads runs on a thread of its own (an unreachable S3 no longer
+  holds up the worker's first poll) and only aborts the worker's own objects (`.dump`, `.globals.sql.zst`) older than
+  10 minutes, so it can never cut off a base backup another `pgbx` process is uploading.
+- Fix: a shutdown waits at most 5 s for running jobs (was 20 s), so a job stuck in an S3 request that does not
+  answer no longer delays Postgres; the job is marked interrupted at the next start. A job child its thread has not
+  reaped yet is killed and reaped before the worker exits.
+- Fix: no child process of pgbx is ever left to the postmaster. Where Postgres runs as PID 1 (containers), an orphan
+  that died by a signal made the postmaster restart the whole server (seen when a base backup was cancelled:
+  pg_basebackup died of SIGPIPE). `pgbx pitr backup` reaps pg_basebackup on SIGTERM; the detached wal-push / wal-get
+  background processes only ever exit 0 or 1.
+- Schema update script `pgbx--0.5.0--0.6.0.sql` (the worker applies it by itself) covers all of the above; an updated
+  database equals a fresh 0.6.0 install.
 
 ## 0.5.0
 

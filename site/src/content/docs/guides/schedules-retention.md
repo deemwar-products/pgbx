@@ -44,3 +44,28 @@ Lowering retention deletes backups, so `pgbx` treats it as **guarded** and wants
 SELECT pgbx.configure(schedule => 'every 6 hours', max_backups => 28, max_days => 30);
 ```
 
+
+## GFS (grandfather-father-son)
+
+Keep long-term history without keeping every backup:
+
+```sql
+SELECT pgbx.set_retention(max_backups => 7, gfs => '7d,4w,12m');
+SELECT pgbx.set_retention(gfs => 'off');      -- back to max_backups / max_days only
+```
+
+```sh
+pgbx retention --db shop --gfs 7d,4w,12m       # adding GFS where there was none: no --yes needed
+pgbx retention --db shop --gfs off --yes       # changing or clearing an existing GFS spec is guarded
+```
+
+`'7d,4w,12m'` additionally keeps the newest backup of each of the last 7 calendar days, last 4 ISO weeks
+(Monday-based) and last 12 calendar months, in UTC; `y` = years. The rules combine:
+
+- a backup is kept if `max_backups`/`max_days` keep it **or** GFS keeps it; a GFS keeper is never deleted
+  by `max_backups` or `max_days`;
+- the newest backup is always kept;
+- the GFS span (12m = 372 days) must fit `pgbx.max_days_limit` (default 90): raise the limit first,
+  otherwise `set_retention` refuses.
+
+`status()` shows it (`max 7 backups, max 90 days, gfs 7d,4w,12m`). Each pruned dump's roles file is deleted with it.

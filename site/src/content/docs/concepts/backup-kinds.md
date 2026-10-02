@@ -4,15 +4,17 @@ description: One logical backup per database, streamed to S3, restored into a ne
 sidebar: { order: 2 }
 ---
 
-pgbx backs up **each database on its own**. There is no whole-server backup and no WAL archiving:
-`archive_mode` is not needed and no extra package is installed.
+pgbx backs up **each database on its own**. By default there is no whole-server backup and no WAL archiving:
+`archive_mode` is not needed and no extra package is installed. Restoring the whole server to any second is an
+optional layer you turn on yourself: [Point-in-time restore](../../guides/point-in-time-restore/).
 
 | | |
 |---|---|
 | Engine | `pg_dump -Fc` streamed to S3 (16 MB multipart parts, no temp file) |
 | Needs | `shared_preload_libraries = 'pgbx'` and the S3 settings |
 | Schedule | per database, `set_schedule()` (default daily at 02:00) |
-| Retention | `max_backups` / `max_days` per database (the newest backup is always kept) |
+| Retention | `max_backups` / `max_days` per database, optionally GFS (`7d,4w,12m`); the newest backup is always kept |
+| Extras | a [roles file](../../guides/roles/) next to every dump; optional [encryption](../../guides/encryption/) |
 | Restore | `restore()` into a **new** database; the live one is never touched |
 | Point in time | the newest backup taken at or before `at` |
 | Restore tests | `verify_now()` / `set_verify_schedule()` restore into a scratch database, check, drop |

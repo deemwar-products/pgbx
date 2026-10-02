@@ -32,7 +32,10 @@ From a checkout: `sh skills/pgbx-skill/install.sh`; self-check: `sh skills/pgbx-
 - Discover (`pgbx status --json`, `pgbx doctor --json`) before any change. Read questions skip that and work on
   servers without the pgbx extension too: `backups: "off"` is normal, and the skill does not push installing it.
 - Never read or print credentials. A `download_url` link is used, never pasted into chat.
-- One-database restore always lands in a **new** database.
+- One-database restore always lands in a **new** database; a point-in-time restore always lands in a new, empty
+  directory and pgbx never starts Postgres for it.
+- Never prints or moves an encryption key file or the notification secrets file; turning encryption,
+  notifications or point-in-time restore on is the human's call (the agent shows the plan).
 - Every job is waited on; success is never claimed from `queued`.
 
 ## Memory: one folder per database
@@ -70,10 +73,10 @@ Import never replaces a file you edited locally: it lists it under `conflicts` a
 
 | tier | examples | agent rule |
 |---|---|---|
-| read-only | `pgbx status/list/doctor/logs`, `status()`, `overview()` | just do it |
-| safe | `pgbx now`, `pgbx verify`, `pgbx db-restore --into NEW` (also `--from-s3`), `resume()` | do it, report the job id |
-| higher-risk | long `pause`, lowering retention, narrowing scope, `verify-schedule never` | ask the human first |
-| destructive | swapping/dropping the live database, `configure(enabled => false)` | explicit human approval, quoting what will be replaced |
+| read-only | `pgbx status/list/doctor/logs/metrics`, `pgbx pitr status`, `status()`, `overview()` | just do it |
+| safe | `pgbx now`, `pgbx verify`, `pgbx db-restore --into NEW` (also `--from-s3`, `--with-roles`), `pgbx pitr restore --target EMPTY_DIR`, `resume()` | do it, report the job id |
+| higher-risk | long `pause`, lowering retention or changing GFS, narrowing scope, `verify-schedule never`, `pgbx setup pitr`, enabling encryption / notifications | ask the human first |
+| destructive | swapping/dropping the live database, `configure(enabled => false)`, `pgbx pitr restore --yes-replace-whole-server` | explicit human approval, quoting what will be replaced |
 
 The guarded gate is enforced in code. `--yes` is the human's signature. An agent never adds it on its own,
 never retries with them after the error, and never escalates roles.
