@@ -19,6 +19,8 @@ skill owns intent routing and recipe knowledge.
 - **Always `--json`, never parse decorative output.** With SQL, use
   `psql -XAtq` and statements that return one row (`row_to_json(...)`). Tables,
   colours and `psql` borders are for humans, never for parsing.
+- **Pick the server first, then pin it.** Run `pgbx profile list --json` (step-00), choose or ask
+  for the profile, and pass `--profile <name>` on every `pgbx` call. Never mix servers in one task.
 - **Discover before acting.** Run `pgbx status --json` / `pgbx doctor --json`
   (step-00) before any mutation. A `failing` database fails the next backup too.
 - **Never print credentials.** S3 keys live in `pgbx.credentials_file`
@@ -40,6 +42,7 @@ Held in conversation memory only — no file writes.
 
 ```
 pgbx_available:   true | false      # from step-00
+profile:          prod               # from `pgbx profile list --json`; --profile on every call
 target_db:        myapp             # database the user means
 admin_db:         postgres          # pgbx.admin_db, for overview()/doctor()
 last_job_id:      1234              # history id of the job we just queued
@@ -49,7 +52,7 @@ last_job_id:      1234              # history id of the job we just queued
 
 1. Read `references/router.xml` first — it routes the user's phrase to a route
    and lists the steps + family reference for it.
-2. Run `references/steps/step-00-preflight.md` (pgbx on PATH, `pgbx doctor --json`).
+2. Run `references/steps/step-00-preflight.md` (pgbx on PATH, `pgbx profile list --json`, `pgbx doctor --json`).
 3. Read `references/workflow.md` for invariants, the safety tiers and failure handling.
 4. Follow the route's step file, if any:
    - Backup before deploy → `references/steps/step-01-backup-before-deploy.md`
