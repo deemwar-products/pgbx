@@ -17,16 +17,21 @@ accounts, GCP projects and environments.
 ### Profiles are the core
 
 - Full management for many profiles: `pgbx profile add | edit | remove | list | show | use`.
-- A profile saves **only**: `name`, `adapter`, and that adapter's args or command, plus non-secret pgbx settings
-  (db, user name, s3 bucket location, ...). **Never a URL, password, token or key.**
-- Users with a single database can skip profiles entirely and pass a connection string for that run
-  (`--url postgres://...` or `PGBX_URL`). It's used in memory and never saved.
+- A profile holds **either**:
+  - a **connection string**, `url = "postgres://ops@db.example.com:5432/shop"`. It's stored **without a
+    password**; the password comes from `~/.pgpass`, `PGPASSWORD` or the user's own tooling, so pgbx still saves
+    no secret (see Q2); **or**
+  - an **adapter command**: any executable plus args, e.g. `["node", "adapter.js", "--project", "acme"]` or
+    `["/usr/local/bin/corp-pg"]`.
+  plus non-secret pgbx settings (db, user name, s3 bucket location, ...).
+- Without a profile: `--url postgres://...` (or `PGBX_URL`) for that run, used in memory and never saved.
 
 ### Adapters: no connection code in pgbx
 
 pgbx itself contains **no connection code**: no SSH, AWS, GCP or Azure logic. Every way of reaching a server is
-an **external adapter**, a command listed in config. pgbx stays a single Rust binary with no Node (or any
-other runtime) requirement. A runtime is needed only for the adapters a user enables.
+either a connection string or an **adapter command**. pgbx runs the command, reads its stdout and carries on.
+**pgbx does not care what language the adapter is in.** It stays a single Rust binary, and Node (or any
+runtime) is never a pgbx dependency.
 
 ```toml
 [additional_adapters]
@@ -63,7 +68,7 @@ stdout within `ready_timeout` (default 30 s), then **exits**:
   adapter has no stop".
 - **pgbx does nothing with secrets.** Credentials belong to the adapter, the vendor CLI or the user.
 
-### Default adapters (in the repo, not in the binary)
+### Default adapters: examples, in the repo, not in the binary
 
 `adapters/ssh`, `adapters/aws`, `adapters/gcp` and `adapters/azure`. Each has its own README (prerequisites, profile
 args, how reuse and expiry work) and its own tests. They wrap the user's existing tooling and credentials:
@@ -75,7 +80,9 @@ args, how reuse and expiry work) and its own tests. They wrap the user's existin
 | `gcp` | `cloud-sql-proxy` (and `gcloud` for the instance name / IAM) |
 | `azure` | `az` (Bastion tunnel and Entra ID token for Azure Database for PostgreSQL) |
 
-Custom adapters follow exactly the same contract, and we embed none of their code.
+They are **example commands** users can enable, copy or replace with their own, in any language. No sh or
+PowerShell variants are planned (owner, 2026-10-02). Custom adapters follow exactly the same contract, and we
+embed none of their code.
 
 ### Safety
 
@@ -99,7 +106,8 @@ Custom adapters follow exactly the same contract, and we embed none of their cod
 - The core gets smaller: `cli/src/tunnel.rs` (its SSH spawn, helper, state files, lock and 10-minute reuse) moves
   out into `adapters/ssh`. The client is profiles, the adapter contract and process-group handling.
 - One rule for every connection, built-in or custom. Profiles are the product's centre for the client side.
-- Enabling a default adapter needs Node on that machine. pgbx itself still doesn't.
+- A default adapter written in Node needs Node only on the machine that enables it. pgbx itself never needs it,
+  and users can write adapters in anything.
 - **Host-side commands** (`doctor`, `logs`, `setup server`, `diagnose`) ran on the server over pgbx's own SSH
   (`ssh target pgbx <cmd>`). With no SSH code in the core they need another route. See Q1.
 - Tests:
@@ -138,8 +146,8 @@ and list the container first (it covers the most buyers), with the AMI as an eas
    database host. Options: (a) an optional adapter verb `<command> exec <name> -- pgbx <cmd> --json`, which the ssh
    adapter implements and the cloud ones may (SSM `send-command`); (b) the user runs them on the host
    themselves. This draft proposes (a).
-2. **Default adapters in Node**: fine for developer laptops, but servers and Windows boxes often lack Node.
-   Ship them as Node only, or also as POSIX `sh` / PowerShell versions for `ssh`, the most common one?
+2. **A connection string in a profile:** this draft stores it only **without a password**, to keep "pgbx saves
+   no secrets". Confirm, or allow a password in a profile's URL (it would then sit in the 0600 profiles file).
 3. Licence: MIT, or a one-time fee? This also decides the marketplace pricing model.
 4. Marketplace target: managed Postgres (needs a new runner mode) or self-managed (an AMI with today's extension)?
 5. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?
