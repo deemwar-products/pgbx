@@ -14,6 +14,3 @@ ALTER EXTENSION pgbx UPDATE;
 ```
 
 3. Update the `pgbx` CLI by re-running the installer: `curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh` (it also refreshes the agent skill).
-
-pgbx starts fresh at 0.5.0. Coming from the previous product name? See
-[Migrating from the previous version](../migrating/).

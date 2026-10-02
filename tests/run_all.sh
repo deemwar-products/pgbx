@@ -4,8 +4,7 @@
 #   2) tests/cli_e2e.sh    — the pgbx CLI (policy, refusals, skill, db-restore --from-s3 onto a server without pgbx)
 #      tests/ui_e2e.sh     — pgbx ui: read-only audit UI (pages, JSON, GET only, viewer role)
 #   3) tests/bench_local.sh — ~1.2 GB speed + S3-outage chaos against a local S3
-#   4) tests/upgrade_e2e.sh — worker auto-update (ALTER EXTENSION UPDATE incl. template1), leftover archive_command
-#      reset, and (PGBX_OLD_IMAGE set) restoring the old product's dumps
+#   4) tests/upgrade_e2e.sh — worker auto-update (ALTER EXTENSION UPDATE incl. template1)
 # PG_MAJOR=13..18 picks the Postgres major (needs a dev image built with that PG_MAJOR, see docker/Dockerfile).
 set -u
 cd "$(dirname "$0")/../docker"

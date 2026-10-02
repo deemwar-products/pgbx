@@ -60,7 +60,6 @@ check "overview shape" "$(J overview 'd["ok"], d["connection"]["read_only"], isi
 check "db shape" "$(J db/shop 'd["status"]["database"], isinstance(d["backups"],list), isinstance(d["history"],list)')" "shop True True"
 check "timeline shape" "$(J 'timeline?days=30' 'd["days"], all(k in d["rows"][0] for k in ("database","kind","state","who","at")), "shop" in d["databases"]')" "30 True True"
 check "timeline newest first" "$(J 'timeline?days=30' 'all(a["at"]>=b["at"] for a,b in zip(d["rows"],d["rows"][1:]))')" "True"
-check "no whole-server endpoint" "$(code $U/api/cluster)" "404"
 check "health shape" "$(J health 'isinstance(d["checks"],list) and len(d["checks"])>3 and "fix" in d["checks"][0]')" "True"
 check "who recorded" "$(P "SELECT who FROM pgbx.history WHERE kind='config' ORDER BY id DESC LIMIT 1" shop)" "postgres"
 check "unknown db 502" "$(code $U/api/db/nope)" "502"

@@ -87,11 +87,9 @@ check "alert_command got the failure" "$(echo "$alertline" | grep -c '"kind":"re
 
 echo "## 11. doctor(): per-database checks only"
 check "doctor() runs only in the admin db" "$(P -d shop -c "SELECT count(*) FROM pgbx.doctor()" 2>&1 | grep -c 'run in database')" 1
-check "doctor(): no whole-server/WAL rows" "$(P -c "SELECT count(*) FROM pgbx.doctor() WHERE name ~ '(whole-server|wal_|restore_from_system_id)'")" 0
 check "doctor(): s3 settings ok" "$(P -c "SELECT ok FROM pgbx.doctor() WHERE name='s3 settings'")" t
 check "doctor(): worker alive" "$(P -c "SELECT ok FROM pgbx.doctor() WHERE name='workers'")" t
 check "doctor(): archive_mode row is info only" "$(P -c "SELECT ok FROM pgbx.doctor() WHERE name='archive_mode'")" t
-check "no whole-server functions left" "$(P -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='pgbx' AND p.proname LIKE 'cluster%'")" 0
 
 echo "## 12. access control"
 P -c "DROP ROLE IF EXISTS app_user" -c "DROP ROLE IF EXISTS viewer_user" -c "DROP ROLE IF EXISTS admin_user"

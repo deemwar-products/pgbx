@@ -610,9 +610,6 @@ mod tests {
         assert!(e(&["status", "--nope"]).contains("unknown option"));
         assert!(e(&["now", "--db"]).contains("needs a value"));
         assert!(e(&["now", "--wait=yes"]).contains("takes no value"));
-        assert!(e(&["restore", "latest"]).contains("unknown command"), "whole-server restore is gone");
-        assert!(e(&["now", "--cluster"]).contains("unknown option"));
-        assert!(e(&["db-restore", "--system-id", "1"]).contains("unknown option"));
     }
 
     #[test]

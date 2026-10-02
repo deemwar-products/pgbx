@@ -742,7 +742,6 @@ mod tests {
         assert!(w.iter().any(|s| s.tier == "destructive" && s.command.contains("pg_drop_replication_slot") && s.why.contains("needs human approval")));
         assert!(!w.iter().any(|s| s.tier != "destructive" && s.command.contains("pg_drop_replication_slot")));
         assert!(w.iter().any(|s| s.tier == "guarded" && s.command.contains("max_slot_wal_keep_size")));
-        assert!(!w.iter().any(|s| s.command.contains("wal_queue_max") || s.command.contains("--cluster") || s.command.contains("pgbackrest ")));
         // pg_wal is never offered for cleaning; logs are safe, pgsql_tmp guarded
         assert!(!w.iter().any(|s| s.tier != "readonly" && s.command.contains("rm") && s.command.contains("pg_wal")));
         assert!(w.iter().any(|s| s.tier == "safe" && s.command.contains("/d/log")));

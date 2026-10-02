@@ -131,7 +131,6 @@ fn tick() -> Result<(), String> {
         use std::sync::atomic::{AtomicBool, Ordering};
         static CLEANED: AtomicBool = AtomicBool::new(false);
         if !CLEANED.swap(true, Ordering::Relaxed) {
-            reset_our_archive_command(&mut admin);
             if let Ok(b) = bucket() {
                 transfer::abort_orphans(&b, &format!("{}/", c.server));
             }
@@ -158,35 +157,6 @@ fn tick() -> Result<(), String> {
     }
     let _ = admin.execute("DELETE FROM pgbx.server_overview WHERE NOT (database::text = ANY($1))", &[&dbs]);
     Ok(())
-}
-
-/// Is `cmd` exactly the archive_command older pgbx versions (whole-server backups) wrote:
-/// `pgbackrest --config=<work_dir>/pgbackrest.conf --stanza=main archive-push %p`? Anything else is not ours.
-pub(crate) fn is_our_archive_command(cmd: &str) -> bool {
-    cmd.trim()
-        .strip_prefix("pgbackrest --config=")
-        .and_then(|r| r.strip_suffix(" --stanza=main archive-push %p"))
-        .is_some_and(|conf| conf.starts_with('/') && conf.ends_with("/pgbackrest.conf") && !conf.contains(char::is_whitespace))
-}
-
-/// Whole-server backups are gone: undo the archive_command an older version set (only that one), so Postgres
-/// does not keep calling a pgBackRest that is no longer configured. archive_mode is left alone (needs a restart).
-fn reset_our_archive_command(admin: &mut Client) {
-    // not SHOW: with archive_mode=off it prints "(disabled)"; read what postgresql(.auto).conf actually sets
-    let Ok(row) = admin.query_one(
-        "SELECT coalesce((SELECT setting FROM pg_file_settings WHERE name = 'archive_command' AND error IS NULL
-                           ORDER BY seqno DESC LIMIT 1), '')",
-        &[],
-    ) else { return };
-    let cmd: String = row.get(0);
-    if !is_our_archive_command(&cmd) {
-        return;
-    }
-    // two calls: a multi-statement string runs as one implicit transaction, and ALTER SYSTEM refuses that
-    match admin.batch_execute("ALTER SYSTEM RESET archive_command").and_then(|_| admin.batch_execute("SELECT pg_reload_conf()")) {
-        Ok(()) => log(&format!("reset archive_command (was set by an older version for whole-server backups: {cmd})")),
-        Err(e) => log(&format!("could not reset archive_command: {}", pe(e))),
-    }
 }
 
 /// "0.5.0" < "0.10.0": compare dotted numeric versions; anything unparsable compares as equal (never update).
@@ -723,16 +693,6 @@ pub(crate) fn parse_flat_json(s: &str) -> std::collections::HashMap<String, Stri
 #[cfg(test)]
 mod t {
     use super::*;
-
-    #[test]
-    fn our_archive_command_only() {
-        assert!(is_our_archive_command("pgbackrest --config=/var/lib/postgresql/pgbx/pgbackrest.conf --stanza=main archive-push %p"));
-        assert!(!is_our_archive_command("pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=prod archive-push %p"));
-        assert!(!is_our_archive_command("pgbackrest --stanza=main archive-push %p"));
-        assert!(!is_our_archive_command("cp %p /mnt/archive/%f"));
-        assert!(!is_our_archive_command(""));
-        assert!(!is_our_archive_command("pgbackrest --config=/x/pgbackrest.conf --stanza=main archive-push %p && rm -rf /"));
-    }
 
     #[test]
     fn versions() {

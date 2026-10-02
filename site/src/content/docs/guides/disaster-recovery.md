@@ -48,14 +48,3 @@ pgbx db-restore --from-s3 --db shop --into shop_restored \
   data comes back. With the extension installed, the database keeps its backup policy and history.
 
 Repeat per database. Once verified, rename: `ALTER DATABASE shop_restored RENAME TO shop;`.
-
-## Old whole-server data
-
-Versions before 0.5.0 also wrote pgBackRest whole-server backups to
-`s3://<bucket>/<server_name>/<system_identifier>/_cluster/` (or `<server_name>/_cluster/` before 0.2).
-0.5.0 never reads or deletes them. When you no longer need them:
-
-```sh
-aws s3 rm --recursive s3://my-backups/db1/7312345678901234567/_cluster/ --endpoint-url https://hel1.your-objectstorage.com
-# or: mc rm --recursive --force myalias/my-backups/db1/7312345678901234567/_cluster/
-```

@@ -2,7 +2,7 @@
 
 Zero-touch Postgres backups: **create a database and it is backed up**. Manual backup and restore are SQL calls.
 The engine is `pg_dump`/`pg_restore` streamed to and from S3; pgbx is the control layer around it.
-Since 0.5.0 it does **per-database backups only** (the pgBackRest whole-server mode and WAL archiving were removed:
+It does **per-database backups only** (no whole-server mode, no WAL archiving:
 one model, no `archive_mode`, no extra package, and a restore never rewinds more than the database you asked for).
 
 ## Behaviour

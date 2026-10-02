@@ -28,12 +28,6 @@ All settings below take effect on reload (`SELECT pg_reload_conf();`). Only `sha
 | `pgbx.audit_days` | `30` | days of `history` (the audit trail) kept; kept backups, queued/running jobs and the newest row of each kind are never pruned |
 | `pgbx.alert_command` | *(none)* | shell command run for every failed job; JSON on stdin, env `PGBX_DATABASE`, `PGBX_KIND`, `PGBX_JOB_ID`, `PGBX_ERROR`, `PGBX_SERVER` |
 
-## Removed in 0.5.0
-
-`cluster_backups`, `cluster_schedule`, `cluster_retention_full`, `cluster_full_every`, `cluster_process_max`,
-`restore_from_system_id`, `wal_queue_max`, `wal_alert_after`, `wal_alert_size`, `wal_gap_margin`, `work_dir`,
-`stop_command`, `start_command`. Remove them from `postgresql.conf`. See [Upgrading](../../guides/upgrading/).
-
 ## Per-database defaults
 
 Stored in `pgbx.config`, one row per database. Change them with SQL, not settings.
