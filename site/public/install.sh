@@ -142,6 +142,16 @@ PGBX=$PREFIX/pgbx
 say "installed $PGBX ($("$PGBX" --version))"
 case ":$PATH:" in *":$PREFIX:"*) ;; *) say "note: $PREFIX is not on your PATH; add it: export PATH=\"$PREFIX:\$PATH\"" ;; esac
 
+# example connection adapters (ssh, aws, gcp, azure; Node scripts) into the user's pgbx config dir, where
+# `pgbx profile add --adapter ssh ...` finds them. Copies of the examples: edit a copy elsewhere, not these.
+AD_SRC=$(find "$TMP/cli" -type d -name adapters | head -1)
+if [ -n "$AD_SRC" ] && [ "$IS_ROOT" != 1 ]; then
+  AD_DIR=${PGBX_ADAPTERS_DIR:-${PGBX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pgbx}/adapters}
+  mkdir -p "$AD_DIR" && cp -R "$AD_SRC"/. "$AD_DIR"/ && say "example adapters: $AD_DIR (need Node 18+ only if you use one)"
+elif [ -n "$AD_SRC" ]; then
+  say "example adapters: skipped as root (they belong in a user's config dir); see $DOCS/guides/adapters/"
+fi
+
 # ---------------------------------------------------------------- extension (Linux)
 # prints "major pkglibdir sharedir" for every local PostgreSQL
 find_postgres() {

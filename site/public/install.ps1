@@ -64,6 +64,15 @@ try {
     $pgbx = Join-Path $InstallDir 'pgbx.exe'
     Write-Host "installed $pgbx ($(& $pgbx --version))"
 
+    # example connection adapters (ssh, aws, gcp, azure; Node scripts) where `pgbx profile add --adapter ssh` finds them
+    $ad = Get-ChildItem -Recurse -Directory "$tmp\x" -Filter adapters | Select-Object -First 1
+    if ($ad) {
+        $adDir = if ($env:PGBX_ADAPTERS_DIR) { $env:PGBX_ADAPTERS_DIR } else { Join-Path $env:APPDATA 'pgbx\adapters' }
+        New-Item -ItemType Directory -Force $adDir | Out-Null
+        Copy-Item -Recurse -Force (Join-Path $ad.FullName '*') $adDir
+        Write-Host "example adapters: $adDir (need Node 18+ only if you use one)"
+    }
+
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not (($userPath -split ';') -contains $InstallDir)) {
         [Environment]::SetEnvironmentVariable('Path', ((@($userPath, $InstallDir) | Where-Object { $_ }) -join ';'), 'User')

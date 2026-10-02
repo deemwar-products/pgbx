@@ -99,6 +99,8 @@ jobs:
           cp cli/target/${{ matrix.target }}/release/pgbx "dist/$NAME/"
           cp LICENSE "dist/$NAME/" 2>/dev/null || true
           echo "$VER" > "dist/$NAME/VERSION"
+          # the example connection adapters (ADR 0003; Node scripts, not part of the binary)
+          mkdir -p "dist/$NAME/adapters" && cp -R adapters/README.md adapters/lib adapters/ssh adapters/aws adapters/gcp adapters/azure "dist/$NAME/adapters/"
           "dist/$NAME/pgbx" --version
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
       - uses: actions/upload-artifact@v4
@@ -129,7 +131,8 @@ jobs:
           cp cli/target/${{ matrix.target }}/release/pgbx.exe "dist/$NAME/"
           cp LICENSE "dist/$NAME/" 2>/dev/null || true
           printf '%s' "${TAG#v}" > "dist/$NAME/VERSION"
-          (cd "dist/$NAME" && zip -q "../$NAME.zip" *)
+          mkdir -p "dist/$NAME/adapters" && cp -R adapters/README.md adapters/lib adapters/ssh adapters/aws adapters/gcp adapters/azure "dist/$NAME/adapters/"
+          (cd "dist/$NAME" && zip -q -r "../$NAME.zip" .)
       - uses: actions/upload-artifact@v4
         with: { name: 'cli-windows-${{ matrix.arch }}', path: 'dist/*.zip' }
 
