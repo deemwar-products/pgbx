@@ -23,6 +23,7 @@ mod serve;
 mod setup;
 mod setup_client;
 mod skill;
+mod tls;
 mod ui;
 mod vars;
 

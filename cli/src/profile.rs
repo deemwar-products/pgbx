@@ -101,7 +101,12 @@ pub fn conn_of(name: &str, cfg: &Config, env: Env) -> Result<Conn, String> {
         }
         (None, None) => return Err(format!("profile '{name}' has neither url nor adapter (pgbx profile edit {name} --url ... | --adapter ...)")),
     };
-    Ok(Conn::new(spec, source, dir))
+    let mut c = Conn::new(spec, source, dir);
+    // sslmode / sslrootcert: pgbx reads them from any profile; an adapter also gets them in its config (they are not
+    // PGBX_KEYS), so the adapter can put them in its URL, which then wins
+    let s = |k: &str| p.get(k).and_then(|v| v.as_str()).map(String::from);
+    c.ssl = crate::tls::Params { mode: s("sslmode"), rootcert: s("sslrootcert") };
+    Ok(c)
 }
 
 /// Fill a command's flags from the profile's pgbx keys ($VARs expanded) where no flag is given.

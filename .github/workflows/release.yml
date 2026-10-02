@@ -89,7 +89,7 @@ jobs:
         with: { targets: '${{ matrix.target }}' }
       - if: matrix.os == 'linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
-      - name: "Build (static on Linux: musl, no OpenSSL — the postgres crate uses NoTls)"
+      - name: "Build (static on Linux: musl, no OpenSSL — TLS to Postgres and S3 is rustls)"
         run: |
           cargo test --manifest-path cli/Cargo.toml
           cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}

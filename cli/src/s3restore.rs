@@ -281,6 +281,7 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
     drop(admin);
 
     let (host, port, user, password) = cx.conn.tool_target()?;
+    let tls_env = cx.conn.tool_tls_env()?;
     let port = port.to_string();
     let skipped: Vec<&str> = EXT_NAMES.iter().copied().filter(|n| !available.iter().any(|a| a == n)).collect();
     let exe = pg_restore_bin();
@@ -289,6 +290,8 @@ pub fn db_restore(cx: &mut Ctx) -> Out {
         .args(skipped.iter().map(|n| format!("--exclude-schema={n}")))
         // the password reaches pg_restore through its environment, never its argv (ADR 0003)
         .envs(password.map(|p| ("PGPASSWORD", p)))
+        // the same sslmode / sslrootcert pgbx used (libpq reads them from here)
+        .envs(tls_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

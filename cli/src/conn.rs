@@ -5,8 +5,10 @@
 //!
 //! The resolved URL lives in memory only. Its password is registered for redaction, handed to postgres in memory
 //! and to child tools (pg_restore) through PGPASSWORD, never argv. A URL without a password falls back to PGPASSWORD.
+//! TLS follows libpq's sslmode (see tls.rs); child tools get the same settings as PGSSLMODE / PGSSLROOTCERT.
 
 use crate::adapter;
+use crate::tls::{self, Tls};
 use crate::vars::{self, Resolver, Source};
 use postgres::{Client, NoTls};
 use serde_json::Value;
@@ -26,6 +28,8 @@ pub struct Live {
     pub cfg: postgres::Config,
     /// host:port for messages (never the password)
     pub display: String,
+    pub tls: Tls,
+    connector: std::sync::OnceLock<Result<tokio_postgres_rustls::MakeRustlsConnect, String>>,
     adapter: Option<adapter::Handle>,
 }
 
@@ -45,6 +49,8 @@ pub struct Conn {
     dir: PathBuf,
     /// --user on the command line: beats the user in the connection string (e.g. a read-only role for pgbx ui)
     pub user: Option<String>,
+    /// the profile's sslmode / sslrootcert keys ($VARs allowed); the connection string's own settings win
+    pub ssl: tls::Params,
     live: Mutex<Option<(Instant, Resolved)>>,
 }
 
@@ -63,7 +69,7 @@ fn env(k: &str) -> Option<String> {
 
 /// Register the password of a connection string (URL or key=value) for redaction.
 pub fn register_url_secrets(url: &str) {
-    if let Ok(c) = url.parse::<postgres::Config>() {
+    if let Ok(c) = tls::split(url).0.parse::<postgres::Config>() {
         if let Some(p) = c.get_password() {
             vars::register(&String::from_utf8_lossy(p));
         }
@@ -86,7 +92,7 @@ pub fn host_of(raw: &str) -> Option<String> {
 
 impl Conn {
     pub fn new(spec: Spec, source: Source, dir: PathBuf) -> Conn {
-        Conn { spec, source, dir, user: None, live: Mutex::new(None) }
+        Conn { spec, source, dir, user: None, ssl: tls::Params::default(), live: Mutex::new(None) }
     }
 
     /// No profile, no url: the flags/env/defaults connection.
@@ -134,32 +140,44 @@ impl Conn {
 
     fn resolve(&self) -> Result<Live, String> {
         let mut res = Resolver::new(&env, self.source.clone(), self.dir.clone());
-        let (mut cfg, display, adapter) = match &self.spec {
+        let (mut cfg, display, adapter, url_ssl) = match &self.spec {
             Spec::Direct { host, port, user } => {
                 let mut c = postgres::Config::new();
                 let p: u16 = port.parse().map_err(|_| format!("bad --port '{port}'"))?;
                 c.host(host).port(p).user(user);
-                (c, format!("{host}:{port}"), None)
+                (c, format!("{host}:{port}"), None, tls::Params::default())
             }
             Spec::Url { profile, raw } => {
                 let what = profile.as_ref().map_or("the connection string".into(), |p| format!("profile '{p}'"));
                 let url = res.expand_url(raw).map_err(|e| format!("{what}: {e}"))?;
                 register_url_secrets(&url);
+                let (url, ssl) = tls::split(&url);
                 let c: postgres::Config = url.parse().map_err(|e| format!("{what}: not a valid connection string ({e})"))?;
                 let d = display_of(&c);
-                (c, d, None)
+                (c, d, None, ssl)
             }
             Spec::Adapter { profile, adapter: name, argv, config, ready_timeout } => {
                 let cfg = res.expand_value(config).map_err(|e| format!("profile '{profile}': {e}"))?;
                 let (run, ready) = adapter::Running::start(argv, profile, &cfg, *ready_timeout, Some(&self.dir))
                     .map_err(|e| format!("profile '{profile}' (adapter {name}): {e}"))?;
                 let handle = adapter::keep(run);
-                let c: postgres::Config = ready.url.parse()
+                let (url, ssl) = tls::split(&ready.url);
+                let c: postgres::Config = url.parse()
                     .map_err(|e| format!("profile '{profile}': adapter {name} returned an invalid connection string ({e})"))?;
                 let d = format!("{} via adapter {name}", display_of(&c));
-                (c, d, Some(handle))
+                (c, d, Some(handle), ssl)
             }
         };
+        let what = self.profile().map_or("TLS".to_string(), |p| format!("profile '{p}'"));
+        let mut expand = |k: &str, v: &Option<String>| v.as_deref().map(|s| res.expand(s)).transpose().map_err(|e| format!("{what}: {k}: {e}"));
+        let prof_ssl = tls::Params { mode: expand("sslmode", &self.ssl.mode)?, rootcert: expand("sslrootcert", &self.ssl.rootcert)? };
+        let tls = tls::resolve(&url_ssl, &prof_ssl, &env).map_err(|e| format!("{what}: {e}"))?;
+        // libpq ignores sslmode on a unix socket (the server refuses TLS there)
+        #[cfg(unix)]
+        let unix = matches!(cfg.get_hosts().first(), Some(postgres::config::Host::Unix(_)));
+        #[cfg(not(unix))]
+        let unix = false;
+        cfg.ssl_mode(if unix { postgres::config::SslMode::Disable } else { tls.mode.wire() });
         if let Some(u) = &self.user {
             cfg.user(u);
         } else if cfg.get_user().is_none() {
@@ -175,7 +193,7 @@ impl Conn {
             cfg.connect_timeout(Duration::from_secs(5));
         }
         cfg.application_name("pgbx");
-        Ok(Live { cfg, display, adapter })
+        Ok(Live { cfg, display, tls, connector: Default::default(), adapter })
     }
 
     /// The database named in the connection string, if any (the default for --db).
@@ -190,9 +208,16 @@ impl Conn {
         let live = self.live()?;
         let mut c = live.cfg.clone();
         c.dbname(db);
-        c.connect(NoTls).map_err(|e| {
+        let r = if c.get_ssl_mode() == postgres::config::SslMode::Disable {
+            c.connect(NoTls)
+        } else {
+            let tls = live.connector.get_or_init(|| live.tls.connector()).clone()
+                .map_err(|e| vars::scrub(&format!("cannot connect to Postgres ({}): {e}", live.display)))?;
+            c.connect(tls)
+        };
+        r.map_err(|e| {
             // a server error (bad password, no such database) says why only in its DbError, not in Display
-            let why = e.as_db_error().map_or_else(|| e.to_string(), |d| format!("{}: {}", d.severity(), d.message()));
+            let why = e.as_db_error().map_or_else(|| with_causes(&e), |d| format!("{}: {}", d.severity(), d.message()));
             vars::scrub(&format!("cannot connect to Postgres ({}, db {db}): {why}", live.display))
         })
     }
@@ -213,10 +238,31 @@ impl Conn {
         Ok((host, port, user, pw))
     }
 
+    /// For child tools: the TLS settings as libpq environment variables (PGSSLMODE, PGSSLROOTCERT).
+    pub fn tool_tls_env(&self) -> Result<Vec<(&'static str, String)>, String> {
+        Ok(self.live()?.tls.tool_env())
+    }
+
     /// Stop the adapter now (`pgbx serve` keeps it; a one-off command stops it at exit through adapter::stop_all).
     pub fn close(&self) {
         *self.live.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+}
+
+/// "error performing TLS handshake: invalid peer certificate: UnknownIssuer": the postgres crate's Display stops
+/// at the first part, the reason is in the source chain.
+fn with_causes(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        let m = c.to_string();
+        if !s.contains(&m) {
+            s.push_str(": ");
+            s.push_str(&m);
+        }
+        cur = c.source();
+    }
+    s
 }
 
 fn display_of(c: &postgres::Config) -> String {
