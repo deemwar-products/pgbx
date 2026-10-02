@@ -53,6 +53,22 @@ pub static ALERT_COMMAND: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 pub static DUMP_COMPRESSION: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"auto"));
 pub static AUDIT_DAYS: GucSetting<i32> = GucSetting::<i32>::new(30);
 pub static ADMIN_DB: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"postgres"));
+// bandwidth caps per job (ADR 0001 §3)
+pub static UPLOAD_KBPS: GucSetting<i32> = GucSetting::<i32>::new(0);
+pub static DOWNLOAD_KBPS: GucSetting<i32> = GucSetting::<i32>::new(0);
+// resource caps on pg_dump / pg_restore (ADR 0001 §3)
+pub static JOB_NICE: GucSetting<i32> = GucSetting::<i32>::new(10);
+pub static JOB_IONICE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"best-effort-7"));
+pub static DUMP_COMPRESSION_BUSY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"auto"));
+pub static DUMP_LOCK_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(5_000); // ms
+pub static DUMP_LOCK_TIMEOUT_FORCED: GucSetting<i32> = GucSetting::<i32>::new(60_000); // ms
+pub static RESTORE_SYNCHRONOUS_COMMIT: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static DOCTOR_LONG_JOB: GucSetting<i32> = GucSetting::<i32>::new(3600); // s
+// deferring a backup (lock timeout now, the load gate later): backoff and the deadline it never passes
+pub static DEFER_BACKOFF: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c"1,2,4,8,15"));
+pub static MAX_DEFER: GucSetting<i32> = GucSetting::<i32>::new(4 * 3600); // s
+pub static MAX_DEFER_FIRST: GucSetting<i32> = GucSetting::<i32>::new(15 * 60); // s
+pub static COALESCE_MANUAL: GucSetting<bool> = GucSetting::<bool>::new(true);
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.s3_endpoint", c"S3 endpoint URL", c"e.g. https://hel1.your-objectstorage.com", &S3_ENDPOINT, GucContext::Sighup, GucFlags::default());
@@ -67,6 +83,19 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(c"pgbx.admin_db", c"Database that holds the server-wide overview and doctor()", c"", &ADMIN_DB, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.audit_days", c"Days of history (audit trail) kept per database", c"older rows are pruned, except kept backups, open incidents/gaps and the newest row of each kind", &AUDIT_DAYS, 1, 36500, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.poll_seconds", c"How often the worker looks for new databases and due/queued jobs", c"", &POLL_SECONDS, 1, 3600, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.upload_kbps", c"Upload bandwidth cap per job in KiB/s", c"0 = unlimited", &UPLOAD_KBPS, 0, 10_000_000, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.download_kbps", c"Download (restore) bandwidth cap per job in KiB/s", c"0 = unlimited", &DOWNLOAD_KBPS, 0, 10_000_000, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.job_nice", c"CPU niceness of pg_dump / pg_restore", c"0-19; never raises priority above the worker's own", &JOB_NICE, 0, 19, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.job_ionice", c"IO priority of pg_dump / pg_restore (Linux)", c"none, idle, or best-effort-0 .. best-effort-7; anything else means best-effort-7", &JOB_IONICE, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_string_guc(c"pgbx.dump_compression_busy", c"pg_dump --compress for a backup forced to run while the server is busy", c"auto (default: zstd:1 with pg_dump 16+, gzip level 1 before; never more than pgbx.dump_compression), or a pg_dump --compress value", &DUMP_COMPRESSION_BUSY, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.dump_lock_timeout", c"How long pg_dump waits for its table locks before the backup is retried later", c"0 = wait forever; never queue behind DDL", &DUMP_LOCK_TIMEOUT, 0, 600_000, GucContext::Sighup, GucFlags::UNIT_MS);
+    GucRegistry::define_int_guc(c"pgbx.dump_lock_timeout_forced", c"pg_dump lock wait once a deferred backup reached its deadline", c"if it still times out, the backup fails and alerts", &DUMP_LOCK_TIMEOUT_FORCED, 0, 600_000, GucContext::Sighup, GucFlags::UNIT_MS);
+    GucRegistry::define_bool_guc(c"pgbx.restore_synchronous_commit", c"synchronous_commit for pg_restore", c"off by default: the target is a new database, a crash just means restoring again", &RESTORE_SYNCHRONOUS_COMMIT, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.doctor_long_job", c"doctor() warns about a backup/restore process running longer than this", c"0 = never", &DOCTOR_LONG_JOB, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_string_guc(c"pgbx.defer_backoff", c"Minutes between retries of a deferred backup", c"comma list, each 1-60; the last value repeats", &DEFER_BACKOFF, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_int_guc(c"pgbx.max_defer", c"A deferred backup runs anyway this long after it was queued", c"capped at the schedule interval; backups are never skipped", &MAX_DEFER, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_int_guc(c"pgbx.max_defer_first", c"max_defer for a new database's first backup", c"", &MAX_DEFER_FIRST, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
+    GucRegistry::define_bool_guc(c"pgbx.coalesce_manual", c"backup_now() / verify_now() return the job already queued instead of adding another", c"", &COALESCE_MANUAL, GucContext::Sighup, GucFlags::default());
 
     // Only register the worker when loaded at server start (shared_preload_libraries),
     // not when a backend loads the library for CREATE EXTENSION.
@@ -133,7 +162,7 @@ CREATE TABLE pgbx.history (
     kind         text NOT NULL CHECK (kind IN ('backup', 'restore', 'config', 'pause', 'resume', 'prune', 'verify')),
     trigger      text NOT NULL DEFAULT 'manual' CHECK (trigger IN ('manual', 'schedule', 'first', 'migration')),
     params       jsonb NOT NULL DEFAULT '{}',
-    state        text NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired')),
+    state        text NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired', 'cancelled')),
     requested_at timestamptz NOT NULL DEFAULT now(),
     started      timestamptz,
     finished     timestamptz,
@@ -295,10 +324,46 @@ BEGIN
                coalesce(cfg.path, current_database()));
 END $$;
 
--- Restore test: restore the newest backup into a scratch database, check it, drop it.
-CREATE FUNCTION pgbx.verify_now() RETURNS bigint LANGUAGE sql AS $$
-    INSERT INTO pgbx.history (kind, trigger) VALUES ('verify', 'manual') RETURNING id
-$$;
+-- internal: queue a manual job, or (pgbx.coalesce_manual, default on) return the one of that kind already queued
+-- in this database
+CREATE FUNCTION pgbx._queue_manual(k text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE j bigint;
+BEGIN
+    IF coalesce(current_setting('pgbx.coalesce_manual', true), 'on') <> 'off' THEN
+        PERFORM pg_advisory_xact_lock(hashtext('pgbx_coalesce'), hashtext(k));
+        SELECT id INTO j FROM pgbx.history WHERE kind = k AND state = 'queued' ORDER BY id LIMIT 1;
+        IF j IS NOT NULL THEN
+            UPDATE pgbx.history SET params = params || jsonb_build_object('manual', true,
+                       'coalesced', coalesce((params->>'coalesced')::int, 0) + 1)
+             WHERE id = j;
+            RAISE NOTICE 'pgbx: % job % is already queued; returning it instead of adding another', k, j;
+            RETURN j;
+        END IF;
+    END IF;
+    INSERT INTO pgbx.history (kind, trigger) VALUES (k, 'manual') RETURNING id INTO j;
+    RETURN j;
+END $$;
+
+-- Cancel a queued job of this database: it never starts and ends as 'cancelled'.
+CREATE FUNCTION pgbx.cancel(job_id bigint) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE h pgbx.history;
+BEGIN
+    SELECT * INTO h FROM pgbx.history WHERE id = job_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgbx: no job % in database %', job_id, current_database();
+    ELSIF h.state = 'queued' THEN
+        UPDATE pgbx.history SET state = 'cancelled', finished = now(), error = 'cancelled by ' || session_user WHERE id = job_id;
+        RETURN format('%s job %s cancelled before it started', h.kind, job_id);
+    END IF;
+    RAISE EXCEPTION 'pgbx: job % is % (only a queued job can be cancelled)', job_id, h.state;
+END $$;
+
+-- Restore test: restore the newest backup into a scratch database, check it, drop it. Like backup_now(), returns
+-- the restore test already queued (pgbx.coalesce_manual) instead of adding another.
+CREATE FUNCTION pgbx.verify_now() RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN pgbx._queue_manual('verify');
+END $$;
 
 -- 'weekly on sunday at 04:00', 'daily at 05:00', ... or 'never'.
 CREATE FUNCTION pgbx.set_verify_schedule(schedule text) RETURNS text LANGUAGE plpgsql AS $$
@@ -485,6 +550,23 @@ BEGIN
            ELSE '(destructive, needs human approval: a dropped slot cannot be recreated at the same position and its consumer must be rebuilt) drop the slot only if its consumer is gone for good: SELECT pg_drop_replication_slot(''<name>''); '
                 || 'and set max_slot_wal_keep_size (e.g. ''10GB'') so a dead consumer cannot fill the disk' END;
     RETURN NEXT;
+
+    -- a running dump holds ACCESS SHARE on every table it reads until it ends: DDL on them waits for it
+    name := 'long_running_job';
+    lim := make_interval(secs => coalesce((SELECT s.setting::int FROM pg_settings s WHERE s.name = 'pgbx.doctor_long_job'), 3600));
+    SELECT string_agg(format('%s in %s for %s (pid %s)', a.application_name, a.datname,
+                             date_trunc('second', now() - a.backend_start), a.pid), ', ' ORDER BY a.backend_start)
+      INTO v FROM pg_stat_activity a
+     WHERE a.application_name IN ('pgbx_dump', 'pgbx_restore', 'pgbx_verify')
+       AND lim > interval '0' AND now() - a.backend_start > lim;
+    ok := v IS NULL;
+    detail := CASE WHEN lim = interval '0' THEN 'check off (pgbx.doctor_long_job = 0)'
+                   WHEN ok THEN format('no backup or restore process running longer than %s', lim)
+                   ELSE format('running longer than %s: %s', lim, v) END;
+    fix := CASE WHEN ok THEN NULL
+                ELSE 'a running dump blocks DDL (ALTER TABLE, migrations) on the tables it reads; move the schedule to a quiet hour, '
+                     || 'or skip the rows of big tables with pgbx.set_data_scope()' END;
+    RETURN NEXT;
 END $$;
 
 -- Health checks for the CLI: one row per check, plain-language detail and the fix. Admin database only.
@@ -533,10 +615,12 @@ BEGIN
                 ELSE format('backups keep every table definition; rows skipped for %s table(s) right now — see pgbx.rowless_tables()', n) END;
 END $$;
 
--- Queue a backup now. Returns the history id; watch it in pgbx.history.
-CREATE FUNCTION pgbx.backup_now() RETURNS bigint LANGUAGE sql AS $$
-    INSERT INTO pgbx.history (kind, trigger) VALUES ('backup', 'manual') RETURNING id
-$$;
+-- Queue a backup now. Returns the history id; watch it in pgbx.history. While a backup of this database is still
+-- queued it returns that one instead (pgbx.coalesce_manual), so calling it five times costs one dump.
+CREATE FUNCTION pgbx.backup_now() RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN pgbx._queue_manual('backup');
+END $$;
 
 -- Queue a restore of this database's newest backup taken at or before `at` into a NEW database `into_db`.
 -- The live database is never touched; swap names yourself once the restore is verified.
@@ -576,13 +660,13 @@ BEGIN
         'pgbx.set_retention(int, int)', 'pgbx.pause(text)', 'pgbx.resume()',
         'pgbx.backup_now()', 'pgbx.restore(text, timestamptz)', 'pgbx.verify_now()',
         'pgbx.set_verify_schedule(text)', 'pgbx.download_url(bigint, interval)',
-        'pgbx.set_data_scope(text[], text[])']
+        'pgbx.set_data_scope(text[], text[])', 'pgbx.cancel(bigint)']
     LOOP
         EXECUTE format('ALTER FUNCTION %s SECURITY DEFINER SET search_path = pg_catalog, pgbx', f);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pgbx_admin', f);
     END LOOP;
 END $lock$;
--- internals (_presign, _log, _check_days): superuser only — no grants.
+-- internals (_presign, _log, _check_days, _queue_manual): superuser only — no grants.
 "#,
     name = "lockdown",
     finalize

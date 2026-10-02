@@ -28,6 +28,32 @@ All settings below take effect on reload (`SELECT pg_reload_conf();`). Only `sha
 | `pgbx.audit_days` | `30` | days of `history` (the audit trail) kept; kept backups, queued/running jobs and the newest row of each kind are never pruned |
 | `pgbx.alert_command` | *(none)* | shell command run for every failed job; JSON on stdin, env `PGBX_DATABASE`, `PGBX_KIND`, `PGBX_JOB_ID`, `PGBX_ERROR`, `PGBX_SERVER` |
 
+## Resource caps
+
+pg_dump / pg_restore run as polite child processes so a backup never takes more than one core and never waits behind
+your app's locks.
+
+| setting | default | what |
+|---|---|---|
+| `pgbx.job_nice` | `10` | CPU niceness of pg_dump / pg_restore (0–19); never raises priority |
+| `pgbx.job_ionice` | `best-effort-7` | IO priority on Linux: `none`, `idle`, `best-effort-0` … `best-effort-7` (anything else = `best-effort-7`; `idle` can starve on a busy disk) |
+| `pgbx.dump_lock_timeout` | `5s` | how long pg_dump waits for its table locks (0–10min); if DDL holds one, the backup is retried later instead of queueing behind it |
+| `pgbx.dump_lock_timeout_forced` | `60s` | the same once a retried backup reached its deadline; if it still times out, the backup fails and alerts |
+| `pgbx.defer_backoff` | `1,2,4,8,15` | minutes between retries (each 1–60, the last repeats) |
+| `pgbx.max_defer` | `4h` | a retried backup runs anyway this long after it was queued (0–24h), never later than one schedule interval |
+| `pgbx.max_defer_first` | `15min` | the same for a new database's first backup |
+| `pgbx.dump_compression_busy` | `auto` | `--compress` for a backup forced to run at its deadline; `auto` = zstd:1 with pg_dump 16+, gzip level 1 before, or `pgbx.dump_compression` when that is already cheaper (`none`, `0`, `lz4`) |
+| `pgbx.upload_kbps` | `0` | upload cap per job in KiB/s; 0 = unlimited |
+| `pgbx.download_kbps` | `0` | restore download cap per job in KiB/s; 0 = unlimited |
+| `pgbx.restore_synchronous_commit` | `off` | `synchronous_commit` for pg_restore; the target is a new database, so a crash just means restoring again |
+| `pgbx.doctor_long_job` | `1h` | `doctor()` warns (`long_running_job`) about a pg_dump / pg_restore running longer than this; 0 = never |
+
+The child connections show in `pg_stat_activity` as `pgbx_dump`, `pgbx_restore` and `pgbx_verify`.
+
+| setting | default | |
+|---|---|---|
+| `pgbx.coalesce_manual` | `on` | `backup_now()` / `verify_now()` return the job of that kind already queued instead of adding another |
+
 ## Per-database defaults
 
 Stored in `pgbx.config`, one row per database. Change them with SQL, not settings.

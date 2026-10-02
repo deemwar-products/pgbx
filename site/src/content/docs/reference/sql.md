@@ -49,7 +49,8 @@ Who: viewer. One row per database on the server.
 pgbx.doctor() RETURNS TABLE (name text, ok bool, detail text, fix text)
 ```
 Who: viewer (runs as `SECURITY DEFINER`). Health checks: `extension loaded`, `s3 settings`, `credentials file`,
-`database backups` (age vs schedule), `restore tests`, `workers`, `archive_mode` (info only) and `replication_slots`.
+`database backups` (age vs schedule), `restore tests`, `workers`, `archive_mode` (info only), `replication_slots`
+and `long_running_job` (a pg_dump / pg_restore running longer than `pgbx.doctor_long_job`).
 
 ### `rowless_tables()`
 ```sql
@@ -95,7 +96,8 @@ Who: admin. Default `'weekly on sunday at 04:00'`; `'never'` or `'off'` disables
 ## Jobs (admin)
 
 ### `backup_now() RETURNS bigint`
-Queues a backup. Returns the `history` id.
+Queues a backup. Returns the `history` id. While a backup of this database is still queued, returns that one
+instead (`pgbx.coalesce_manual`, on), so five calls cost one dump.
 
 ### `restore(into_db text, at timestamptz DEFAULT now()) RETURNS bigint`
 Restores the newest backup at or before `at` into a **new** database. Live database untouched.
@@ -104,7 +106,11 @@ SELECT pgbx.restore(into_db => 'myapp_restored', at => '2026-10-01 09:00');
 ```
 
 ### `verify_now() RETURNS bigint`
-Restores the newest backup into a scratch database, checks it, drops it.
+Restores the newest backup into a scratch database, checks it, drops it. Coalesced like `backup_now()`.
+
+### `cancel(job_id bigint) RETURNS text`
+Cancels a **queued** job of this database; it never starts and ends as `cancelled`. A running job cannot be
+cancelled yet. Revoked from `PUBLIC`; granted to admin.
 
 ### `download_url(backup_id bigint DEFAULT NULL, expires interval DEFAULT '1 hour') RETURNS text`
 Presigned S3 link to one backup (newest when `backup_id` is NULL). `expires` between 1 minute and 7 days.
