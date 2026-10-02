@@ -552,8 +552,8 @@ BEGIN
     est_bytes := coalesce(est_bytes, 0);
     SELECT array_agg(x.b / x.secs) INTO speeds
       FROM (SELECT h.bytes::float8 AS b, extract(epoch FROM h.finished - h.started)::float8 AS secs FROM pgbx.history h
-             WHERE h.kind = k AND h.state IN ('done', 'expired') AND h.bytes > 0 AND h.finished > h.started
-             ORDER BY h.id DESC LIMIT n) x;
+             WHERE h.kind = k AND h.state IN ('done', 'expired') AND h.bytes >= 1048576 AND h.finished > h.started
+             ORDER BY h.id DESC LIMIT n) x;   -- a job under 1 MiB is mostly fixed overhead, not speed
     srv := CASE k WHEN 'backup' THEN cap.backup_bps WHEN 'restore' THEN cap.restore_bps WHEN 'verify' THEN cap.verify_bps END;
     IF coalesce(cardinality(speeds), 0) >= least(3, n) THEN
         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) INTO s FROM unnest(speeds) v;
@@ -1171,7 +1171,7 @@ GRANT SELECT ON pgbx.config, pgbx.history, pgbx.backups, pgbx.server_overview, p
       pgbx.activity_hourly TO pgbx_viewer;
 GRANT EXECUTE ON FUNCTION pgbx.status(), pgbx.overview(), pgbx.to_cron(text),
       pgbx.next_run_epoch(text, double precision), pgbx._require_admin_db(),
-      pgbx.rowless_tables(), pgbx._like(text), pgbx._dur(double precision) TO pgbx_viewer;
+      pgbx.rowless_tables(), pgbx._like(text), pgbx._dur(double precision), pgbx._estimate(text) TO pgbx_viewer;
 -- job_eta() reads pg_database_size and the history: runs as the extension owner, viewers may call it
 ALTER FUNCTION pgbx.job_eta(bigint) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.job_eta(bigint) TO pgbx_viewer;
@@ -1196,7 +1196,8 @@ BEGIN
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pgbx_admin', f);
     END LOOP;
 END $lock$;
--- internals (_presign, _log, _check_days, _queue_manual, _estimate, _notice_eta, _activity_add): superuser only — no grants.
+-- internals (_presign, _log, _check_days, _queue_manual, _notice_eta, _activity_add): superuser only — no grants.
+-- (_estimate only reads: status() calls it as the viewer.)
 "#,
     name = "lockdown",
     finalize

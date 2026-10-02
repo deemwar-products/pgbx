@@ -36,9 +36,11 @@ r=$(P -d win -c "SELECT cron||'|'||confidence||'|'||(score < current_score)||'|'
 check "daily quiet hour 03:00 UTC, high confidence, quieter than 02:00" "$r" "0 3 * * *|high|true|SELECT pgbx.configure(schedule => '0 3 * * *');"
 check "status() shows it, never applied by itself" "$(P -d win -c "SELECT suggested_schedule LIKE '0 3 * * *%never applied by itself%' FROM pgbx.status()")" t
 P -d win -c "SELECT pgbx.set_schedule('daily at 12:00')" >/dev/null
-for _ in $(seq 20); do ok=$(P -c "SELECT ok FROM pgbx.doctor() WHERE name='schedule_in_quiet_window'"); [ "$ok" = f ] && break; sleep 1; done
-check "doctor(): schedule_in_quiet_window warns about 12:00" "$ok" f
-check "its fix is the configure() call" "$(P -c "SELECT fix LIKE '%win%configure(schedule => ''0 3 * * *'')%' FROM pgbx.doctor() WHERE name='schedule_in_quiet_window'")" t
+# (other databases may be listed too: cli_e2e leaves shop on 'every 2 hours', which hits busy hours)
+listed() { P -c "SELECT ok||'|'||(detail LIKE '%win: \"' || \$\$$1\$\$ || '\" runs at %; 0 3 * * * would be %') FROM pgbx.doctor() WHERE name='schedule_in_quiet_window'"; }
+for _ in $(seq 20); do r=$(listed 'daily at 12:00'); [ "$r" = "false|true" ] && break; sleep 1; done
+check "doctor(): schedule_in_quiet_window warns about win at 12:00 and names 0 3 * * *" "$r" "false|true"
+P -c "SELECT detail, fix FROM pgbx.doctor() WHERE name='schedule_in_quiet_window'" | sed 's/^/  /' | cut -c1-220
 out=$(J schedule suggest --db win)
 check "pgbx schedule suggest --json" "$(echo "$out" | jq -r '"\(.ok) \(.suggestion.cron) \(.applied) \(.safety)"')" "true 0 3 * * * false readonly"
 out=$(J schedule suggest --db win --apply)
@@ -46,8 +48,8 @@ check "--apply without --yes (no terminal) refused" "$(echo "$out" | jq -r '"\(.
 check "nothing changed" "$(P -d win -c "SELECT cron FROM pgbx.status()")" "0 12 * * *"
 out=$(J schedule suggest --db win --apply --yes)
 check "--apply --yes applies it" "$(echo "$out" | jq -r '"\(.ok) \(.applied)"')|$(P -d win -c "SELECT cron FROM pgbx.status()")" "true true|0 3 * * *"
-for _ in $(seq 20); do ok=$(P -c "SELECT ok FROM pgbx.doctor() WHERE name='schedule_in_quiet_window'"); [ "$ok" = t ] && break; sleep 1; done
-check "doctor(): ok again" "$ok" t
+for _ in $(seq 20); do r=$(P -c "SELECT position('win:' IN coalesce(detail, '')) = 0 FROM pgbx.doctor() WHERE name='schedule_in_quiet_window'"); [ "$r" = t ] && break; sleep 1; done
+check "doctor(): win no longer listed" "$r" t
 # another database's backup starts at 03:00 -> the suggestion for a third one moves away from that hour
 newdb win2
 P -d win -c "SELECT pgbx.set_schedule('daily at 03:00')" >/dev/null; sleep 8
@@ -103,7 +105,7 @@ check "on: the scheduled backup is deferred (busy)" "$(echo "$r" | cut -c1-12)" 
 sleep 4
 check "pgbx load lists it as deferred" "$(J load | jq -r --arg i "$sid" '[.deferred_jobs[]|select((.job_id|tostring)==$i)]|length')" 1
 sleep 50; check "still queued after 50 s" "$(state gate "$sid")" queued
-check "it ran at its deadline, forced" "$(wait_end gate "$sid" 120)|$(P -d gate -c "SELECT (params->>'forced')||'|'||(started <= (params->>'deadline')::timestamptz + interval '10 seconds')||'|'||(params->>'busy_deferrals')::int >= 1 FROM pgbx.history WHERE id=$sid")" "done|true|true|true"
+check "it ran at its deadline, forced" "$(wait_end gate "$sid" 120)|$(P -d gate -c "SELECT (params->>'forced')||'|'||(started <= (params->>'deadline')::timestamptz + interval '10 seconds')||'|'||((params->>'busy_deferrals')::int >= 1)::text FROM pgbx.history WHERE id=$sid")" "done|true|true|true"
 # the next slot: deferred, then the load stops -> it runs before the deadline, not forced
 for _ in $(seq 150); do s2=$(P -d gate -c "SELECT id FROM pgbx.history WHERE kind='backup' AND trigger='schedule' AND id > $sid ORDER BY id LIMIT 1"); [ -n "$s2" ] && break; sleep 1; done
 for _ in $(seq 15); do r=$(P -d gate -c "SELECT state||'|'||coalesce(params->>'defer_reason','-') FROM pgbx.history WHERE id=$s2"); case "$r" in queued\|busy*) break;; esac; sleep 1; done
@@ -115,7 +117,7 @@ for _ in $(seq 20); do b=$(J load | jq -r '.sample.load_busy'); [ "$b" = false ]
 check "pgbx load: quiet again" "$b" false
 out=$(J load --db gate)
 check "pgbx load: per-database counts" "$(echo "$out" | jq -r '.databases[]|select(.database=="gate")|"\(.load_gate) \(.deferred_7d>=2) \(.forced_7d>=1)"')" "on true true"
-check "doctor(): load_gate row" "$(P -c "SELECT ok||'|'||(detail LIKE '%on in gate%') FROM pgbx.doctor() WHERE name='load_gate'")" "t|t"
+check "doctor(): load_gate row" "$(P -c "SELECT ok||'|'||(detail LIKE '%on in gate%') FROM pgbx.doctor() WHERE name='load_gate'")" "true|true"
 P -d gate -c "SELECT pgbx.configure(load_gate => 'default')" >/dev/null
 greset busy_active_backends busy_tps max_defer defer_backoff
 P -c "DROP DATABASE IF EXISTS gate WITH (FORCE)" -c "DROP DATABASE IF EXISTS gate2 WITH (FORCE)" >/dev/null

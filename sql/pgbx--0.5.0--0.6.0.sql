@@ -429,8 +429,8 @@ BEGIN
     est_bytes := coalesce(est_bytes, 0);
     SELECT array_agg(x.b / x.secs) INTO speeds
       FROM (SELECT h.bytes::float8 AS b, extract(epoch FROM h.finished - h.started)::float8 AS secs FROM pgbx.history h
-             WHERE h.kind = k AND h.state IN ('done', 'expired') AND h.bytes > 0 AND h.finished > h.started
-             ORDER BY h.id DESC LIMIT n) x;
+             WHERE h.kind = k AND h.state IN ('done', 'expired') AND h.bytes >= 1048576 AND h.finished > h.started
+             ORDER BY h.id DESC LIMIT n) x;   -- a job under 1 MiB is mostly fixed overhead, not speed
     srv := CASE k WHEN 'backup' THEN cap.backup_bps WHEN 'restore' THEN cap.restore_bps WHEN 'verify' THEN cap.verify_bps END;
     IF coalesce(cardinality(speeds), 0) >= least(3, n) THEN
         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) INTO s FROM unnest(speeds) v;
@@ -541,7 +541,7 @@ BEGIN
     RETURN j;
 END $$;
 REVOKE ALL ON FUNCTION pgbx._dur(double precision), pgbx._estimate(text), pgbx.job_eta(bigint), pgbx._notice_eta(bigint) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION pgbx._dur(double precision) TO pgbx_viewer;
+GRANT EXECUTE ON FUNCTION pgbx._dur(double precision), pgbx._estimate(text) TO pgbx_viewer;
 ALTER FUNCTION pgbx.job_eta(bigint) SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 GRANT EXECUTE ON FUNCTION pgbx.job_eta(bigint) TO pgbx_viewer;
 ALTER FUNCTION pgbx.restore(text, timestamptz) SECURITY DEFINER SET search_path = pg_catalog, pgbx;

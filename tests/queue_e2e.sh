@@ -164,6 +164,7 @@ check "doctor(): capacity and eta_accuracy rows" "$(P -c "SELECT count(*) FROM p
 greset upload_kbps
 
 echo "## 5. crash: the job never leaves a dump or an open multipart upload behind"
+gset upload_kbps 256
 before=$(dumps qa); s3before=$(s3_dumps qa)
 id=$(P -d qa -c "SELECT pgbx.backup_now()"); wait_state qa "$id" running 30 >/dev/null; sleep 4
 check "multipart upload open while it runs" "$(open_uploads)" 1
@@ -178,7 +179,7 @@ id=$(P -d qa -c "SELECT pgbx.backup_now()"); wait_state qa "$id" running 30 >/de
 pid=$($DC exec -T db sh -c 'for p in /proc/[0-9]*; do tr "\0" " " < $p/cmdline 2>/dev/null | grep -q "^postgres: pgbx scheduler" && echo ${p#/proc/}; done' | head -1)
 check "found the scheduler process" "$([ -n "$pid" ] && echo yes)" yes
 since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-$DC exec -T db kill -9 "$pid"; sleep 3; wait_up
+$DC exec -T db sh -c "kill -9 $pid"; sleep 3; wait_up
 for _ in $(seq 60); do s=$(state qa "$id" 2>/dev/null); [ "$s" = failed ] && break; sleep 1; done
 check "kill -9 of the worker mid-upload: job failed (interrupted)" "$s|$(P -d qa -c "SELECT error LIKE 'interrupted%' FROM pgbx.history WHERE id=$id")" "failed|t"
 for _ in $(seq 30); do n=$($DC logs --since "$since" db 2>&1 | grep -c "aborted orphaned upload"); [ "$n" -ge 1 ] && break; sleep 1; done

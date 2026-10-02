@@ -151,6 +151,7 @@ pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read, kbps: i32, progre
         return Ok(n as u64);
     }
     let id = retry(&format!("start upload {key}"), || b.initiate_multipart_upload(key, CT).map_err(|e| e.to_string()))?.upload_id;
+    remember_upload(key, &id); // a crash from here on leaves an upload the next worker start aborts
     let result = (|| {
         let mut parts = Vec::new();
         let mut total = 0u64;
@@ -185,7 +186,48 @@ pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read, kbps: i32, progre
     if result.is_err() {
         let _ = b.abort_upload(key, &id);
     }
+    forget_upload(&id);
     result
+}
+
+/// Multipart uploads this server started and has not finished, one "key<TAB>upload id" per line, in the data
+/// directory (the worker's working directory). Listing open uploads through S3 is not reliable across S3
+/// implementations (some omit fields the client requires), so the worker keeps its own list.
+const OPEN_UPLOADS: &str = "pgbx_open_uploads";
+static OPEN_LOCK: Mutex<()> = Mutex::new(());
+
+fn remember_upload(key: &str, id: &str) {
+    let _g = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let r = std::fs::OpenOptions::new().create(true).append(true).open(OPEN_UPLOADS).and_then(|mut f| writeln!(f, "{key}\t{id}"));
+    if let Err(e) = r {
+        log(&format!("{OPEN_UPLOADS}: {e}"));
+    }
+}
+
+fn forget_upload(id: &str) {
+    let _g = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(text) = std::fs::read_to_string(OPEN_UPLOADS) else { return };
+    let keep: String = text.lines().filter(|l| l.split('\t').nth(1) != Some(id)).map(|l| format!("{l}\n")).collect();
+    let _ = if keep.is_empty() { std::fs::remove_file(OPEN_UPLOADS) } else { std::fs::write(OPEN_UPLOADS, keep) };
+}
+
+/// At worker start: abort every upload a crash left in the list (they are never a backup and cost storage).
+pub fn abort_remembered(b: &Bucket) {
+    let _g = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(text) = std::fs::read_to_string(OPEN_UPLOADS) else { return };
+    let mut left = String::new();
+    for l in text.lines() {
+        let Some((key, id)) = l.split_once('\t') else { continue };
+        match b.abort_upload(key, id) {
+            Ok(_) => log(&format!("aborted orphaned upload {key}")),
+            Err(e) if e.to_string().contains("NoSuchUpload") || e.to_string().contains("404") => {}
+            Err(e) => {
+                log(&format!("abort orphaned upload {key}: {e}; retried at the next start"));
+                left.push_str(&format!("{l}\n"));
+            }
+        }
+    }
+    let _ = if left.is_empty() { std::fs::remove_file(OPEN_UPLOADS) } else { std::fs::write(OPEN_UPLOADS, left) };
 }
 
 /// Writer wrapper that remembers whether the *destination* failed (pg_restore died) vs the network.

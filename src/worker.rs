@@ -362,6 +362,7 @@ fn tick(s: &mut Sched) -> Result<(), String> {
             && !CLEANED.swap(true, Ordering::Relaxed)
             && let Ok(b) = bucket()
         {
+            transfer::abort_remembered(&b);
             transfer::abort_orphans(&b, &format!("{}/", c.server));
         }
     }
@@ -677,7 +678,7 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &mut Sched) -> Result<Scann
             "SELECT kind, bytes::float8 / extract(epoch FROM finished - started)::float8 FROM (
                  SELECT kind, bytes, started, finished, row_number() OVER (PARTITION BY kind ORDER BY id DESC) AS n
                    FROM pgbx.history WHERE kind IN ('backup', 'restore', 'verify') AND state IN ('done', 'expired')
-                    AND bytes > 0 AND finished > started) x
+                    AND bytes >= 1048576 AND finished > started) x
               WHERE n <= $1",
             &[&(ETA_SAMPLES.get() as i64)],
         )
@@ -1222,8 +1223,8 @@ fn sample_load(admin: &mut Client, s: &mut Sched) {
                     AND a.pid <> pg_backend_pid() AND coalesce(a.application_name, '') NOT LIKE 'pgbx%')::int,
                 (SELECT sum(xact_commit + xact_rollback) FROM pg_stat_database)::float8,
                 (SELECT count(*) FROM pg_stat_activity a WHERE a.state = 'active' AND a.backend_type = 'client backend'
-                    AND coalesce(a.application_name, '') NOT LIKE 'pgbx%' AND $1 > 0
-                    AND now() - a.xact_start > make_interval(secs => $1)
+                    AND coalesce(a.application_name, '') NOT LIKE 'pgbx%' AND $1::float8 > 0
+                    AND now() - a.xact_start > make_interval(secs => $1::float8)
                     AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND l.granted
                                 AND l.mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock',
                                                'ExclusiveLock', 'AccessExclusiveLock')))::int,
