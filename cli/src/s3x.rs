@@ -116,8 +116,11 @@ pub fn get(b: &Bucket, key: &str) -> Result<Option<Vec<u8>>, String> {
     Ok(get_meta(b, key)?.map(|(v, _)| v))
 }
 
+/// An object's body and its x-amz-meta-* values.
+pub type WithMeta = (Vec<u8>, std::collections::HashMap<String, String>);
+
 /// GET a whole object with its x-amz-meta-* values (lower-case names, prefix stripped).
-pub fn get_meta(b: &Bucket, key: &str) -> Result<Option<(Vec<u8>, std::collections::HashMap<String, String>)>, String> {
+pub fn get_meta(b: &Bucket, key: &str) -> Result<Option<WithMeta>, String> {
     match b.get_object(key) {
         Ok(r) if r.status_code() == 404 => Ok(None),
         Ok(r) if r.status_code() / 100 == 2 => {
@@ -272,7 +275,9 @@ pub fn download_parallel(b: &Bucket, key: &str, size: u64, w: &mut impl Write, c
     }
     let window = concurrency * 2;
     let next = AtomicUsize::new(0);
-    let state: Mutex<(BTreeMap<usize, Vec<u8>>, usize, Option<String>)> = Mutex::new((BTreeMap::new(), 0, None));
+    // (chunks fetched and not yet written, next chunk the writer needs, first error)
+    type Window = (BTreeMap<usize, Vec<u8>>, usize, Option<String>);
+    let state: Mutex<Window> = Mutex::new((BTreeMap::new(), 0, None));
     let cv = Condvar::new();
     let mut written = 0u64;
     let mut werr: Option<String> = None;

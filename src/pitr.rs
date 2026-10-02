@@ -2,13 +2,14 @@
 //!
 //! The data path lives in the pgbx CLI (`pgbx wal-push` as archive_command, `pgbx pitr backup` for base
 //! backups, `pgbx wal-get` during recovery). Every poll the worker's main thread (never blocking on S3):
-//!   1. writes `<work_dir>/pgbx-wal.conf` (0600; S3 settings + the PATH of the credentials file, never keys),
-//!   2. turns WAL dropped by wal-push under `pgbx.wal_queue_max` (`<work_dir>/wal-drops.log`) into a 'wal_gap'
-//!      history row + alert, and closes it once a base backup that STARTED after the last drop has finished,
-//!   3. watches archiving (pg_stat_archiver + the .ready backlog) as a 'wal_archive' incident: one alert when it
-//!      starts, a reminder every hour, one 'recovered' alert only when WAL really reached S3 again and nothing was
-//!      dropped recently (a drop also tells Postgres "archived", so the archiver alone looks healthy),
-//!   4. queues base backups on `pgbx.pitr_schedule` (and a healing one after a gap, with backoff).
+//! 1. writes `<work_dir>/pgbx-wal.conf` (0600; S3 settings + the PATH of the credentials file, never keys),
+//! 2. turns WAL dropped by wal-push under `pgbx.wal_queue_max` (`<work_dir>/wal-drops.log`) into a 'wal_gap'
+//!    history row + alert, and closes it once a base backup that STARTED after the last drop has finished,
+//! 3. watches archiving (pg_stat_archiver + the .ready backlog) as a 'wal_archive' incident: one alert when it
+//!    starts, a reminder every hour, one 'recovered' alert only when WAL really reached S3 again and nothing was
+//!    dropped recently (a drop also tells Postgres "archived", so the archiver alone looks healthy),
+//! 4. queues base backups on `pgbx.pitr_schedule` (and a healing one after a gap, with backoff).
+//!
 //! A base backup is an ordinary job of the server-wide queue (ADR 0001): kind 'base_backup' in the admin database,
 //! started on a job thread with a slot, which runs `pgbx pitr backup` as its child (cancel / shutdown kill it).
 //! History rows ('base_backup', 'wal_gap', 'wal_archive') live in the admin database. Alerts and notifications for

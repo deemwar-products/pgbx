@@ -153,7 +153,9 @@ pub extern "C-unwind" fn pgbx_worker_main(_arg: pg_sys::Datum) {
     log("worker stopping");
 }
 
-/// Shutdown: stop every job (their threads abort uploads and record the failure), wait up to 20 s for them.
+/// Shutdown: stop every job (their threads abort uploads and record the failure), wait up to 5 s for them. A thread
+/// stuck in an S3 request that does not answer (it ends at the request timeout) is not waited for: the job is marked
+/// interrupted at the next start, and Postgres stops promptly.
 fn stop_all(s: &mut Sched) {
     STOPPING.store(true, Ordering::Relaxed);
     for r in &s.running {
@@ -161,7 +163,7 @@ fn stop_all(s: &mut Sched) {
         kill_child(&r.ctl);
     }
     let t0 = Instant::now();
-    while !s.running.is_empty() && t0.elapsed() < Duration::from_secs(20) {
+    while !s.running.is_empty() && t0.elapsed() < Duration::from_secs(5) {
         reap(s);
         drain_logs();
         std::thread::sleep(Duration::from_millis(100));
@@ -379,15 +381,19 @@ fn tick(s: &mut Sched) -> Result<(), String> {
     {
         use std::sync::atomic::AtomicBool;
         static CLEANED: AtomicBool = AtomicBool::new(false);
-        // once per worker start, before any job runs: uploads a crash cut off are never a backup
+        // once per worker start, before any job runs: uploads a crash cut off are never a backup. On a thread of its
+        // own: with S3 unreachable these calls wait for timeouts, and the poll loop (new databases, queued jobs,
+        // shutdown) must never wait for S3.
         if s.running.is_empty()
             && !CLEANED.swap(true, Ordering::Relaxed)
             && let Ok(b) = bucket()
         {
             // listed uploads: only those older than 10 minutes (S3's clock may lag ours; the list file covers the rest)
             let (prefix, list, cutoff) = (format!("{}/", c.server), transfer::take_remembered(), Utc::now() - chrono::Duration::minutes(10));
-            transfer::abort_remembered(&b, &list);
-            transfer::abort_orphans(&b, &prefix, cutoff);
+            let _ = std::thread::Builder::new().name("pgbx cleanup".into()).spawn(move || {
+                transfer::abort_remembered(&b, &list);
+                transfer::abort_orphans(&b, &prefix, cutoff);
+            });
         }
     }
     let dbs: Vec<String> = admin

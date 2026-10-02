@@ -7,6 +7,7 @@
 #      tests/load_e2e.sh   — quiet-window suggestion and the load gate (pgbench)
 #      tests/extras_e2e.sh — 0.6 extras: encryption, roles file + with_roles, notifications, GFS, metrics (own S3)
 #      tests/pitr_e2e.sh   — optional point-in-time restore: setup, wal-push/get, restore to a time, gaps, upgrade (own S3)
+#      tests/s3down_e2e.sh — S3 that never answers: new databases, heartbeat, cancel and shutdown never wait for it
 #   3) tests/bench_local.sh — ~1.2 GB speed + S3-outage chaos against a local S3
 #   4) tests/upgrade_e2e.sh — worker auto-update (ALTER EXTENSION UPDATE incl. template1)
 # PG_MAJOR=13..18 picks the Postgres major (needs a dev image built with that PG_MAJOR, see docker/Dockerfile).
@@ -31,6 +32,7 @@ echo "== server ready"
 ../tests/load_e2e.sh; load=$?
 IMAGE=pgbx:test ../tests/extras_e2e.sh; extras=$?
 PITR_IMAGE=pgbx:test ../tests/pitr_e2e.sh; pitr=$?
+IMAGE=pgbx:test ../tests/s3down_e2e.sh; s3down=$?
 ../tests/bench_local.sh; bench=$?
 (set -a; [ ! -f ./.env ] || . ./.env; set +a; ../tests/upgrade_e2e.sh); upgrade=$?   # S3 env: docker/.env, else the environment
 diag=0
@@ -38,5 +40,5 @@ if [ "${PGBX_DIAG_SMOKE:-0}" = 1 ]; then   # optional: pgbx doctor/diagnose with
   (cd .. && docker run --rm --name pgbx-diag-smoke -v "$PWD":/src -v pgbx-diag-target:/src/target \
      -v pgbx-diag-clitarget:/src/cli/target -w /src pgbx-dev sh tests/diag_smoke.sh); diag=$?
 fi
-echo "== e2e exit $e2e, cli_e2e exit $cli, ui_e2e exit $ui, queue_e2e exit $queue, load_e2e exit $load, extras_e2e exit $extras, pitr_e2e exit $pitr, bench exit $bench, upgrade exit $upgrade, diag smoke exit $diag"
-[ $e2e -eq 0 ] && [ $cli -eq 0 ] && [ $ui -eq 0 ] && [ $queue -eq 0 ] && [ $load -eq 0 ] && [ $extras -eq 0 ] && [ $pitr -eq 0 ] && [ $bench -eq 0 ] && [ $upgrade -eq 0 ] && [ $diag -eq 0 ]
+echo "== e2e exit $e2e, cli_e2e exit $cli, ui_e2e exit $ui, queue_e2e exit $queue, load_e2e exit $load, extras_e2e exit $extras, pitr_e2e exit $pitr, s3down_e2e exit $s3down, bench exit $bench, upgrade exit $upgrade, diag smoke exit $diag"
+[ $e2e -eq 0 ] && [ $cli -eq 0 ] && [ $ui -eq 0 ] && [ $queue -eq 0 ] && [ $load -eq 0 ] && [ $extras -eq 0 ] && [ $pitr -eq 0 ] && [ $s3down -eq 0 ] && [ $bench -eq 0 ] && [ $upgrade -eq 0 ] && [ $diag -eq 0 ]

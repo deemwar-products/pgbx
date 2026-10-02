@@ -183,7 +183,7 @@ pub fn next_segment(name: &str, seg_size: u64) -> Option<String> {
     let tl = u32::from_str_radix(&name[..8], 16).ok()?;
     let log = u32::from_str_radix(&name[8..16], 16).ok()?;
     let seg = u32::from_str_radix(&name[16..24], 16).ok()?;
-    let per_log = (0x1_0000_0000u64 / seg_size.max(1)) as u64;
+    let per_log = 0x1_0000_0000u64 / seg_size.max(1);
     let (log, seg) = if seg as u64 + 1 >= per_log { (log.checked_add(1)?, 0) } else { (log, seg + 1) };
     Some(format!("{tl:08X}{log:08X}{seg:08X}"))
 }

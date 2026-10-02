@@ -14,6 +14,9 @@
 //!   tablespaces, \connect, \restrict, SET -> skipped (server-specific or session-only)
 //! Scope 'referenced' (default) limits this to the roles the database uses; 'all' replays every role.
 
+// Also compiled into the CLI (edition 2021): no let-chains, so nested `if`s stay as they are.
+#![allow(clippy::collapsible_if)]
+
 use std::collections::{BTreeSet, HashSet};
 
 pub const REF_MARK: &str = "-- pgbx-referenced-roles: ";
