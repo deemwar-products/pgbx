@@ -36,10 +36,6 @@ jobs:
           ARGS="--no-skill --prefix $P"; [ -z "$VER" ] || ARGS="$ARGS --version $VER"
           curl -fsSL "$DOCS/install.sh" | sh -s -- $ARGS
           "$P/pgbx" --version
-          # Intel build, under Rosetta (skipped when the release has no darwin-amd64 yet)
-          if curl -fsSL "$DOCS/install.sh" -o i.sh && arch -x86_64 /bin/sh i.sh $ARGS --prefix "$P-x64"; then
-            arch -x86_64 "$P-x64/pgbx" --version; file "$P-x64/pgbx"
-          else echo "::warning::darwin-amd64 not installable from this release"; fi
 
   windows:
     runs-on: [self-hosted, pgbx-win]

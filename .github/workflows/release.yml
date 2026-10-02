@@ -3,7 +3,7 @@ name: Release
 # Manual only: Actions -> Release -> Run workflow with an existing tag vX.Y.Z -> builds every artifact below and publishes a GitHub Release with SHA256SUMS.
 #   pgbx-ext-pg<N>-linux-<arch>.tar.gz   extension: lib/<name>.so + extension/<name>.control + all sql (incl. upgrades)
 #   pgbx-linux-<arch>.tar.gz             CLI, static musl binary
-#   pgbx-darwin-<arch>.tar.gz            CLI only (the extension is Linux-only)
+#   pgbx-darwin-arm64.tar.gz             CLI only (the extension is Linux-only)
 #   pgbx-windows-<arch>.zip              CLI only, pgbx.exe
 # Asset names carry NO version, so installers use the stable redirect
 #   https://github.com/deemwar-products/pgbx/releases/latest/download/<asset>   (no API call, no rate limit)
@@ -79,9 +79,8 @@ jobs:
         include:
           - { os: linux, arch: amd64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl }
           - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-          # macOS builds run on our own Mac (self-hosted runner label pgbx-mac); Intel is cross-compiled there
+          # macOS builds run on our own Mac (self-hosted runner label pgbx-mac); Apple silicon only (Intel Macs: build from source)
           - { os: darwin, arch: arm64, runner: pgbx-mac, target: aarch64-apple-darwin }
-          - { os: darwin, arch: amd64, runner: pgbx-mac, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.runner == 'pgbx-mac' && fromJSON('["self-hosted","pgbx-mac"]') || matrix.runner }}
     steps:
       - uses: actions/checkout@v4

@@ -62,6 +62,7 @@ case "$(uname -m)" in
   aarch64|arm64) ARCH=arm64 ;;
   *) die "unsupported CPU $(uname -m) (amd64 and arm64 only)" ;;
 esac
+[ "$OS" = darwin ] && [ "$ARCH" != arm64 ] && die "no prebuilt pgbx for Intel Macs; build it from source: git clone https://github.com/$REPO && cargo install --locked --path pgbx/cli"
 
 IS_ROOT=0
 [ "$(id -u)" = 0 ] && IS_ROOT=1
