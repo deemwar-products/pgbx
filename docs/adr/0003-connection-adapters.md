@@ -1,6 +1,7 @@
 # ADR 0003: Connection adapters and profiles (and a marketplace note)
 
-Status: **Accepted in principle (owner decisions, 2026-10-02); build after the current merges.**
+Status: **Accepted in principle (owner decisions, 2026-10-02, including "no connection code in the core"); build
+after the current merges.**
 Builds on ADR 0002 (profiles, SSH tunnels, read queries).
 
 ## Context
@@ -21,13 +22,25 @@ accounts, GCP projects and environments.
 - Users with a single database can skip profiles entirely and pass a connection string for that run
   (`--url postgres://...` or `PGBX_URL`). It's used in memory and never saved.
 
-### Adapters
+### Adapters: no connection code in pgbx
 
-An adapter is a program pgbx runs to get a connection. pgbx **re-runs the adapter for every command and stops it
-when the command ends**. There's no helper daemon and no socket for adapters.
+pgbx itself contains **no connection code**: no SSH, AWS, GCP or Azure logic. Every way of reaching a server is
+an **external adapter**, a command listed in config. pgbx stays a single Rust binary with no Node (or any
+other runtime) requirement. A runtime is needed only for the adapters a user enables.
 
-**Contract (v1).** pgbx runs the command with no shell, in its own process group (`setsid` on Unix, a Job Object
-on Windows). The adapter prints **one JSON line** on stdout within `ready_timeout` (default 30 s):
+```toml
+[additional_adapters]
+# defaults shipped in the repo under adapters/ (copied by the installer; enable by uncommenting)
+# ssh   = ["node", "~/.pgbx/adapters/ssh/ssh-connector.js"]
+# aws   = ["node", "~/.pgbx/adapters/aws/aws-connector.js"]
+# gcp   = ["node", "~/.pgbx/adapters/gcp/gcp-connector.js"]
+# azure = ["node", "~/.pgbx/adapters/azure/azure-connector.js"]
+corp-vpn = ["/usr/local/bin/corp-pg", "--env", "prod"]   # any executable works the same way
+```
+
+**Contract (v1).** pgbx runs `<command> connect <name> [profile args...]` with no shell, in its own process
+group (`setsid` on Unix, a Job Object on Windows), for **every command**. The adapter prints **one JSON line** on
+stdout within `ready_timeout` (default 30 s), then **exits**:
 
 ```json
 {"url": "postgres://user:pass@127.0.0.1:54321/shop?sslmode=require", "state": "ready", "name": "prod-eu"}
@@ -35,39 +48,34 @@ on Windows). The adapter prints **one JSON line** on stdout within `ready_timeou
 
 | Field | Meaning |
 |---|---|
-| `url` | full connection string, password included if needed. pgbx uses it **in memory for this run only** and saves it nowhere (not in profiles, state files, memories or logs). Any output redacts it to `postgres://user:***@...`. Child tools (`pg_dump`, `pg_restore`) get the password through their environment, never their argv, so it can't show up in `ps`. |
-| `state` | shown to the user as is: `ready` means go; anything else (`error: no credentials for project acme-prod`, `mfa required`) means pgbx stops, shows it and exits non-zero. |
-| `name` | the connection's name. It must match the profile name when run from a profile (a mismatch is an error, to catch a wrong adapter). With an ad-hoc adapter it becomes the connection name for memory (`~/pgbx/<name>/<db>/`). |
+| `url` | full connection string, password included if needed. pgbx uses it **in memory for this run only** and saves it nowhere (not in profiles, state, memories or logs). Output redacts it to `postgres://user:***@...`. Child tools get the password through their environment, never their argv. |
+| `state` | shown as is. `ready` means go; anything else (`error: no credentials for project acme-prod`, `mfa required`) stops the command with a non-zero exit. |
+| `name` | the connection's name. It must match the profile name (a mismatch is an error). With an ad-hoc adapter it names the memory folder (`~/pgbx/<name>/<db>/`). |
 
-When the command ends, or on a ready-timeout or Ctrl-C, pgbx sends **SIGTERM to the adapter's process group**,
-then **SIGKILL** after 5 s (on Windows it terminates the Job Object), so no proxy is left behind.
+- **The adapter owns reuse and caching.** It may start a **detached** tunnel process that it owns (an SSH forward,
+  `aws ssm start-session`, `cloud-sql-proxy`), print the line and exit. On the next call it checks whether its
+  tunnel is still up, reuses it, or restarts it if broken, with its own idle expiry (the default adapters use 10
+  minutes). pgbx's built-in 10-minute tunnel reuse (`cli/src/tunnel.rs`) is **removed**.
+- **pgbx stops only the adapter process**: SIGTERM to its process group, then SIGKILL after 5 s, if it hasn't
+  exited after the ready-timeout or on Ctrl-C. It **never touches anything the adapter detached**.
+- **An optional verb, `<command> stop <name>`**, tears down that adapter's tunnel for `name`. It's used by
+  `pgbx profile disconnect NAME`. An adapter without it answers with a non-zero exit, and pgbx reports "this
+  adapter has no stop".
+- **pgbx does nothing with secrets.** Credentials belong to the adapter, the vendor CLI or the user.
 
-**pgbx does nothing with secrets.** Credentials belong to the adapter, the vendor CLI or the user. pgbx only
-forwards and uses the URL.
+### Default adapters (in the repo, not in the binary)
 
-### Exactly four built-in adapters
+`adapters/ssh`, `adapters/aws`, `adapters/gcp` and `adapters/azure`. Each has its own README (prerequisites, profile
+args, how reuse and expiry work) and its own tests. They wrap the user's existing tooling and credentials:
 
-| Adapter | Wraps (the user's existing tooling and credentials) |
+| Adapter | Wraps |
 |---|---|
-| `ssh` | system `ssh` with keys, agent, `~/.ssh/config` and ProxyJump (today's path) |
+| `ssh` | system `ssh` (keys, agent, `~/.ssh/config`, ProxyJump); a detached `ssh -N -L` forward, reused, with a 10-minute idle expiry |
 | `aws` | `aws ssm start-session` port forwarding to RDS or EC2, plus `aws rds generate-db-auth-token` for IAM auth when asked |
-| `gcp` | `cloud-sql-proxy` (and `gcloud` for the instance connection name / IAM) |
+| `gcp` | `cloud-sql-proxy` (and `gcloud` for the instance name / IAM) |
 | `azure` | `az` (Bastion tunnel and Entra ID token for Azure Database for PostgreSQL) |
 
-No kubectl or other built-ins. Each built-in is a thin wrapper that runs the vendor CLI the user already has,
-picks a free local port, waits until it accepts, and emits the same `{url, state, name}` line. A missing
-vendor CLI gives `state: "error: aws CLI not found (install it, then aws configure)"`.
-
-### Custom adapters: config only, no code from us
-
-```toml
-[additional_adapters]
-corp-vpn = ["node", "corp-proxy.js"]
-vault-db = ["/usr/local/bin/vault-pg", "--role", "readonly"]
-```
-
-`pgbx profile add billing --adapter corp-vpn --arg env=prod`. We embed no custom adapter code: we run the
-command and read its line. The contract above is the whole API.
+Custom adapters follow exactly the same contract, and we embed none of their code.
 
 ### Safety
 
@@ -88,15 +96,17 @@ command and read its line. The contract above is the whole API.
 
 ## Consequences
 
-- One code path for SSH and every cloud, and profiles become the product's centre for the client side.
-- Per-command adapters are simple and leave nothing running, but each command pays the adapter's start-up
-  (seconds for SSM or cloud-sql-proxy). Acceptable for backups and occasional queries; slow for rapid
-  agent loops (Q1 below).
-- Host-side commands (`doctor`, `logs`, `setup server`, `diagnose`) still need `ssh`; for cloud adapters
-  they report that honestly.
-- Tests: a fake adapter in e2e. It prints ready, then sleeps; prints an error state; never prints; prints a
-  name that doesn't match; ignores SIGTERM (so SIGKILL must land). The URL must never appear on disk or in
-  output.
+- The core gets smaller: `cli/src/tunnel.rs` (its SSH spawn, helper, state files, lock and 10-minute reuse) moves
+  out into `adapters/ssh`. The client is profiles, the adapter contract and process-group handling.
+- One rule for every connection, built-in or custom. Profiles are the product's centre for the client side.
+- Enabling a default adapter needs Node on that machine. pgbx itself still doesn't.
+- **Host-side commands** (`doctor`, `logs`, `setup server`, `diagnose`) ran on the server over pgbx's own SSH
+  (`ssh target pgbx <cmd>`). With no SSH code in the core they need another route. See Q1.
+- Tests:
+  - pgbx: a fake adapter that prints ready and exits; prints an error state; never prints; prints a mismatching
+    name; ignores SIGTERM (so SIGKILL must land); detaches a child (which must survive pgbx); implements `stop`.
+    The URL must never appear on disk or in output.
+  - Each default adapter: its own tests (reuse, broken-tunnel restart, idle expiry, `stop`).
 
 ## Marketplace (long term)
 
@@ -124,9 +134,12 @@ and list the container first (it covers the most buyers), with the AMI as an eas
 
 ## Open questions for the owner
 
-1. **The SSH tunnel today is reused for 10 minutes** (ADR 0002, built on the owner's request). Should the
-   `ssh` built-in keep that reuse, since it stores no secret, only host and port? Or should it re-run per command
-   like every other adapter, to keep one rule? This draft keeps today's SSH reuse until decided.
-2. Licence: MIT, or a one-time fee? This also decides the marketplace pricing model.
-3. Marketplace target: managed Postgres (needs a new runner mode) or self-managed (an AMI with today's extension)?
-4. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?
+1. **Host-side commands without SSH in the core.** `doctor`, `logs`, `setup server` and `diagnose` need to run on the
+   database host. Options: (a) an optional adapter verb `<command> exec <name> -- pgbx <cmd> --json`, which the ssh
+   adapter implements and the cloud ones may (SSM `send-command`); (b) the user runs them on the host
+   themselves. This draft proposes (a).
+2. **Default adapters in Node**: fine for developer laptops, but servers and Windows boxes often lack Node.
+   Ship them as Node only, or also as POSIX `sh` / PowerShell versions for `ssh`, the most common one?
+3. Licence: MIT, or a one-time fee? This also decides the marketplace pricing model.
+4. Marketplace target: managed Postgres (needs a new runner mode) or self-managed (an AMI with today's extension)?
+5. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?
