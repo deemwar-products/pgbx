@@ -137,7 +137,7 @@ echo "## k. profiles (stored in a scratch config dir; never hold secrets)"
 PJ() { $DC exec -T -u postgres -e PGBX_CONFIG_DIR=/tmp/pgbx-prof db pgbx "$@" --json 2>/dev/null; }
 X rm -rf /tmp/pgbx-prof
 out=$(PJ profile add plain --host "$PLAIN" $S3); check "profile add" "$(jq1 "$out" .ok)|$(jq1 "$out" .profile.default)" "true|true"
-check "profile file is 0600 and has no key values" "$(X sh -c 'stat -c %a /tmp/pgbx-prof/profiles.json; grep -ci secret_access_key /tmp/pgbx-prof/profiles.json')" "600
+check "profile file is 0600 and has no key values" "$(X sh -c 'stat -c %a /tmp/pgbx-prof/config.yaml; grep -ci secret_access_key /tmp/pgbx-prof/config.yaml')" "600
 0"
 out=$(PJ profile list); check "profile list" "$(jq1 "$out" '.profiles|length')|$(jq1 "$out" .default)" "1|plain"
 out=$(PJ backups --from-s3 --db shop --profile plain); check "backups --from-s3 via --profile" "$(jq1 "$out" .ok)|$(jq1 "$out" .profile_used)|$(jq1 "$out" '.backups[0].key')" "true|plain|$newest"

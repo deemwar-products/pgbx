@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 # pgbx as a plain Postgres client, no backups: every client path against a STOCK postgres (no pgbx extension,
-# no S3), directly and through an Alpine sshd that has no pgbx installed either. Nothing that a client-only user
+# no S3), directly and through an Alpine sshd that has no pgbx installed either (the ssh example adapter). Nothing that a client-only user
 # runs may fail or print a scary error; the backup commands must refuse in one plain sentence.
-# Run: tests/client_only_e2e.sh     (needs docker, ssh, jq; bash 3.2-safe; exits non-zero on any failure)
+# Run: tests/client_only_e2e.sh     (needs docker, ssh, node 18+, jq; bash 3.2-safe; exits non-zero on any failure)
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 B=${PGBX_BIN:-$ROOT/cli/target/debug/pgbx}
 [ -x "$B" ] || cargo build -q --manifest-path "$ROOT/cli/Cargo.toml" || exit 1
 NET=pgbx-co-net; PG=pgbx-co-pg; SSHD=pgbx-co-sshd; SPORT=${CO_SSH_PORT:-22223}; PPORT=${CO_PG_PORT:-55499}
 W=$(mktemp -d)
-export PGBX_CONFIG_DIR=$W/config PGBX_STATE_DIR=$W/state PGBX_SSH=$W/ssh PGBX_MEMORY_DIR=$W/mem
-cleanup() { "$B" tunnel close --all >/dev/null 2>&1; docker rm -f $PG $SSHD >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; rm -rf "$W"; }
+export PGBX_CONFIG_DIR=$W/config PGBX_SSH_BIN=$W/ssh PGBX_MEMORY_DIR=$W/mem
+unset PGBX_URL PGBX_PROFILE
+ADAPTER="node $ROOT/adapters/ssh/ssh-adapter.js"
+cleanup() { docker rm -f $PG $SSHD >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; pkill -f "$W/ssh_config" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  PASS $1"; pass=$((pass+1)); else echo "  FAIL $1 (got '$2', want '$3')"; fail=$((fail+1)); fi; }
 jq1() { echo "$1" | jq -r "$2" 2>/dev/null; }
 J() { "$B" "$@" --json 2>/dev/null; }
-OFF="pgbx extension not installed on this server: backups are off; queries, profiles and tunnels work"
+OFF="pgbx extension not installed on this server: backups are off; queries, profiles and adapters work"
 
 ssh-keygen -q -t ed25519 -N '' -f "$W/key"
 cat > "$W/ssh_config" <<CFG
@@ -88,16 +90,15 @@ SK() { HOME=$W/home CLAUDE_SKILLS_DIR=$W/home/claude "$B" skill "$@" --no-codex 
 out=$(SK install); check "skill install" "$(jq1 "$out" .ok)" true
 out=$(SK uninstall); check "skill uninstall" "$(jq1 "$out" .ok)" true
 
-echo "## e. over ssh to a host with no pgbx installed"
-out=$(J setup client viassh --ssh pgbxco --host $PG --user postgres --yes); rc=$?
+echo "## e. through the ssh adapter to a host with no pgbx installed"
+out=$(J setup client viassh --adapter ssh --adapter-command "$ADAPTER" target=pgbxco pg_host=$PG user=postgres --yes); rc=$?
 check "setup client over ssh: ok, exit 0, backups off" "$(jq1 "$out" .ok)|$rc|$(jq1 "$out" .test.backups)" "true|0|off"
 out=$(J query "SELECT max(n) AS m FROM t" --profile viassh); rc=$?
-check "query through the tunnel" "$(jq1 "$out" '.rows[0].m')|$rc" "50|0"
+check "query through the ssh adapter" "$(jq1 "$out" '.rows[0].m')|$rc" "50|0"
 out=$(J status --profile viassh); rc=$?
-check "status through the tunnel: backups off, exit 0" "$(jq1 "$out" .backups)|$rc" "off|0"
+check "status through the ssh adapter: backups off, exit 0" "$(jq1 "$out" .backups)|$rc" "off|0"
 out=$(J doctor --profile viassh); rc=$?
-check "doctor: no pgbx on the host, checks through the tunnel" "$(jq1 "$out" .healthy)|$rc|$(jq1 "$out" '.checks[] | select(.name=="backups (pgbx extension)") | .ok')" "true|0|true"
-check "one tunnel, reused" "$(J tunnel list | jq '.tunnels|length')" 1
-out=$(J tunnel close --all); check "tunnel close --all" "$(jq1 "$out" .ok)|$(J tunnel list | jq '.tunnels|length')" "true|0"
+check "doctor: no pgbx on the host, SQL checks through the adapter" "$(jq1 "$out" .healthy)|$rc|$(jq1 "$out" '.checks[] | select(.name=="backups (pgbx extension)") | .ok')" "true|0|true"
+check "no ssh forward outlives a command" "$(pgrep -f "$W/ssh_config" | wc -l | tr -d ' ')" 0
 
 echo "RESULT: $pass passed, $fail failed"; [ $fail -eq 0 ]

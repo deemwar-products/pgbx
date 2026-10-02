@@ -3,7 +3,8 @@
 #   1. the docker test stack (docker/compose.test.yml, needs the server up; run after tests/e2e.sh so there is history):
 #      app + API endpoints, no token -> 401, foreign Host -> 403, actions refused without --allow-safe, the safe ones
 #      allowed with it (backup now, restore into a NEW database, cancel a queued job), the query guard, Save to memory;
-#   2. a STOCK postgres (no pgbx extension, like tests/client_only_e2e.sh): the overview says backups are off.
+#   2. a STOCK postgres (no pgbx extension, like tests/client_only_e2e.sh): the overview says backups are off;
+#   3. an ADAPTER profile (ADR 0003): one adapter for the whole serve run, the profile switcher, Ctrl-C stops it.
 # Run: tests/serve_e2e.sh     (needs docker, curl, jq; bash 3.2-safe; exits non-zero on any failure)
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -15,7 +16,8 @@ X() { $DC exec -T -u postgres db "$@"; }
 P() { X psql -v ON_ERROR_STOP=1 -qAt "$@"; }
 TPORT=${SERVE_TEST_PG_PORT:-55439}; CO=pgbx-serve-co-pg; COPORT=${SERVE_CO_PG_PORT:-55497}
 W=$(mktemp -d)
-export PGBX_CONFIG_DIR=$W/config PGBX_STATE_DIR=$W/state PGBX_MEMORY_DIR=$W/mem
+export PGBX_CONFIG_DIR=$W/config PGBX_MEMORY_DIR=$W/mem
+unset PGBX_URL PGBX_PROFILE
 PIDS=""
 cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null; done; docker rm -f $CO >/dev/null 2>&1; rm -rf "$W"; }
 trap cleanup EXIT
@@ -125,7 +127,7 @@ for _ in $(seq 30); do docker exec $CO psql -qAtU postgres -c "SELECT 1" >/dev/n
 docker exec $CO psql -qU postgres -c "CREATE DATABASE app" >/dev/null
 unset PGPASSWORD
 start co --host 127.0.0.1 --port $COPORT --user postgres
-OFF="pgbx extension not installed on this server: backups are off; queries, profiles and tunnels work"
+OFF="pgbx extension not installed on this server: backups are off; queries, profiles and adapters work"
 ov=$(G /api/overview)
 check "overview: backups off, said plainly" "$(echo "$ov" | jq -r '"\(.ok) \(.backups) \(.info)"')" "true off $OFF"
 check "overview: the databases are still listed" "$(echo "$ov" | jq -r '[.databases[].database]|index("app") != null')" true
@@ -133,6 +135,35 @@ check "overview: how to turn backups on" "$(echo "$ov" | jq -r '.next_steps[0]|t
 check "health: healthy, extension row is info" "$(G /api/health | jq -r '"\(.healthy) \(.checks[]|select(.name=="backups (pgbx extension)")|.ok)"')" "true true"
 check "query works without the extension" "$(PJ /api/query '{"db":"app","sql":"SELECT 41 + 1 AS n"}' | jq -r '.rows[0].n')" 42
 check "queue: refused in one plain sentence" "$(G /api/queue | jq -r '"\(.ok) \(.error|startswith("pgbx extension not installed"))"')" "false true"
+
+echo "## 4. an adapter profile: one adapter for the whole run"
+# a minimal adapter: hands over the test stack's URL (password from the profile's $PGPASSWORD) and logs each start
+cat > "$W/adapter.sh" <<'ADP'
+#!/bin/sh
+IFS= read -r line || exit 0
+v() { printf '%s' "$line" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+echo start >> "$(v dir)/starts"
+echo "adapter: connecting to port $(v port)" >&2
+printf '{"url":"postgres://postgres:%s@127.0.0.1:%s/postgres","state":"ready","name":"%s"}\n' "$(v password)" "$(v port)" "$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')"
+while IFS= read -r l; do case $l in *stop*) echo stop > "$(v dir)/stopped"; exit 0 ;; esac; done
+echo eof > "$(v dir)/stopped"
+ADP
+export PGPASSWORD=test-only-not-secret
+"$B" profile add viaadapter --adapter fake --adapter-command "sh $W/adapter.sh" dir=$W port=$TPORT 'password=$PGPASSWORD' --json >/dev/null
+"$B" profile add stock --url "postgres://postgres@127.0.0.1:$COPORT/postgres" --json >/dev/null
+start ad --profile viaadapter
+check "adapter profile: overview through the adapter" "$(G /api/overview | jq -r '"\(.ok) \(.backups)"')" "true on"
+for e in /api/queue /api/load /api/health /api/db/postgres; do G $e >/dev/null; done
+check "query through the adapter" "$(PJ /api/query '{"db":"postgres","sql":"SELECT 7 AS n"}' | jq -r '.rows[0].n')" 7
+check "one adapter for all those calls" "$(wc -l < "$W/starts" | tr -d ' ')" 1
+check "switcher lists the adapter profile (url redacted, never a password)" "$(G /api/session | jq -r '[.profiles[]|select(.name=="viaadapter")|.adapter][0]')|$(G /api/session | grep -c test-only-not-secret)" "fake|0"
+check "switch to another profile" "$(G '/api/overview?profile=stock' | jq -r .backups)" off
+check "switching back reuses the running adapter" "$(G '/api/overview?profile=viaadapter' | jq -r .backups)|$(wc -l < "$W/starts" | tr -d ' ')" "on|1"
+check "no API answer carries the password" "$( (G /api/session; G /api/health; G /api/overview) | grep -c test-only-not-secret)" 0
+pid=$(echo $PIDS | awk '{print $NF}'); kill -INT "$pid"
+for _ in $(seq 50); do [ -s "$W/stopped" ] && break; sleep 0.2; done
+check "Ctrl-C: serve says stop to its adapter" "$(cat "$W/stopped" 2>/dev/null)" stop
+check "the password never reached serve's output" "$(cat "$W"/*.out "$W"/*.err | grep -c test-only-not-secret)" 0
 
 echo "== serve_e2e: pass=$pass fail=$fail"
 [ $fail -eq 0 ]
