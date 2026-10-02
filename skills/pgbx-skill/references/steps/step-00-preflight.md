@@ -29,6 +29,9 @@ pgbx profile list --json
   `settings.host`; if still ambiguous, **ask** which one (list the names). Never guess between servers.
 - **No profiles** — use the flags/env the user gave (`PGHOST` etc.); offer
   `pgbx profile add <name> --host H --port P --user U` (safe; never put a password or S3 key in it).
+  A server reachable only over SSH: `pgbx profile add <name> --ssh user@host [--ssh-port N] [--ssh-jump J]`
+  — pgbx starts the tunnel with the system ssh and reuses it; you never run `ssh` yourself.
+  `pgbx tunnel list --json` shows open tunnels; `pgbx tunnel close <name>` closes one.
 
 Set `profile` in session context and pass `--profile <name>` on **every** later `pgbx` call
 (recipes show commands without it — add it). Check `profile_used` in each reply matches.

@@ -48,6 +48,35 @@ pgbx status --profile prod --db shop
 Profiles store where a server is, never passwords or S3 keys (use `~/.pgpass` / `PGPASSWORD`, and a
 credentials file for S3). See [CLI reference](../../reference/cli/#profiles).
 
+### Servers you reach over SSH
+
+Many database servers only accept connections from inside their network. Add `--ssh` to the profile and the
+CLI goes through SSH for you, using your normal `ssh` program (your keys, agent, `~/.ssh/config` and jump
+hosts all work; pgbx never sees a key):
+
+```sh
+pgbx profile add prod --ssh ops@db.prod.example.com --user postgres
+pgbx status --profile prod --db shop      # first command opens the tunnel
+pgbx query "SELECT now()" --profile prod  # later commands reuse it
+```
+
+```
+ pgbx CLI ──▶ 127.0.0.1:<free port> ══ ssh -L ══▶ db server ──▶ Postgres (localhost:5432)
+               └─ kept open by a small background pgbx helper; closes after 10 minutes unused
+```
+
+Commands that need the machine itself (`doctor`, `logs`, `diagnose`, `setup`) run there as
+`ssh ops@db... pgbx <command> --json`, so the server needs the pgbx CLI too (the install one-liner puts it
+there). `pgbx tunnel list` shows open tunnels; `pgbx tunnel close prod` closes one.
+
+### Looking around without a shell
+
+`pgbx query "SELECT ..."` runs one read query and returns typed JSON rows, so you (or an agent) can answer
+"how big is this database?" without psql or a login on the box. It only accepts SELECT-style statements and
+refuses writes and functions with side effects. This is a **best-effort guard for agents, not a security
+boundary**: if you need a hard guarantee, connect as a role that can only read. Roles and permissions stay
+yours to manage; pgbx never creates one.
+
 ## The agent skill — on top of the CLI
 
 `pgbx-skill` teaches AI coding agents (Claude Code, Codex) to answer "is my database backed up?" or
@@ -60,7 +89,7 @@ See [For AI agents](../../agents/skill/).
 | part | runs on | needs Postgres up? |
 |---|---|---|
 | pgbx extension | the database server, inside Postgres | yes (it *is* part of Postgres) |
-| pgbx CLI | anywhere: laptop, CI, the server | for most commands; not for the ones below |
+| pgbx CLI | anywhere: laptop, CI, the server (also over SSH) | for most commands; not for the ones below |
 | agent skill | wherever the agent runs | no, it only calls the CLI |
 
 ## When Postgres is down

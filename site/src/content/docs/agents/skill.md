@@ -25,6 +25,10 @@ From a checkout: `sh skills/pgbx-skill/install.sh`; self-check: `sh skills/pgbx-
 ## Rules the skill follows
 
 - `pgbx … --json` first. SQL is the fallback when the CLI is missing.
+- Pick the server first: `pgbx profile list --json`, choose (or ask), then `--profile NAME` on every call.
+- No shell: read questions go through `pgbx query "SELECT ..." --json`; a server behind SSH is a profile with
+  `--ssh`, and pgbx opens and reuses the tunnel. The skill never runs `ssh` or `psql` itself and never tries to
+  get around the query guard.
 - Discover (`pgbx status --json`, `pgbx doctor --json`) before any change.
 - Never read or print credentials. A `download_url` link is used, never pasted into chat.
 - One-database restore always lands in a **new** database.

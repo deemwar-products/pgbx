@@ -21,6 +21,9 @@ skill owns intent routing and recipe knowledge.
   colours and `psql` borders are for humans, never for parsing.
 - **Pick the server first, then pin it.** Run `pgbx profile list --json` (step-00), choose or ask
   for the profile, and pass `--profile <name>` on every `pgbx` call. Never mix servers in one task.
+- **No shell needed: use the CLI.** Read questions → `pgbx query "SELECT ..." --json` (STAT-R-7); a remote
+  server → a profile with `--ssh` (pgbx opens and reuses the tunnel itself). Prefer these over `ssh`, `psql`
+  or any shell command; never try to get around `pgbx query`'s SELECT-only guard.
 - **Discover before acting.** Run `pgbx status --json` / `pgbx doctor --json`
   (step-00) before any mutation. A `failing` database fails the next backup too.
 - **Never print credentials.** S3 keys live in `pgbx.credentials_file`
@@ -74,7 +77,7 @@ Runs:
 
 | Family | Covers | Reference |
 |---|---|---|
-| Status | is it backed up, list backups, doctor, logs, audit UI / who did what | `references/status.md` |
+| Status | is it backed up, list backups, doctor, logs, audit UI / who did what, read queries | `references/status.md` |
 | Backup | backup now, wait, backup id | `references/backup.md` |
 | Restore | db into a new database, from S3 onto a new server | `references/restore.md` |
 | Verify | restore tests, verify schedule, failures | `references/verify.md` |
