@@ -94,8 +94,8 @@ The worker tags its own children `application_name=pgbx_dump`/`pgbx_restore` (PG
   Note the honest limit: the *backend* serving pg_dump's COPY is a Postgres process we do not renice; most CPU of a
   dump is compression in pg_dump itself, which we do cap.
 - **Concurrency:** formalise today's one-job-at-a-time: a `pg_try_advisory_lock(hashtext('pgbx_job'))` in the admin
-  DB around each job, so a future second worker or the CLI cannot run a job in parallel. `pgbx.max_parallel_jobs`
-  is **not** added (YAGNI); `pg_restore -j` / `pg_dump -j` stay unused (they need directory format anyway).
+  DB slots `1..pgbx.max_concurrent_jobs` (default 1) around each job, so a second worker or the CLI cannot exceed it.
+  `pg_restore -j` / `pg_dump -j` stay unused (they need directory format anyway).
 - **Compression:** keep `pgbx.dump_compression` default; under a forced (deadline) run or when the gate saw load,
   use `zstd:1` / gzip 1. Never use zstd `workers=` (multi-threaded) — one core max.
 - **Upload bandwidth:** `pgbx.upload_kbps` (default **0** = unlimited) — token bucket in `upload_stream` /
