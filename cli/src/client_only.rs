@@ -35,7 +35,8 @@ pub fn classify(created: bool, available: bool, preloaded: bool) -> Ext {
 pub fn ext(c: &mut Client) -> Result<Ext, String> {
     let v = one(c, "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pgbx') AS created,
                            EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pgbx') AS available,
-                           coalesce(current_setting('shared_preload_libraries', true), '') ~ '(^|[ ,])pgbx($|[ ,])' AS preloaded", &[])?;
+                           -- pg_settings hides superuser-only settings from other roles instead of raising, unlike current_setting()
+                           coalesce((SELECT setting FROM pg_settings WHERE name = 'shared_preload_libraries'), '') ~ '(^|[ ,])pgbx($|[ ,])' AS preloaded", &[])?;
     Ok(classify(v["created"] == true, v["available"] == true, v["preloaded"] == true))
 }
 
