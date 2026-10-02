@@ -71,6 +71,7 @@ pub static MAX_DEFER_FIRST: GucSetting<i32> = GucSetting::<i32>::new(15 * 60); /
 pub static COALESCE_MANUAL: GucSetting<bool> = GucSetting::<bool>::new(true);
 // one server-wide job queue (ADR 0001 §0)
 pub static MAX_CONCURRENT_JOBS: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub static RESTORE_LANE: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static OVERRUN_POLICY: GucSetting<Overrun> = GucSetting::<Overrun>::new(Overrun::Skip);
 pub static OVERRUN_MAX_GAP: GucSetting<f64> = GucSetting::<f64>::new(1.5);
 
@@ -111,6 +112,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(c"pgbx.max_defer_first", c"max_defer for a new database's first backup", c"", &MAX_DEFER_FIRST, 0, 86_400, GucContext::Sighup, GucFlags::UNIT_S);
     GucRegistry::define_bool_guc(c"pgbx.coalesce_manual", c"backup_now() / verify_now() return the job already queued instead of adding another", c"", &COALESCE_MANUAL, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_int_guc(c"pgbx.max_concurrent_jobs", c"Jobs (backups, restore tests, restores, prunes) running at once on this server", c"1-8; each running job holds an advisory lock slot in the admin database, so nothing can exceed it", &MAX_CONCURRENT_JOBS, 1, 8, GucContext::Sighup, GucFlags::default());
+    GucRegistry::define_bool_guc(c"pgbx.restore_lane", c"One extra job slot for restores only", c"a restore never waits behind a long dump; turn off on very small servers", &RESTORE_LANE, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_enum_guc(c"pgbx.overrun_policy", c"Schedule slots that passed while a dump of the database was running", c"skip: the next run is the next slot after the dump finished (see pgbx.overrun_max_gap); catch_up: run once right away", &OVERRUN_POLICY, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_float_guc(c"pgbx.overrun_max_gap", c"With overrun_policy=skip, never wait for a slot more than this many schedule intervals after the last good backup finished", c"1.0-10; past it the backup runs right away", &OVERRUN_MAX_GAP, 1.0, 10.0, GucContext::Sighup, GucFlags::default());
 
@@ -152,6 +154,23 @@ CREATE TABLE pgbx.server_overview (
     seen_at          timestamptz NOT NULL DEFAULT now(),
     interval_secs    float8,                                   -- seconds between this schedule's slots
     dump_secs        float8[]                                  -- run time of the last 3 backups, newest first
+);
+
+-- The server-wide job queue as the worker sees it (every database's running, queued and deferred jobs), rewritten
+-- every poll in the admin database; `pgbx jobs` reads it. Readable like server_overview (pgbx_viewer).
+CREATE TABLE pgbx.server_queue (
+    database     name NOT NULL,
+    job_id       bigint NOT NULL,
+    kind         text NOT NULL,
+    trigger      text NOT NULL,
+    state        text NOT NULL,                                -- running | cancelling | queued | deferred
+    position     int,                                          -- 1 = starts next; NULL while running or deferred
+    slot         int,                                          -- job slot while running; 0 = the restore lane
+    requested_at timestamptz,
+    started_at   timestamptz,
+    detail       text,                                         -- why it waits, or where it runs
+    seen_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (database, job_id)
 );
 
 -- One row per database. path NULL = use the database name (so the row copied from template1 stays correct).
@@ -298,7 +317,7 @@ CREATE FUNCTION pgbx.status() RETURNS TABLE (
     last_backup_at timestamptz, last_backup_age interval, last_backup_size text, last_backup_key text,
     backups_kept bigint, retention text, data_scope text, verify_schedule text, last_verified_at timestamptz, last_verify_result text,
     last_error text, last_error_at timestamptz, paused_reason text, paused_at timestamptz,
-    queued_jobs bigint, location text
+    queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text
 ) LANGUAGE plpgsql STABLE AS $$
 DECLARE cfg pgbx.config; lb pgbx.history; le pgbx.history; lv pgbx.history; last_auto timestamptz;
 BEGIN
@@ -340,7 +359,14 @@ BEGIN
         (SELECT count(*) FROM pgbx.history h WHERE h.state='queued'),
         format('s3://%s/%s/%s/', current_setting('pgbx.s3_bucket', true),
                coalesce(nullif(current_setting('pgbx.server_name', true), ''), '<hostname>'),
-               coalesce(cfg.path, current_database()));
+               coalesce(cfg.path, current_database())),
+        (SELECT max(h.id) FROM pgbx.history h WHERE h.state='running'),
+        nq.id, (nq.params->>'queue_position')::int,
+        coalesce(nq.params->>'wait_reason', CASE WHEN nq.id IS NOT NULL THEN 'queued; the worker picks it up within pgbx.poll_seconds' END)
+    FROM (SELECT NULL::bigint AS id, NULL::jsonb AS params
+          UNION ALL (SELECT h.id, h.params FROM pgbx.history h WHERE h.state='queued'
+                     ORDER BY (h.params->>'queue_position')::int NULLS LAST, h.id LIMIT 1)
+          ORDER BY id NULLS LAST LIMIT 1) nq;
 END $$;
 
 -- internal: queue a manual job, or (pgbx.coalesce_manual, default on) return the one of that kind already queued
@@ -363,7 +389,9 @@ BEGIN
     RETURN j;
 END $$;
 
--- Cancel a queued job of this database: it never starts and ends as 'cancelled'.
+-- Cancel a job of this database: a queued one never starts; a running one is stopped by the worker within a few
+-- seconds (its child is killed, a half-done upload is aborted so nothing is left in S3, a half-restored database is
+-- dropped). Either way it ends as 'cancelled'.
 CREATE FUNCTION pgbx.cancel(job_id bigint) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE h pgbx.history;
 BEGIN
@@ -373,8 +401,13 @@ BEGIN
     ELSIF h.state = 'queued' THEN
         UPDATE pgbx.history SET state = 'cancelled', finished = now(), error = 'cancelled by ' || session_user WHERE id = job_id;
         RETURN format('%s job %s cancelled before it started', h.kind, job_id);
+    ELSIF h.state = 'running' THEN
+        UPDATE pgbx.history SET params = params || jsonb_build_object('cancel_requested', now(), 'cancelled_by', session_user)
+         WHERE id = job_id;
+        RETURN format('%s job %s is running: the worker stops it within a few seconds and it ends as cancelled '
+                      '(nothing is left in S3)', h.kind, job_id);
     END IF;
-    RAISE EXCEPTION 'pgbx: job % is % (only a queued job can be cancelled)', job_id, h.state;
+    RAISE EXCEPTION 'pgbx: job % is % already (only a queued or running job can be cancelled)', job_id, h.state;
 END $$;
 
 -- Restore test: restore the newest backup into a scratch database, check it, drop it. Like backup_now(), returns
@@ -689,7 +722,7 @@ REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgbx FROM PUBLIC;
 GRANT USAGE ON SCHEMA pgbx TO pgbx_viewer;
 
 -- viewer: read-only
-GRANT SELECT ON pgbx.config, pgbx.history, pgbx.backups, pgbx.server_overview TO pgbx_viewer;
+GRANT SELECT ON pgbx.config, pgbx.history, pgbx.backups, pgbx.server_overview, pgbx.server_queue TO pgbx_viewer;
 GRANT EXECUTE ON FUNCTION pgbx.status(), pgbx.overview(), pgbx.to_cron(text),
       pgbx.next_run_epoch(text, double precision), pgbx._require_admin_db(),
       pgbx.rowless_tables(), pgbx._like(text) TO pgbx_viewer;

@@ -8,6 +8,7 @@
 //!   guarded     pause, lowering retention, narrowing scope, verify-schedule never — require --yes
 
 mod diagnose;
+mod jobs;
 mod policy;
 mod profile;
 mod query;
@@ -42,6 +43,7 @@ const VALUE_FLAGS: &[&str] = &[
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
     "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "tunnel",
+    "jobs",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -109,6 +111,7 @@ read-only:
   pgbx diagnose [--log FILE] [--pgdata DIR]  why Postgres is down / disk full / pg_wal growing: cause, evidence,
                                              and steps tagged readonly/safe/guarded/destructive (never run by pgbx)
   pgbx logs     [--lines N]                  recent failed jobs
+  pgbx jobs                                  the server-wide job queue: what runs (slot / restore lane), what waits and why
   pgbx ui       [--listen 127.0.0.1:8432] [--strict]
                                              read-only audit web UI (overview, 30-day timeline, health);
                                              --strict refuses a role that could change backups
@@ -128,6 +131,7 @@ policy / access (show with no arguments; changes that reduce protection need --y
   pgbx scope [--include P1,P2] [--exclude P1,P2] [--reset]
   pgbx verify-schedule TEXT|never pgbx link [--backup-id N] [--expires '1 hour']
   pgbx overview                   (admin database: every database on the server)
+  pgbx jobs cancel ID [--db X] --yes        cancel a queued or running job (a running one is stopped, nothing left in S3)
 setup (guarded: shows the plan; --yes writes):
   pgbx setup server [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
               --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
@@ -181,6 +185,7 @@ pub fn level(cmd: &str, a: &Args) -> Level {
         "retention" | "scope" | "pause" | "setup" => Level::Guarded,
         "verify-schedule" if a.pos.first().and_then(|s| policy::verify_schedule_risk(s)).is_some() => Level::Guarded,
         "verify-schedule" => Level::Safe,
+        "jobs" if a.pos.first().map(String::as_str) == Some("cancel") => Level::Guarded,
         _ => Level::ReadOnly,
     }
 }
@@ -305,7 +310,7 @@ fn wait_job(c: &mut Client, id: i64, timeout: Duration) -> Result<Value, String>
     loop {
         let r = one(c, "SELECT id, kind, state, started, finished, s3_key, bytes, error, params FROM pgbx.history WHERE id = $1", &[&id])?;
         match r["state"].as_str() {
-            Some("done") | Some("failed") | Some("expired") => return Ok(r),
+            Some("done") | Some("failed") | Some("expired") | Some("cancelled") => return Ok(r),
             None => return Err(format!("job {id} not found in pgbx.history")),
             _ => {}
         }
@@ -581,6 +586,7 @@ fn main() {
         "db-restore" => cmd_db_restore(&mut cx),
         "doctor" => cmd_doctor(&mut cx),
         "logs" => cmd_logs(&mut cx),
+        "jobs" => jobs::run(&mut cx),
         "schedule" => policy::schedule(&mut cx),
         "retention" => policy::retention(&mut cx),
         "pause" => policy::pause(&mut cx),
@@ -621,6 +627,8 @@ fn main() {
         if v.get("diagnosis").is_some() {
             print!("\n{}", diagnose::text(&v["diagnosis"]));
         }
+    } else if cmd == "jobs" && ok && v.get("jobs").is_some() {
+        print!("{}", jobs::text(&v));
     } else if cmd == "diagnose" && ok {
         print!("{}", diagnose::text(&v));
     } else if let Some(e) = v.get("error").filter(|_| !ok) {
@@ -727,6 +735,8 @@ mod tests {
         assert_eq!(level("schedule", &p(&["schedule"])), Level::ReadOnly);
         assert_eq!(level("profile", &p(&["profile", "list"])), Level::ReadOnly);
         assert_eq!(level("profile", &p(&["profile", "add", "x", "--host", "h"])), Level::Safe);
+        assert_eq!(level("jobs", &p(&["jobs"])), Level::ReadOnly);
+        assert_eq!(level("jobs", &p(&["jobs", "cancel", "7"])), Level::Guarded);
     }
 
     #[test]

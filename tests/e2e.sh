@@ -218,7 +218,7 @@ check "2x verify_now() = one job" "$(echo "$r" | wc -l | tr -d ' ')" 1
 P -d shop -c "SELECT pgbx.cancel($r)" >/dev/null
 check "queued restore test cancelled" "$(P -d shop -c "SELECT state FROM pgbx.history WHERE id=$r")" cancelled
 sleep 3; check "a cancelled job never starts" "$(P -d shop -c "SELECT state||'|'||(started IS NULL) FROM pgbx.history WHERE id=$r")" "cancelled|true"
-bad=$(P -d shop -c "SELECT pgbx.cancel($r)" 2>&1); case "$bad" in *"only a queued job can be cancelled"*) echo "  PASS cancel of a finished job refused"; pass=$((pass+1));; *) echo "  FAIL: $bad"; fail=$((fail+1));; esac
+bad=$(P -d shop -c "SELECT pgbx.cancel($r)" 2>&1); case "$bad" in *"only a queued or running job can be cancelled"*) echo "  PASS cancel of a finished job refused"; pass=$((pass+1));; *) echo "  FAIL: $bad"; fail=$((fail+1));; esac
 P -c "ALTER SYSTEM SET pgbx.coalesce_manual = off" -c "SELECT pg_reload_conf()" >/dev/null; sleep 1
 r=$(P -d shop -c "BEGIN" -c "SELECT pgbx.backup_now()" -c "SELECT pgbx.backup_now()" -c "COMMIT" 2>/dev/null | sort -u)
 check "coalesce_manual=off queues each call" "$(echo "$r" | wc -l | tr -d ' ')" 2

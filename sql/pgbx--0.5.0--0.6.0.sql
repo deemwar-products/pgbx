@@ -155,7 +155,7 @@ BEGIN
     RETURN NEXT;
 END $$;
 
--- coalesced manual jobs and cancel (ADR 0001 §0); the server-wide queue itself is not in 0.6.0
+-- coalesced manual jobs and cancel (ADR 0001 §0)
 ALTER TABLE pgbx.history DROP CONSTRAINT IF EXISTS history_state_check;
 ALTER TABLE pgbx.history ADD CONSTRAINT history_state_check
     CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired', 'cancelled'));
@@ -190,8 +190,13 @@ BEGIN
     ELSIF h.state = 'queued' THEN
         UPDATE pgbx.history SET state = 'cancelled', finished = now(), error = 'cancelled by ' || session_user WHERE id = job_id;
         RETURN format('%s job %s cancelled before it started', h.kind, job_id);
+    ELSIF h.state = 'running' THEN
+        UPDATE pgbx.history SET params = params || jsonb_build_object('cancel_requested', now(), 'cancelled_by', session_user)
+         WHERE id = job_id;
+        RETURN format('%s job %s is running: the worker stops it within a few seconds and it ends as cancelled '
+                      '(nothing is left in S3)', h.kind, job_id);
     END IF;
-    RAISE EXCEPTION 'pgbx: job % is % (only a queued job can be cancelled)', job_id, h.state;
+    RAISE EXCEPTION 'pgbx: job % is % already (only a queued or running job can be cancelled)', job_id, h.state;
 END $$;
 
 CREATE OR REPLACE FUNCTION pgbx.verify_now() RETURNS bigint LANGUAGE plpgsql AS $$
@@ -210,3 +215,82 @@ GRANT EXECUTE ON FUNCTION pgbx.cancel(bigint) TO pgbx_admin;
 -- CREATE OR REPLACE resets SECURITY DEFINER / search_path: restore them as the install's lockdown sets them
 ALTER FUNCTION pgbx.backup_now() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
 ALTER FUNCTION pgbx.verify_now() SECURITY DEFINER SET search_path = pg_catalog, pgbx;
+
+-- the server-wide job queue (ADR 0001 §0): pgbx jobs, cancel of a running job, status() says why a job waits
+-- The server-wide job queue as the worker sees it, rewritten every poll in the admin database.
+CREATE TABLE pgbx.server_queue (
+    database     name NOT NULL,
+    job_id       bigint NOT NULL,
+    kind         text NOT NULL,
+    trigger      text NOT NULL,
+    state        text NOT NULL,                                -- running | cancelling | queued | deferred
+    position     int,                                          -- 1 = starts next; NULL while running or deferred
+    slot         int,                                          -- job slot while running; 0 = the restore lane
+    requested_at timestamptz,
+    started_at   timestamptz,
+    detail       text,                                         -- why it waits, or where it runs
+    seen_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (database, job_id)
+);
+GRANT SELECT ON pgbx.server_queue TO pgbx_viewer;
+
+-- status() gains running_job, next_job, queue_position, waiting_reason (new OUT columns: drop and create)
+DROP FUNCTION pgbx.status();
+CREATE OR REPLACE FUNCTION pgbx.status() RETURNS TABLE (
+    database name, state text, schedule text, cron text, next_backup_at timestamptz,
+    last_backup_at timestamptz, last_backup_age interval, last_backup_size text, last_backup_key text,
+    backups_kept bigint, retention text, data_scope text, verify_schedule text, last_verified_at timestamptz, last_verify_result text,
+    last_error text, last_error_at timestamptz, paused_reason text, paused_at timestamptz,
+    queued_jobs bigint, location text, running_job bigint, next_job bigint, queue_position int, waiting_reason text
+) LANGUAGE plpgsql STABLE AS $$
+DECLARE cfg pgbx.config; lb pgbx.history; le pgbx.history; lv pgbx.history; last_auto timestamptz;
+BEGIN
+    SELECT * INTO cfg FROM pgbx.config;
+    IF NOT FOUND THEN  -- worker hasn't visited this database yet
+        cfg := ROW(1, NULL, '0 2 * * *', 'daily at 02:00', 14, 90, '0 4 * * 0', 'weekly on sunday at 04:00',
+                   true, NULL, NULL, now(), NULL, NULL)::pgbx.config;
+    END IF;
+    SELECT * INTO lb FROM pgbx.history WHERE kind='backup' AND history.state='done' ORDER BY id DESC LIMIT 1;
+    SELECT * INTO le FROM pgbx.history WHERE history.state='failed' ORDER BY id DESC LIMIT 1;
+    SELECT * INTO lv FROM pgbx.history WHERE kind='verify' AND history.state IN ('done','failed') ORDER BY id DESC LIMIT 1;
+    SELECT max(requested_at) INTO last_auto FROM pgbx.history WHERE kind='backup' AND trigger IN ('schedule','first');
+    RETURN QUERY SELECT
+        current_database()::name,
+        CASE WHEN NOT cfg.enabled THEN 'paused'
+             WHEN EXISTS (SELECT 1 FROM pgbx.history h WHERE h.state='running') THEN 'running'
+             WHEN lb.id IS NULL THEN 'waiting for first backup'
+             WHEN le.id > lb.id THEN 'failing'
+             ELSE 'active' END,
+        cfg.schedule_label, cfg.schedule,
+        CASE WHEN NOT cfg.enabled THEN NULL
+             WHEN last_auto IS NULL THEN now()
+             ELSE to_timestamp(pgbx.next_run_epoch(cfg.schedule, extract(epoch FROM last_auto))) END,
+        lb.finished, now() - lb.finished, pg_size_pretty(lb.bytes), lb.s3_key,
+        (SELECT count(*) FROM pgbx.history h WHERE h.kind='backup' AND h.state='done'),
+        format('max %s backups, max %s days', cfg.max_backups, cfg.max_days),
+        CASE WHEN coalesce(cardinality(cfg.include_data), 0) = 0 AND coalesce(cardinality(cfg.exclude_data), 0) = 0
+             THEN 'all tables, all rows'
+             ELSE 'all tables; rows of ' ||
+                  CASE WHEN coalesce(cardinality(cfg.include_data), 0) > 0 THEN 'only ' || array_to_string(cfg.include_data, ', ')
+                       ELSE 'all tables' END ||
+                  CASE WHEN coalesce(cardinality(cfg.exclude_data), 0) > 0 THEN ' except ' || array_to_string(cfg.exclude_data, ', ')
+                       ELSE '' END ||
+                  format(' (%s tables backed up without rows)', (SELECT count(*) FROM pgbx.rowless_tables()))
+        END,
+        coalesce(cfg.verify_label, 'never'), lv.finished,
+        CASE WHEN lv.id IS NULL THEN NULL WHEN lv.state = 'done' THEN 'ok: ' || coalesce(lv.params->>'checked', '') ELSE 'FAILED: ' || lv.error END,
+        le.error, le.finished, cfg.paused_reason, cfg.paused_at,
+        (SELECT count(*) FROM pgbx.history h WHERE h.state='queued'),
+        format('s3://%s/%s/%s/', current_setting('pgbx.s3_bucket', true),
+               coalesce(nullif(current_setting('pgbx.server_name', true), ''), '<hostname>'),
+               coalesce(cfg.path, current_database())),
+        (SELECT max(h.id) FROM pgbx.history h WHERE h.state='running'),
+        nq.id, (nq.params->>'queue_position')::int,
+        coalesce(nq.params->>'wait_reason', CASE WHEN nq.id IS NOT NULL THEN 'queued; the worker picks it up within pgbx.poll_seconds' END)
+    FROM (SELECT NULL::bigint AS id, NULL::jsonb AS params
+          UNION ALL (SELECT h.id, h.params FROM pgbx.history h WHERE h.state='queued'
+                     ORDER BY (h.params->>'queue_position')::int NULLS LAST, h.id LIMIT 1)
+          ORDER BY id NULLS LAST LIMIT 1) nq;
+END $$;
+REVOKE ALL ON FUNCTION pgbx.status() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pgbx.status() TO pgbx_viewer;

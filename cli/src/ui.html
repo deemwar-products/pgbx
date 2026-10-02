@@ -27,7 +27,7 @@ td.wrap{white-space:normal;min-width:220px}
 th{font-size:12px;color:var(--mute);font-weight:600}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--mute)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.info{color:var(--info)}
-.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}.dot.info{background:var(--info)}
+.dot.mute{background:var(--line)}.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}.dot.info{background:var(--info)}
 .mute{color:var(--mute)}
 .chip{display:inline-block;padding:1px 7px;border-radius:10px;background:var(--chip);font-size:12px}
 .filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
@@ -57,6 +57,7 @@ const ago = v => { if (!v) return ""; const s = (Date.now() - Date.parse(v)) / 1
   const a = Math.abs(s), f = a < 3600 ? Math.round(a/60) + " min" : a < 172800 ? Math.round(a/3600) + " h" : Math.round(a/86400) + " d";
   return s >= 0 ? f + " ago" : "in " + f; };
 function tone(s) { s = String(s || "").toLowerCase();
+  if (/^cancel/.test(s)) return "mute";
   if (/fail|error|problem|overdue|open|never|worker error/.test(s)) return "bad";
   if (/pause|inactive|running|queued|starting|expired/.test(s)) return "warn";
   if (/ok|done|backed|healthy|closed|scheduled|idle/.test(s)) return "ok";
@@ -71,10 +72,20 @@ function table(cols, rows, empty) {
     rows.map(r => `<tr>${cols.map(c => `<td${c[2] ? ' class="wrap"' : ""}>${c[1](r)}</td>`).join("")}</tr>`).join("") + "</tbody></table></div>";
 }
 
+function queueCard(q) {
+  return `<div class="card"><h2>Job queue (${q.jobs.length}) <span class=mute>· slots ${esc(q.slots.max_concurrent_jobs)}, restore lane ${esc(q.slots.restore_lane)}</span></h2>` + table([
+    ["database", r => `<a class="db" href="#db/${encodeURIComponent(r.database)}">${esc(r.database)}</a>`],
+    ["job", r => esc(r.job_id)], ["kind", r => `<span class=chip>${esc(r.kind)}</span>`], ["state", r => st(r.state)],
+    ["where", r => r.position != null ? `#${esc(r.position)} in line` : r.slot === 0 ? "restore lane" : r.slot != null ? `slot ${esc(r.slot)}` : ""],
+    ["since", r => `${ts(r.started_at || r.requested_at)} <span class=mute>${ago(r.started_at || r.requested_at)}</span>`],
+    ["why / what", r => esc(r.detail), 1],
+  ], q.jobs, "nothing running or queued") + "</div>";
+}
+
 async function overview() {
-  const j = await get("/api/overview");
+  const [j, q] = await Promise.all([get("/api/overview"), get("/api/queue").catch(() => null)]);
   $("#who").textContent = `read-only · role ${j.connection.role} · ${j.connection.server_name || ""}`;
-  return `<div class="card"><h2>Every database (${j.databases.length})</h2>` + table([
+  return (q ? queueCard(q) : "") + `<div class="card"><h2>Every database (${j.databases.length})</h2>` + table([
     ["database", r => `<a class="db" href="#db/${encodeURIComponent(r.database)}">${esc(r.database)}</a>`],
     ["state", r => st(r.state)], ["schedule", r => esc(r.schedule)],
     ["last backup", r => `${ts(r.last_backup_at)} <span class=mute>${ago(r.last_backup_at)}</span>`],

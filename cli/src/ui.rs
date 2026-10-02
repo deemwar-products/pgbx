@@ -38,6 +38,7 @@ pub enum Route {
     Db(String),
     Timeline { days: i32 },
     Health,
+    Queue,
     NotFound,
     MethodNotAllowed,
 }
@@ -51,6 +52,7 @@ pub fn route(method: &str, target: &str) -> Route {
         "/" | "/index.html" => Route::Index,
         "/api/overview" => Route::Overview,
         "/api/health" => Route::Health,
+        "/api/queue" => Route::Queue,
         "/api/timeline" => {
             let days = query_param(query, "days").and_then(|d| d.parse::<i32>().ok()).unwrap_or(30).clamp(1, 3650);
             Route::Timeline { days }
@@ -196,6 +198,16 @@ fn api_timeline(cx: &Ctx, days: i32) -> Result<Value, String> {
     Ok(json!({"ok": true, "days": days, "databases": dbs, "rows": all, "truncated": truncated, "errors": errors}))
 }
 
+/// The server-wide job queue (what runs, what waits and why), as the worker last wrote it.
+fn api_queue(cx: &Ctx) -> Result<Value, String> {
+    let mut c = admin(cx)?;
+    let jobs = rows(&mut c, "SELECT database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail, seen_at
+                             FROM pgbx.server_queue ORDER BY state IN ('running', 'cancelling') DESC, position NULLS LAST, requested_at", &[])?;
+    let slots = one(&mut c, "SELECT current_setting('pgbx.max_concurrent_jobs', true) AS max_concurrent_jobs,
+                                    current_setting('pgbx.restore_lane', true) AS restore_lane", &[])?;
+    Ok(json!({"ok": true, "jobs": jobs, "slots": slots}))
+}
+
 fn api_health(cx: &Ctx) -> Result<Value, String> {
     let mut c = admin(cx)?;
     let checks = rows(&mut c, "SELECT * FROM pgbx.doctor()", &[])?;
@@ -262,6 +274,7 @@ fn handle(mut s: TcpStream, cx: &Ctx, loopback: bool) {
         Route::Db(n) => json_resp(&mut s, api_db(cx, &n)),
         Route::Timeline { days } => json_resp(&mut s, api_timeline(cx, days)),
         Route::Health => json_resp(&mut s, api_health(cx)),
+        Route::Queue => json_resp(&mut s, api_queue(cx)),
     }
 }
 
@@ -322,6 +335,7 @@ mod tests {
         assert_eq!(route("GET", "/api/overview"), Route::Overview);
         assert_eq!(route("GET", "/api/cluster"), Route::NotFound);
         assert_eq!(route("GET", "/api/health"), Route::Health);
+        assert_eq!(route("GET", "/api/queue"), Route::Queue);
         assert_eq!(route("GET", "/api/timeline"), Route::Timeline { days: 30 });
         assert_eq!(route("GET", "/api/timeline?days=7"), Route::Timeline { days: 7 });
         assert_eq!(route("GET", "/api/timeline?days=0"), Route::Timeline { days: 1 });
@@ -372,6 +386,7 @@ mod tests {
     #[test]
     fn page_is_self_contained() {
         assert!(PAGE.contains("/api/overview") && PAGE.contains("/api/timeline") && PAGE.contains("/api/health"));
+        assert!(PAGE.contains("/api/queue") && PAGE.contains("cancel"));
         for bad in ["http://", "https://", "<form", "method=\"post\"", "POST"] {
             assert!(!PAGE.contains(bad), "page must not contain {bad}");
         }

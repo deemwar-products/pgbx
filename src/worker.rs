@@ -269,6 +269,9 @@ struct Running {
     db: String,
     id: i64,
     kind: String,
+    trigger: String,
+    requested: DateTime<Utc>,
+    started: DateTime<Utc>,
     slot: i32, // advisory-lock slot 1..max_concurrent_jobs; 0 = the restore lane
     owns_db: Option<String>, // the NEW database a restore / restore test writes into: not served while it runs
     ctl: Arc<JobCtl>,
@@ -357,15 +360,16 @@ fn tick(s: &mut Sched) -> Result<(), String> {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    let mut cands = Vec::new();
+    let (mut cands, mut deferred) = (Vec::new(), Vec::new());
     let mut conns: HashMap<String, Client> = HashMap::new();
     for db in &dbs {
         if owned.contains(db) {
             continue; // a restore is still writing it: it is not a live database yet
         }
         match scan_db(&c, &mut admin, db, s) {
-            Ok((cl, mut found)) => {
+            Ok((cl, mut found, mut later)) => {
                 cands.append(&mut found);
+                deferred.append(&mut later);
                 conns.insert(db.clone(), cl);
             }
             Err(e) => {
@@ -379,7 +383,8 @@ fn tick(s: &mut Sched) -> Result<(), String> {
         }
     }
     let _ = admin.execute("DELETE FROM pgbx.server_overview WHERE NOT (database::text = ANY($1))", &[&dbs]);
-    start_jobs(&c, &admin_db, s, cands, &mut conns);
+    let waiting = start_jobs(&c, &admin_db, s, cands, &mut conns);
+    publish_queue(&mut admin, s, &waiting, &deferred, &mut conns);
     Ok(())
 }
 
@@ -547,9 +552,10 @@ fn queue_scheduled_backup(cl: &mut Client, db: &str, schedule: &str) -> Result<(
     Ok(())
 }
 
-/// Per database, every poll: keep the extension current, recover jobs a restart cut off, queue due jobs,
-/// publish the overview row; returns the connection and this database's queued jobs.
-fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &Sched) -> Result<(Client, Vec<Cand>), String> {
+/// Per database, every poll: keep the extension current, recover jobs a restart cut off, pass on cancel requests,
+/// queue due jobs, publish the overview row; returns the connection, this database's queued jobs that may start now,
+/// and the deferred ones (with the reason).
+fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &Sched) -> Result<(Client, Vec<Cand>, Vec<(Cand, String)>), String> {
     let mut cl = connect(c, db)?;
     cl.batch_execute("CREATE EXTENSION IF NOT EXISTS pgbx;").map_err(pe)?;
     update_extension(&mut cl, db)?;
@@ -572,6 +578,18 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &Sched) -> Result<(Client, 
         (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4), row.get(5));
     let max_days = max_days.min(MAX_DAYS_LIMIT.get()); // server-wide ceiling wins
 
+    // pgbx.cancel() of a running job: stop its thread and child; the thread records 'cancelled'
+    for r in cl.query("SELECT id FROM pgbx.history WHERE state='running' AND params ? 'cancel_requested'", &[]).map_err(pe)? {
+        let id: i64 = r.get(0);
+        if let Some(job) = s.running.iter().find(|x| x.db == db && x.id == id)
+            && !job.ctl.cancelled.swap(true, Ordering::Relaxed)
+        {
+            job.ctl.stop.store(true, Ordering::Relaxed);
+            kill_child(&job.ctl);
+            log(&format!("{db}: {} #{id} cancel requested: stopping it", job.kind));
+        }
+    }
+
     if enabled {
         queue_scheduled_backup(&mut cl, db, &schedule)?;
         // restore tests follow their own schedule, and only once there is a backup to test
@@ -593,15 +611,20 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &Sched) -> Result<(Client, 
     }
 
     // queued jobs; a deferred one waits for its deferred_until
-    let found = cl
+    let (mut found, mut deferred) = (Vec::new(), Vec::new());
+    for j in cl
         .query(
-            "SELECT id, kind, params::text, trigger, requested_at FROM pgbx.history WHERE state='queued'
-               AND coalesce((params->>'deferred_until')::timestamptz, '-infinity') <= now() ORDER BY id",
+            "SELECT id, kind, params::text, trigger, requested_at,
+                    CASE WHEN (params->>'deferred_until')::timestamptz > now()
+                         THEN format('deferred (%s) until %s UTC, runs anyway from %s UTC', coalesce(params->>'defer_reason', '?'),
+                                     to_char((params->>'deferred_until')::timestamptz AT TIME ZONE 'UTC', 'HH24:MI:SS'),
+                                     coalesce(to_char((params->>'deadline')::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI'), '?')) END
+               FROM pgbx.history WHERE state='queued' ORDER BY id",
             &[],
         )
         .map_err(pe)?
-        .iter()
-        .map(|j| Cand {
+    {
+        let cand = Cand {
             db: db.to_string(),
             id: j.get(0),
             kind: j.get(1),
@@ -612,30 +635,54 @@ fn scan_db(c: &Ctx, admin: &mut Client, db: &str, s: &Sched) -> Result<(Client, 
             schedule: schedule.clone(),
             max_backups,
             max_days,
-        })
-        .collect();
+        };
+        match j.get::<_, Option<String>>(5) {
+            Some(why) => deferred.push((cand, why)),
+            None => found.push(cand),
+        }
+    }
     prune_audit(&mut cl, db);
     publish_overview(admin, &mut cl, db, &schedule)?;
-    Ok((cl, found))
+    Ok((cl, found, deferred))
 }
 
 /// Start queued jobs, best first, while job slots are free. A job that cannot start now (its database is
-/// already being dumped) does not hold up the jobs behind it.
-fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conns: &mut HashMap<String, Client>) {
+/// already being dumped) does not hold up the jobs behind it. Returns the jobs left waiting, in pick order,
+/// each with the reason.
+fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conns: &mut HashMap<String, Client>) -> Vec<(Cand, String)> {
     let max = MAX_CONCURRENT_JOBS.get().clamp(1, 8);
+    let lane = RESTORE_LANE.get();
     let never = Instant::now() - Duration::from_secs(365 * 86_400);
     cands.sort_by_key(|j| (priority(&j.kind, &j.trigger, &j.params), j.requested, *s.last_start.get(&j.db).unwrap_or(&never)));
+    let mut waiting = Vec::new();
     for j in cands {
         let used: Vec<i32> = s.running.iter().map(|r| r.slot).collect();
-        let slots: Vec<i32> = (1..=max).filter(|n| !used.contains(n)).collect();
-        if slots.is_empty() {
-            break;
+        let general: Vec<i32> = (1..=max).filter(|n| !used.contains(n)).collect();
+        let lane_free = lane && !used.contains(&0);
+        let mut slots = general.clone();
+        if j.kind == "restore" && lane_free {
+            slots.push(0); // the restore lane: a restore never waits behind a long dump
         }
         // never two dumps of one database at once
         if j.kind == "backup" && s.running.iter().any(|r| r.db == j.db && r.kind == "backup") {
+            waiting.push((j, "waits for the backup of this database that is running".to_string()));
             continue;
         }
-        let Some((slot, lock)) = take_slot(c, admin_db, &slots) else { break };
+        if slots.is_empty() {
+            let busy: Vec<String> = s.running.iter().map(|r| format!("{} {} #{}", r.db, r.kind, r.id)).collect();
+            let why = format!(
+                "waits for a job slot: {} of {max} in use ({}){}",
+                used.iter().filter(|n| **n > 0).count(),
+                busy.join(", "),
+                if j.kind == "restore" && lane { "; the restore lane is busy too" } else { "" }
+            );
+            waiting.push((j, why));
+            continue;
+        }
+        let Some((slot, lock)) = take_slot(c, admin_db, &slots) else {
+            waiting.push((j, "waits for a job slot: another pgbx worker holds them (pgbx.max_concurrent_jobs)".into()));
+            continue;
+        };
         let Some(cl) = conns.get_mut(&j.db) else { continue };
         let cfg = JobCfg::now();
         let p = parse_flat_json(&j.params);
@@ -644,7 +691,9 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
         // a cancel() between the scan and now wins: only a row still queued starts
         let n = cl.execute(
             "UPDATE pgbx.history SET state='running', started=now(),
-                    params = CASE WHEN $2 THEN params || '{\"forced\":true}' ELSE params END WHERE id=$1 AND state='queued'",
+                    params = (params - 'queue_position' - 'wait_reason')
+                             || CASE WHEN $2 THEN '{\"forced\":true}'::jsonb ELSE '{}'::jsonb END
+              WHERE id=$1 AND state='queued'",
             &[&j.id, &forced],
         );
         if !matches!(n, Ok(1)) {
@@ -662,11 +711,11 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
             db: j.db.clone(),
             id: j.id,
             kind: j.kind.clone(),
-            trigger: j.trigger,
-            params: j.params,
+            trigger: j.trigger.clone(),
+            params: j.params.clone(),
             requested: j.requested,
-            path: j.path,
-            schedule: j.schedule,
+            path: j.path.clone(),
+            schedule: j.schedule.clone(),
             max_backups: j.max_backups,
             max_days: j.max_days,
             forced,
@@ -679,9 +728,21 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
         });
         match spawned {
             Ok(h) => {
-                log(&format!("{}: {} #{} started (slot {slot})", j.db, j.kind, j.id));
+                let lane_note = if slot == 0 { "restore lane" } else { "slot" };
+                log(&format!("{}: {} #{} started ({lane_note} {slot})", j.db, j.kind, j.id));
                 s.last_start.insert(j.db.clone(), Instant::now());
-                s.running.push(Running { db: j.db, id: j.id, kind: j.kind, slot, owns_db, ctl, handle: Some(h) });
+                s.running.push(Running {
+                    db: j.db,
+                    id: j.id,
+                    kind: j.kind,
+                    trigger: j.trigger,
+                    requested: j.requested,
+                    started: Utc::now(),
+                    slot,
+                    owns_db,
+                    ctl,
+                    handle: Some(h),
+                });
             }
             Err(e) => {
                 let _ = cl.execute(
@@ -689,6 +750,83 @@ fn start_jobs(c: &Ctx, admin_db: &str, s: &mut Sched, mut cands: Vec<Cand>, conn
                     &[&j.id, &format!("could not start a job thread: {e}")],
                 );
             }
+        }
+    }
+    waiting
+}
+
+/// Mirror the server-wide queue into the admin database (pgbx.server_queue, `pgbx jobs`) and tell each waiting job
+/// why it waits (history.params queue_position / wait_reason, shown by status()). Rows only change when it changed.
+fn publish_queue(admin: &mut Client, s: &Sched, waiting: &[(Cand, String)], deferred: &[(Cand, String)], conns: &mut HashMap<String, Client>) {
+    struct Row<'a> {
+        db: &'a str,
+        id: i64,
+        kind: &'a str,
+        trigger: &'a str,
+        state: &'a str,
+        position: Option<i32>,
+        slot: Option<i32>,
+        requested: SystemTime,
+        started: Option<SystemTime>,
+        detail: String,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for r in &s.running {
+        let cancelling = r.ctl.cancelled.load(Ordering::Relaxed);
+        rows.push(Row {
+            db: &r.db,
+            id: r.id,
+            kind: &r.kind,
+            trigger: &r.trigger,
+            state: if cancelling { "cancelling" } else { "running" },
+            position: None,
+            slot: Some(r.slot),
+            requested: r.requested.into(),
+            started: Some(r.started.into()),
+            detail: if cancelling {
+                "cancel requested: stopping it".into()
+            } else if r.slot == 0 {
+                "running in the restore lane".into()
+            } else {
+                format!("running in job slot {}", r.slot)
+            },
+        });
+    }
+    for (i, (j, why)) in waiting.iter().enumerate() {
+        rows.push(Row {
+            db: &j.db, id: j.id, kind: &j.kind, trigger: &j.trigger, state: "queued", position: Some(i as i32 + 1), slot: None,
+            requested: j.requested.into(), started: None, detail: why.clone(),
+        });
+    }
+    for (j, why) in deferred {
+        rows.push(Row {
+            db: &j.db, id: j.id, kind: &j.kind, trigger: &j.trigger, state: "deferred", position: None, slot: None,
+            requested: j.requested.into(), started: None, detail: why.clone(),
+        });
+    }
+    let r = (|| -> Result<(), postgres::Error> {
+        let mut tx = admin.transaction()?;
+        tx.execute("DELETE FROM pgbx.server_queue", &[])?;
+        for q in &rows {
+            tx.execute(
+                "INSERT INTO pgbx.server_queue (database, job_id, kind, trigger, state, position, slot, requested_at, started_at, detail)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                &[&q.db, &q.id, &q.kind, &q.trigger, &q.state, &q.position, &q.slot, &q.requested, &q.started, &q.detail],
+            )?;
+        }
+        tx.commit()
+    })();
+    if let Err(e) = r {
+        log(&format!("server_queue: {}", pe(e)));
+    }
+    for q in rows.iter().filter(|q| q.state != "running" && q.state != "cancelling") {
+        if let Some(cl) = conns.get_mut(q.db) {
+            let _ = cl.execute(
+                "UPDATE pgbx.history SET params = params || jsonb_build_object('queue_position', $2::int, 'wait_reason', $3::text)
+                  WHERE id=$1 AND state='queued'
+                    AND (params->'queue_position' IS DISTINCT FROM to_jsonb($2::int) OR params->>'wait_reason' IS DISTINCT FROM $3::text)",
+                &[&q.id, &q.position, &q.detail],
+            );
         }
     }
 }
@@ -762,7 +900,18 @@ fn execute(j: &Job) -> Result<Done, String> {
 /// Write a finished job's outcome into its history row (and expire backups after a backup / prune).
 fn record(j: &Job, cl: &mut Client, res: &Result<Done, String>) -> Result<(), String> {
     let (db, id, kind) = (j.db.as_str(), j.id, j.kind.as_str());
+    let cancelled = this_job().is_some_and(|x| x.cancelled.load(Ordering::Relaxed));
     match res {
+        // pgbx.cancel() of a running job: its upload was aborted / its partial database dropped; no alert
+        Err(e) if cancelled => {
+            cl.execute(
+                "UPDATE pgbx.history SET state='cancelled', finished=now(),
+                        error='cancelled by ' || coalesce(params->>'cancelled_by', '?') || ' while running' WHERE id=$1",
+                &[&id],
+            )
+            .map_err(pe)?;
+            log(&format!("{db}: {kind} #{id} cancelled ({e})"));
+        }
         Ok(done) => {
             // record the new backup first so prune sees it as a live row, then expire, then mark the job done
             if kind == "backup" {
@@ -1222,6 +1371,10 @@ fn restore_key_into(c: &Ctx, cfg: &JobCfg, admin: &mut Client, b: &Bucket, key: 
     set_child(0);
     let out = out?;
     if shutting_down() {
+        if stop_reason() == "cancelled" {
+            // cancelled: the half-restored NEW database (created above) is of no use to anyone
+            let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{into}\" WITH (FORCE)"));
+        }
         return Err(format!("restore stopped, {}", stop_reason()));
     }
     if !out.status.success() {

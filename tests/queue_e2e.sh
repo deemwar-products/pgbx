@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # The server-wide job queue (ADR 0001 §0) against docker/compose.test.yml (run after tests/e2e.sh; needs the server up).
 # Slow jobs are made with pgbx.upload_kbps. bash 3.2-safe; exits non-zero on any failure.
-#   1. the worker keeps polling while a job runs; max_concurrent_jobs; pick order
+#   1. the worker keeps polling while a job runs; restore lane; max_concurrent_jobs; pick order; why a job waits
+#      (server_queue, status(), pgbx jobs) and who may see it
 #   2. overrun_policy=skip: a dump longer than its interval skips slots (params.skipped_slots), never back to back
-#   3. crash: SIGTERM restart and kill -9 of the worker mid-upload -> job failed, no dump and no multipart upload left
+#   3. cancel() of RUNNING jobs: backup (upload aborted, nothing in S3, no alert) and restore (half-restored db dropped)
+#   4. crash: SIGTERM restart and kill -9 of the worker mid-upload -> job failed, no dump and no multipart upload left
 set -u
 cd "$(dirname "$0")/../docker"
 DC="docker compose -f compose.test.yml"
@@ -42,7 +44,7 @@ qa_bytes=$(P -d qa -c "SELECT bytes FROM pgbx.history WHERE id=(SELECT max(id) F
 echo "  qa dump: $qa_bytes bytes"
 check "qa dump is multipart (> 16 MiB)" "$([ "${qa_bytes:-0}" -gt 16777216 ] && echo yes || echo "no ($qa_bytes)")" yes
 
-echo "## 1. the worker keeps polling while a job runs; max_concurrent_jobs; pick order"
+echo "## 1. the worker keeps polling while a job runs; restore lane; max_concurrent_jobs; pick order; why a job waits"
 gset upload_kbps 256
 slow=$(P -d qa -c "SELECT pgbx.backup_now()")
 check "slow qa backup running" "$(wait_state qa "$slow" "running" 30)" running
@@ -51,11 +53,35 @@ for _ in $(seq 20); do n=$(P -d qc -c "SELECT count(*) FROM pgbx.history WHERE k
 check "new database qc found and its first backup queued while qa dumps" "${n:-0}" 1
 check "qc in the overview" "$(P -c "SELECT count(*) FROM pgbx.overview() WHERE database='qc'")" 1
 check "one slot: only one job runs" "$(P -d qc -c "SELECT state FROM pgbx.history WHERE kind='backup' AND trigger='first'")" queued
-rid=$(P -d qb -c "SELECT pgbx.restore(into_db => 'qb_restored')")
+check "restore_lane on by default" "$(P -c 'SHOW pgbx.restore_lane')" on
+lid=$(P -d qb -c "SELECT pgbx.restore(into_db => 'qb_restored')")
+check "restore lane: qb's restore runs and finishes while qa's dump holds the only slot" "$(wait_end qb "$lid" 60)|$(state qa "$slow")" "done|running"
+check "restored" "$(P -d qb_restored -c 'SELECT count(*) FROM t')" 1000
+check "server_queue: qa's dump in slot 1" "$(P -c "SELECT state||'|'||slot||'|'||detail FROM pgbx.server_queue WHERE database='qa' AND job_id=$slow")" "running|1|running in job slot 1"
+gset restore_lane off
+rid=$(P -d qb -c "SELECT pgbx.restore(into_db => 'qb_restored2')")
 vid=$(P -d qb -c "SELECT pgbx.verify_now()")
 sleep 6
-check "pgbx.restore_lane off: the restore waits for the slot" "$(P -c "SHOW pgbx.restore_lane" 2>/dev/null || echo none)|$(state qb "$rid")" "none|queued"
+check "restore_lane off: the restore waits for the slot" "$(state qb "$rid")" queued
 check "qa still running (not blocked by the queue)" "$(state qa "$slow")" running
+check "server_queue: restore is #1 in line and says why" \
+  "$(P -c "SELECT state||'|'||position||'|'||detail FROM pgbx.server_queue WHERE database='qb' AND job_id=$rid")" \
+  "queued|1|waits for a job slot: 1 of 1 in use (qa backup #$slow)"
+check "status() in qb says why its next job waits" \
+  "$(P -d qb -c "SELECT next_job||'|'||queue_position||'|'||waiting_reason FROM pgbx.status()")" \
+  "$rid|1|waits for a job slot: 1 of 1 in use (qa backup #$slow)"
+check "status() in qa: running_job" "$(P -d qa -c "SELECT running_job FROM pgbx.status()")" "$slow"
+out=$($DC exec -T -u postgres db pgbx jobs --json 2>/dev/null)
+check "pgbx jobs --json: qa running, qb restore queued #1" \
+  "$(echo "$out" | jq -r --arg s "$slow" --arg r "$rid" '[(.jobs[]|select(.database=="qa" and (.job_id|tostring)==$s)|.state), (.jobs[]|select(.database=="qb" and (.job_id|tostring)==$r)|"\(.state) \(.position)")]|join("|")')" \
+  "running|queued 1"
+check "pgbx jobs (text)" "$($DC exec -T -u postgres db pgbx jobs 2>/dev/null | grep -c "#1 in line")" 1
+P -c "DROP ROLE IF EXISTS q_viewer" -c "DROP ROLE IF EXISTS q_plain" -c "CREATE ROLE q_viewer LOGIN IN ROLE pgbx_viewer" -c "CREATE ROLE q_plain LOGIN" >/dev/null
+AS() { u=$1; shift; $DC exec -T db psql -U "$u" -qAt "$@" 2>&1; }
+check "viewer reads server_queue" "$(AS q_viewer -d postgres -c "SELECT count(*) > 0 FROM pgbx.server_queue")" t
+check "plain role cannot read server_queue" "$(AS q_plain -d postgres -c "SELECT count(*) FROM pgbx.server_queue" | grep -c 'permission denied')" 1
+check "viewer cannot cancel" "$(AS q_viewer -d qb -c "SELECT pgbx.cancel($rid)" | grep -c 'permission denied')" 1
+P -c "DROP ROLE q_viewer" -c "DROP ROLE q_plain" >/dev/null
 gset max_concurrent_jobs 2
 r=$(wait_state qb "$rid" "running done" 20); qs=$(state qa "$slow")
 check "max_concurrent_jobs=2: qb restore starts while qa still dumps" "$(echo "$r" | grep -cE '^(running|done)$')|$qs" "1|running"
@@ -68,7 +94,7 @@ r=$(P -d qb -c "SELECT (SELECT started FROM pgbx.history WHERE id=$rid) < '$(P -
 check "pick order: restore, then first backup, then restore test" "$r" t
 check "advisory slots held = 1 (only qa runs)" "$(P -c "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objsubid=2 AND granted
                                                       AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")" 1
-greset max_concurrent_jobs
+greset max_concurrent_jobs restore_lane
 check "slow qa backup done" "$(wait_end qa "$slow" 300)" done
 
 echo "## 2. overrun_policy=skip: an every-minute schedule with ~90 s dumps"
@@ -85,7 +111,34 @@ check "dump > 1 min; next run records skipped_slots and waits for the next slot 
 P -d qa -c "SELECT pgbx.set_schedule('daily at 02:00')" >/dev/null
 check "that one runs too" "$(wait_end qa "$s2" 300)" done
 
-echo "## 3. crash: the job never leaves a dump or an open multipart upload behind"
+echo "## 3. cancel() of running jobs"
+before=$(dumps qa); s3before=$(s3_dumps qa)
+$DC exec -T -u postgres db sh -c ': > /var/lib/postgresql/alerts.log'
+id=$(P -d qa -c "SELECT pgbx.backup_now()"); wait_state qa "$id" running 30 >/dev/null; sleep 4
+check "multipart upload open while it runs" "$(open_uploads)" 1
+out=$($DC exec -T -u postgres db pgbx jobs cancel "$id" --json 2>/dev/null)
+check "pgbx jobs cancel without --yes refused" "$(echo "$out" | jq -r '"\(.ok) \(.error|test("--yes"))"')" "false true"
+out=$($DC exec -T -u postgres db pgbx jobs cancel "$id" --yes --json 2>/dev/null)
+check "pgbx jobs cancel ID --yes (database found in the queue)" "$(echo "$out" | jq -r '"\(.ok) \(.database)"')" "true qa"
+t0=$SECONDS; s=$(wait_end qa "$id" 30)
+check "running backup cancelled within seconds" "$s|$([ $((SECONDS-t0)) -le 15 ] && echo fast || echo "slow $((SECONDS-t0))s")" "cancelled|fast"
+check "error says who" "$(P -d qa -c "SELECT error FROM pgbx.history WHERE id=$id")" "cancelled by postgres while running"
+check "no multipart upload left" "$(open_uploads)" 0
+check "no dump in history or S3" "$(dumps qa)|$(s3_dumps qa)" "$before|$s3before"
+check "no alert for a cancel" "$($DC exec -T db cat /var/lib/postgresql/alerts.log | grep -c "\"job_id\":$id,")" 0
+check "pgbx_dump process gone" "$(P -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='pgbx_dump' AND datname='qa'")" 0
+gset download_kbps 256
+P -c "DROP DATABASE IF EXISTS qa_r WITH (FORCE)" >/dev/null
+id=$(P -d qa -c "SELECT pgbx.restore(into_db => 'qa_r')"); wait_state qa "$id" running 30 >/dev/null; sleep 4
+check "restore writing qa_r" "$(P -c "SELECT count(*) FROM pg_database WHERE datname='qa_r'")" 1
+msg=$(P -d qa -c "SELECT pgbx.cancel($id)")
+check "cancel() of a running restore" "$(echo "$msg" | grep -c 'is running: the worker stops it')" 1
+check "restore cancelled" "$(wait_end qa "$id" 30)" cancelled
+check "half-restored database dropped" "$(P -c "SELECT count(*) FROM pg_database WHERE datname='qa_r'")" 0
+bad=$(P -d qa -c "SELECT pgbx.cancel($id)" 2>&1); check "cancel of a cancelled job refused" "$(echo "$bad" | grep -c 'only a queued or running job')" 1
+greset download_kbps
+
+echo "## 4. crash: the job never leaves a dump or an open multipart upload behind"
 before=$(dumps qa); s3before=$(s3_dumps qa)
 id=$(P -d qa -c "SELECT pgbx.backup_now()"); wait_state qa "$id" running 30 >/dev/null; sleep 4
 check "multipart upload open while it runs" "$(open_uploads)" 1
