@@ -49,7 +49,8 @@ Who: viewer. One row per database on the server.
 pgbx.doctor() RETURNS TABLE (name text, ok bool, detail text, fix text)
 ```
 Who: viewer (runs as `SECURITY DEFINER`). Health checks: `extension loaded`, `s3 settings`, `credentials file`,
-`database backups` (age vs schedule), `restore tests`, `workers`, `archive_mode` (info only) and `replication_slots`.
+`database backups` (age vs schedule), `restore tests`, `workers`, `archive_mode` (info only), `replication_slots`
+and `long_running_job` (a pg_dump / pg_restore running longer than `pgbx.doctor_long_job`).
 
 ### `rowless_tables()`
 ```sql

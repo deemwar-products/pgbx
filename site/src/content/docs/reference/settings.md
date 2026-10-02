@@ -42,7 +42,7 @@ your app's locks.
 | `pgbx.defer_backoff` | `1,2,4,8,15` | minutes between retries (each 1–60, the last repeats) |
 | `pgbx.max_defer` | `4h` | a retried backup runs anyway this long after it was queued (0–24h), never later than one schedule interval |
 | `pgbx.max_defer_first` | `15min` | the same for a new database's first backup |
-| `pgbx.dump_compression_busy` | `auto` | `--compress` for a backup forced to run at its deadline; `auto` = zstd:1 with pg_dump 16+, gzip level 1 before |
+| `pgbx.dump_compression_busy` | `auto` | `--compress` for a backup forced to run at its deadline; `auto` = zstd:1 with pg_dump 16+, gzip level 1 before, or `pgbx.dump_compression` when that is already cheaper (`none`, `0`, `lz4`) |
 | `pgbx.upload_kbps` | `0` | upload cap per job in KiB/s; 0 = unlimited |
 | `pgbx.download_kbps` | `0` | restore download cap per job in KiB/s; 0 = unlimited |
 | `pgbx.restore_synchronous_commit` | `off` | `synchronous_commit` for pg_restore; the target is a new database, so a crash just means restoring again |

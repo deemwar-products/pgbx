@@ -542,11 +542,8 @@ fn backup(c: &Ctx, db: &str, path: &str, forced: bool) -> Result<Done, String> {
     let b = bucket()?;
     let key = format!("{}{}.dump", prefix(c, path), Utc::now().format("%Y-%m-%dT%H-%M-%SZ"));
     let (pg_dump, major) = client_tool(c, "pg_dump");
-    let compress = if forced {
-        compression_busy(setting(&DUMP_COMPRESSION_BUSY).as_deref(), major)
-    } else {
-        compression(setting(&DUMP_COMPRESSION).as_deref(), major)
-    };
+    let normal = compression(setting(&DUMP_COMPRESSION).as_deref(), major);
+    let compress = if forced { compression_busy(setting(&DUMP_COMPRESSION_BUSY).as_deref(), &normal, major) } else { normal };
     // pg_dump SETs lock_timeout=0 itself, so its own --lock-wait-timeout is the knob; C messages so a timeout is recognised
     let lock_ms = if forced { DUMP_LOCK_TIMEOUT_FORCED.get() } else { DUMP_LOCK_TIMEOUT.get() };
     let mut child = job_command(&pg_dump, "pgbx_dump")
@@ -596,10 +593,12 @@ pub(crate) fn compression(setting: Option<&str>, pg_dump_major: Option<u32>) -> 
 }
 
 /// pgbx.dump_compression_busy: 'auto' (or unset) = zstd:1 when pg_dump is 16+, else gzip level 1. Single-threaded
-/// either way (no zstd workers=): one core at most.
-pub(crate) fn compression_busy(setting: Option<&str>, pg_dump_major: Option<u32>) -> String {
+/// either way (no zstd workers=): one core at most. 'auto' never costs more than `normal` (none / 0 / lz4 stay).
+pub(crate) fn compression_busy(setting: Option<&str>, normal: &str, pg_dump_major: Option<u32>) -> String {
+    let n = normal.trim().to_ascii_lowercase();
     match setting.map(str::trim) {
         Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("auto") => s.to_string(),
+        _ if matches!(n.as_str(), "none" | "0" | "gzip:0") || n.starts_with("lz4") => normal.to_string(),
         _ if pg_dump_major.unwrap_or(0) >= 16 => "zstd:1".into(),
         _ => "1".into(),
     }
@@ -911,9 +910,13 @@ mod t {
 
     #[test]
     fn busy_compression_is_cheap() {
-        assert_eq!(compression_busy(Some("auto"), Some(16)), "zstd:1");
-        assert_eq!(compression_busy(None, Some(15)), "1");
-        assert_eq!(compression_busy(Some("lz4"), Some(16)), "lz4");
+        assert_eq!(compression_busy(Some("auto"), "zstd:3", Some(16)), "zstd:1");
+        assert_eq!(compression_busy(None, "6", Some(15)), "1");
+        assert_eq!(compression_busy(Some("lz4"), "zstd:3", Some(16)), "lz4");
+        // auto never makes a forced run more expensive than the normal setting
+        for cheap in ["none", "0", "lz4", "lz4:1"] {
+            assert_eq!(compression_busy(Some("auto"), cheap, Some(16)), cheap);
+        }
     }
 
     #[test]
