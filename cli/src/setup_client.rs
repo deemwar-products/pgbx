@@ -209,7 +209,7 @@ fn test(cx: &Ctx, db: &str) -> Value {
 pub fn run(cx: &mut Ctx) -> Out {
     let interactive = !cx.a.has("json") && std::io::IsTerminal::is_terminal(&std::io::stdin());
     let mut prompt = |q: &str, d: &str| crate::setup::prompt(q, Some(d));
-    let configured: Vec<String> = config::load(&config::sys_env).map(|(c, _)| c.adapters.keys().cloned().collect()).unwrap_or_default();
+    let configured: Vec<String> = profile::load_sys().map(|c| c.adapters.keys().cloned().collect()).unwrap_or_default();
     let plan = gather(&cx.a, if interactive { Some(&mut prompt) } else { None }, &configured)?;
     if !interactive && !cx.a.has("yes") {
         return Ok(json!({"ok": false, "error": "pgbx setup client writes a profile: re-run with --yes (or in a terminal)",

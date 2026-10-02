@@ -135,7 +135,9 @@ pub fn select(a: &mut Args, env: Env) -> Result<(Arc<Conn>, Vec<String>), String
             Some(c) => Source::parse(c.secrets.as_ref(), &dir)?,
             None => Source::Env,
         };
-        Ok(Arc::new(Conn::new(Spec::Url { profile: None, raw }, src, dir)))
+        let mut c = Conn::new(Spec::Url { profile: None, raw }, src, dir);
+        c.user = a.flags.get("user").cloned();
+        Ok(Arc::new(c))
     };
     let wants_profile = flag_profile.is_some() || (!direct_flags && flag_url.is_none() && env("PGBX_URL").is_none() && env("PGBX_PROFILE").is_some());
     let loaded = config::load(env);
@@ -168,7 +170,9 @@ pub fn select(a: &mut Args, env: Env) -> Result<(Arc<Conn>, Vec<String>), String
     };
     fill_flags(a, p, &cfg, env)?;
     a.flags.insert("profile".into(), name.clone());
-    Ok((Arc::new(conn_of(&name, &cfg, env)?), notes))
+    let mut c = conn_of(&name, &cfg, env)?;
+    c.user = a.flags.get("user").cloned();
+    Ok((Arc::new(c), notes))
 }
 
 /// main's entry point.
@@ -488,6 +492,8 @@ mod tests {
             }
             x => panic!("{x:?}"),
         }
+        let mut a = p(&["status", "--profile", "dev", "--user", "viewer"]);
+        assert_eq!(select(&mut a, &env).unwrap().0.user.as_deref(), Some("viewer"), "--user beats the url's user");
         let mut a = p(&["status", "--host", "h2"]);
         assert!(select(&mut a, &env).unwrap().0.profile().is_none(), "--host means direct, not the default profile");
         let mut a = p(&["status", "--url", "postgres://u@h/d"]);

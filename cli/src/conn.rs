@@ -43,6 +43,8 @@ pub struct Conn {
     pub spec: Spec,
     source: Source,
     dir: PathBuf,
+    /// --user on the command line: beats the user in the connection string (e.g. a read-only role for pgbx ui)
+    pub user: Option<String>,
     live: Mutex<Option<(Instant, Resolved)>>,
 }
 
@@ -84,7 +86,7 @@ pub fn host_of(raw: &str) -> Option<String> {
 
 impl Conn {
     pub fn new(spec: Spec, source: Source, dir: PathBuf) -> Conn {
-        Conn { spec, source, dir, live: Mutex::new(None) }
+        Conn { spec, source, dir, user: None, live: Mutex::new(None) }
     }
 
     /// No profile, no url: the flags/env/defaults connection.
@@ -158,7 +160,9 @@ impl Conn {
                 (c, d, Some(handle))
             }
         };
-        if cfg.get_user().is_none() {
+        if let Some(u) = &self.user {
+            cfg.user(u);
+        } else if cfg.get_user().is_none() {
             cfg.user(env("PGUSER").as_deref().unwrap_or("postgres")); // pgbx's default user, as before 0.6
         }
         if cfg.get_password().is_none() {
