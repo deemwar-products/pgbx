@@ -196,8 +196,9 @@ P -c "DROP DATABASE IF EXISTS big_capped WITH (FORCE)"
 capped() { # id -> "<state> <MiB/s>" once finished
   for _ in $(seq 240); do r=$(P -d big -c "SELECT state||' '||coalesce(round((bytes / extract(epoch FROM finished - started) / 1048576)::numeric, 2)::text, '-') FROM pgbx.history WHERE id=$1");
     case "$r" in done*|failed*) break;; esac; sleep 1; done; echo "$r"; }
-within() { awk -v r="${1#* }" -v s="${1%% *}" 'BEGIN { print (s == "done" && r >= 1.8 && r <= 2.2) ? "yes" : "no (" s ", " r " MiB/s)" }'; }
-r=$(capped "$(P -d big -c "SELECT pgbx.backup_now()")"); echo "  backup: $r MiB/s"; check "upload at 2 MiB/s ±10%" "$(within "$r")" yes
+# a cap is a ceiling: never above it (+10 %), but a slower producer (gzip pg_dump on PG13) may average below it
+within() { awk -v r="${1#* }" -v s="${1%% *}" 'BEGIN { print (s == "done" && r >= 1.5 && r <= 2.2) ? "yes" : "no (" s ", " r " MiB/s)" }'; }
+r=$(capped "$(P -d big -c "SELECT pgbx.backup_now()")"); echo "  backup: $r MiB/s"; check "upload capped at 2 MiB/s (1.5-2.2)" "$(within "$r")" yes
 id=$(P -d big -c "SELECT pgbx.restore(into_db => 'big_capped')")
 # the pg_restore: nice / IO class / synchronous_commit=off (its env; readable only as its own user) / connection tag
 caps=$(docker compose -f compose.test.yml exec -T -u postgres db sh -c 'for _ in $(seq 300); do for p in /proc/[0-9]*; do
@@ -205,7 +206,7 @@ caps=$(docker compose -f compose.test.yml exec -T -u postgres db sh -c 'for _ in
 check "pg_restore runs at nice 10, best-effort 7, synchronous_commit=off" "$caps" "10|best-effort: prio 7|PGOPTIONS=-c synchronous_commit=off"
 for _ in $(seq 20); do n=$(P -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='pgbx_restore' AND datname='big_capped'"); [ "$n" = 1 ] && break; sleep 0.5; done
 check "its connection is tagged pgbx_restore" "$n" 1
-r=$(capped "$id"); echo "  restore: $r MiB/s"; check "download at 2 MiB/s ±10%" "$(within "$r")" yes
+r=$(capped "$id"); echo "  restore: $r MiB/s"; check "download capped at 2 MiB/s (1.5-2.2)" "$(within "$r")" yes
 check "capped restore is complete" "$(P -d big_capped -c 'SELECT count(*) FROM blob')" 1000000
 P -c "ALTER SYSTEM RESET pgbx.upload_kbps" -c "ALTER SYSTEM RESET pgbx.download_kbps" -c "SELECT pg_reload_conf()" >/dev/null
 
