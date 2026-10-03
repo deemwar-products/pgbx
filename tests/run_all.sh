@@ -47,7 +47,7 @@ fi
 # disk hygiene: the stacks go away with their volumes, and a LOCAL test bucket is emptied (never a real one)
 docker compose -f compose.test.yml down -v >/dev/null 2>&1
 docker compose -f compose.local.yml down -v >/dev/null 2>&1
-(set -a; . ./.env; set +a
+(set -a; [ ! -f ./.env ] || . ./.env; set +a
  case "$S3_ENDPOINT" in
    *orb.local*|*localhost*|*127.0.0.1*|*host.docker.internal*)
      docker run --rm --env-file local.env amazon/aws-cli --endpoint-url "$S3_ENDPOINT" s3 rm --recursive --quiet "s3://$S3_BUCKET/" >/dev/null 2>&1 \
