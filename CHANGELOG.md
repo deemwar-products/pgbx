@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.1
+## 0.6.1 (unreleased)
 
 - **Fix: backups to HTTPS S3 endpoints failed in 0.6.0** (AWS, R2, Hetzner, Backblaze...): every backup job panicked with
   "Could not automatically determine the process-level CryptoProvider". The 0.6 dependencies enable two rustls crypto

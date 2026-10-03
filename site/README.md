@@ -24,14 +24,19 @@ npm run preview
 | `PUBLIC_SITE_URL` | `https://example.github.io` |
 | `PUBLIC_BASE_PATH` | `/pgbx` |
 
-## Deploy (GitHub Pages)
+## Deploy (Cloudflare Pages)
 
-`.github/workflows/pages.yml` builds `site/` on every push to `main` that touches `site/**`
-(or by hand via *Run workflow*) and deploys with `actions/deploy-pages`. It sets both env vars from the
-repository owner and name.
+Live at **https://pgbx.deemwar.com** (Cloudflare Pages project `pgbx`). `.github/workflows/pages.yml` (manual: *Run
+workflow*) builds with `PUBLIC_SITE_URL=https://pgbx.deemwar.com PUBLIC_BASE_PATH=/` and deploys with wrangler, using
+the repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. By hand:
 
-Once, in the repo: **Settings → Pages → Source: GitHub Actions**.
-For a custom domain, set `PUBLIC_SITE_URL=https://docs.example.com` and `PUBLIC_BASE_PATH=/` in the workflow.
+```sh
+cd site && PUBLIC_SITE_URL=https://pgbx.deemwar.com PUBLIC_BASE_PATH=/ npm run build
+npx wrangler pages deploy dist --project-name pgbx --branch main
+```
+
+The installers in `site/public` (`install.sh`, `install.ps1`, `install.cmd`) ship with the site, so a deploy also
+publishes them.
 
 Edit links are off until the repo exists: add `editLink: { baseUrl: 'https://github.com/<org>/pgbx/edit/main/site/' }`
 to the Starlight config.

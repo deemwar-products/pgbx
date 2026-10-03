@@ -2,7 +2,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
-// Served at https://pgbx.deemwar.com (GitHub Pages custom domain); local dev keeps /pgbx unless PUBLIC_BASE_PATH is set
+// Served at https://pgbx.deemwar.com (Cloudflare Pages project `pgbx`); local dev keeps /pgbx unless PUBLIC_BASE_PATH is set
 const site = process.env.PUBLIC_SITE_URL || 'https://example.github.io';
 const base = process.env.PUBLIC_BASE_PATH || '/pgbx';
 
@@ -26,6 +26,7 @@ export default defineConfig({
         { label: 'Reference', items: [{ autogenerate: { directory: 'reference' } }] },
         { label: 'For AI agents', items: [{ autogenerate: { directory: 'agents' } }] },
         { label: 'Testing & guarantees', slug: 'testing' },
+        { label: 'Release notes', slug: 'releases' },
       ],
     }),
   ],

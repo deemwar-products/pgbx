@@ -7,7 +7,7 @@ restore tests, restores); the **pgbx CLI** (`pgbx`) is the client that talks to 
 (and restores straight from S3 when Postgres is down); the **agent skill** drives the CLI with `--json`.
 See [How it works](https://pgbx.deemwar.com/concepts/how-it-works/).
 
-Full documentation: [`site/`](site/README.md) (Astro Starlight, published to GitHub Pages).
+Full documentation: [`site/`](site/README.md) (Astro Starlight, live at https://pgbx.deemwar.com).
 
 ## Quick start (Linux, PostgreSQL 13–18)
 ```sh
