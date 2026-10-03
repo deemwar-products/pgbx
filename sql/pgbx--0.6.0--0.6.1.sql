@@ -1,0 +1,1 @@
+-- pgbx 0.6.0 -> 0.6.1: no schema change (the fix is in the library: an explicit rustls crypto provider).

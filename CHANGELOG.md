@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.6.1
+
+- **Fix: backups to HTTPS S3 endpoints failed in 0.6.0** (AWS, R2, Hetzner, Backblaze...): every backup job panicked with
+  "Could not automatically determine the process-level CryptoProvider". The 0.6 dependencies enable two rustls crypto
+  providers (aws-lc-rs and ring) and none was chosen; pgbx now installs aws-lc-rs explicitly in the extension and the
+  CLI. Plain-http endpoints were not affected, which is why the test suites (local S3 over http) missed it.
+- New test `tests/https_s3_e2e.sh`: real https calls to AWS S3 with dummy keys, from the extension's backup job and the
+  CLI; it reproduces the 0.6.0 panic and passes on 0.6.1. Run by `tests/run_all.sh`.
+- No schema change (`pgbx--0.6.0--0.6.1.sql` is empty); the worker updates every database's extension version itself.
+
+## 0.6.0
 
 - Windows: one x64 build (`pgbx-windows-amd64.zip`). Windows on ARM runs it through its built-in x64 emulation, and `install.ps1` installs it there; the separate arm64 Windows build is dropped (its cross-build of the TLS/crypto C libraries fails).
 

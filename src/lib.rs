@@ -155,8 +155,19 @@ pub enum Overrun {
     CatchUp,
 }
 
+/// Install rustls' process-wide crypto provider once. The build has both aws-lc-rs (rust-s3) and ring (ureq, lettre),
+/// and without an explicit choice rustls panics on the first HTTPS connection: every backup to a real (https) S3
+/// endpoint failed in 0.6.0 ("Could not automatically determine the process-level CryptoProvider").
+pub(crate) fn crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    crypto_provider(); // in the postmaster: every backend and the worker inherit it
     GucRegistry::define_string_guc(c"pgbx.s3_endpoint", c"S3 endpoint URL", c"e.g. https://hel1.your-objectstorage.com", &S3_ENDPOINT, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_string_guc(c"pgbx.s3_bucket", c"S3 bucket for all backups of this server", c"", &S3_BUCKET, GucContext::Sighup, GucFlags::default());
     GucRegistry::define_string_guc(c"pgbx.s3_region", c"S3 region", c"", &S3_REGION, GucContext::Sighup, GucFlags::default());

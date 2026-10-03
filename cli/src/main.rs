@@ -658,6 +658,9 @@ fn cmd_skill(cx: &mut Ctx) -> Out {
 }
 
 fn main() {
+    // one rustls crypto provider for the whole process (the build has both aws-lc-rs and ring; rustls panics on
+    // the first HTTPS/TLS connection unless one is chosen): S3 over https, Postgres TLS, IMDS/STS
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let raw: Vec<String> = std::env::args().skip(1).collect();
     // credentials_file aws-default: AWS_ACCESS_KEY_ID & co. of the user running pgbx count (never in the extension)
     s3auth::allow_env_keys();

@@ -1,6 +1,6 @@
 [package]
 name = "pgbx"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [lib]
@@ -34,6 +34,9 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # already in the tree (attohttpc is rust-s3's HTTP client, serde_json comes with pgrx), so nothing new is pulled in
 attohttpc = { version = "0.30", default-features = false }
 serde_json = "1"
+# rustls 0.23 refuses to pick a crypto provider when the build enables two (aws-lc-rs via rust-s3, ring via
+# ureq/lettre): pgbx installs aws-lc-rs explicitly at load time (crypto_provider() in lib.rs). Same crate rust-s3 uses.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 
 [dev-dependencies]
 [dev-dependencies.pgrx-tests]

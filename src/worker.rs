@@ -120,6 +120,7 @@ fn drain_logs() {
 pub extern "C-unwind" fn pgbx_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let _ = MAIN_THREAD.set(std::thread::current().id());
+    crate::crypto_provider();
     s3auth::on_new_credentials(log); // "s3 credentials from instance role via IMDSv2 (role r), temporary, valid until ..."
     log("worker started");
     let mut s = Sched::default();
@@ -254,6 +255,7 @@ pub(crate) fn s3_spec() -> S3Spec {
 impl S3Spec {
     /// Any thread: no GUC reads.
     pub(crate) fn bucket(&self) -> Result<Box<Bucket>, String> {
+        crate::crypto_provider();
         let name = self.bucket.clone().ok_or("pgbx.s3_bucket is not set")?;
         let endpoint = self.endpoint.clone().ok_or("pgbx.s3_endpoint is not set")?;
         let creds = if s3auth::uses_chain(&self.credentials) {
