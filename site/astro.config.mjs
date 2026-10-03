@@ -2,7 +2,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
-// GitHub Pages: set PUBLIC_SITE_URL=https://<org>.github.io and PUBLIC_BASE_PATH=/pgbx
+// Served at https://pgbx.deemwar.com (GitHub Pages custom domain); local dev keeps /pgbx unless PUBLIC_BASE_PATH is set
 const site = process.env.PUBLIC_SITE_URL || 'https://example.github.io';
 const base = process.env.PUBLIC_BASE_PATH || '/pgbx';
 

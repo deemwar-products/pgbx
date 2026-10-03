@@ -22,8 +22,8 @@ jobs:
           path: site
           node-version: 22
         env:
-          PUBLIC_SITE_URL: https://${{ github.repository_owner }}.github.io
-          PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+          PUBLIC_SITE_URL: https://pgbx.deemwar.com
+          PUBLIC_BASE_PATH: /
 
   deploy:
     needs: build
