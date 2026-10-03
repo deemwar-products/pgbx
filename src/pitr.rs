@@ -240,7 +240,7 @@ fn retention_days() -> i64 {
 // ------------------------------------------------------------------------------------------- conf file
 
 fn render_conf(c: &Ctx, wd: &Path, sid: &str, seg: i64, pgdata: &str) -> String {
-    let mut s = String::from("# written by the pgbx worker (pgbx.pitr = on); S3 keys are never stored here, only the path of the credentials file\n");
+    let mut s = String::from("# written by the pgbx worker (pgbx.pitr = on); S3 keys are never stored here, only the path of the credentials file (or aws-default)\n");
     let mut kv = |k: &str, v: String| {
         if !v.is_empty() {
             s.push_str(&format!("{k}={v}\n"));
@@ -249,7 +249,7 @@ fn render_conf(c: &Ctx, wd: &Path, sid: &str, seg: i64, pgdata: &str) -> String 
     kv("s3_endpoint", setting(&S3_ENDPOINT).unwrap_or_default());
     kv("s3_bucket", setting(&S3_BUCKET).unwrap_or_default());
     kv("s3_region", setting(&S3_REGION).unwrap_or_default());
-    kv("credentials_file", setting(&CREDENTIALS_FILE).unwrap_or_default());
+    kv("credentials_file", setting(&CREDENTIALS_FILE).unwrap_or(crate::s3auth::AWS_DEFAULT.into())); // empty = aws-default
     kv("server_name", c.server.clone());
     kv("system_id", sid.to_string());
     kv("work_dir", wd.display().to_string());

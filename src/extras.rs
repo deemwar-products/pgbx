@@ -79,7 +79,7 @@ pub(crate) fn backup_globals(c: &Ctx, cfg: &JobCfg, b: &Bucket, dump_key: &str, 
         drop(z);
         let res = child.wait_with_output().map_err(pe)?;
         if !res.status.success() {
-            let _ = b.delete_object(&gkey);
+            let _ = crate::s3auth::fresh(b).map(|b| b.delete_object(&gkey));
             return Err(format!("pg_dumpall: {}", String::from_utf8_lossy(&res.stderr).trim()));
         }
         up

@@ -120,6 +120,7 @@ fn drain_logs() {
 pub extern "C-unwind" fn pgbx_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let _ = MAIN_THREAD.set(std::thread::current().id());
+    s3auth::on_new_credentials(log); // "s3 credentials from instance role via IMDSv2 (role r), temporary, valid until ..."
     log("worker started");
     let mut s = Sched::default();
     let mut next_tick = Instant::now();
@@ -223,28 +224,57 @@ pub(crate) fn connect(c: &Ctx, db: &str) -> Result<Client, String> {
         .map_err(|e| format!("connect {db}: {}", pe(e)))
 }
 
-/// (access_key_id, secret_access_key) from pgbx.credentials_file
-pub(crate) fn credentials() -> Result<(String, String), String> {
-    let file = setting(&CREDENTIALS_FILE).ok_or("pgbx.credentials_file is not set")?;
-    let text = std::fs::read_to_string(&file).map_err(|e| format!("read {file}: {e}"))?;
+/// (access_key_id, secret_access_key) from a keys file (pgbx.credentials_file)
+pub(crate) fn credentials(file: &str) -> Result<(String, String), String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("read {file}: {e}"))?;
     let get = |k: &str| text.lines().find_map(|l| l.trim().strip_prefix(k).map(|v| v.trim_start_matches('=').trim().to_string()));
     Ok((get("access_key_id").ok_or("access_key_id missing")?, get("secret_access_key").ok_or("secret_access_key missing")?))
 }
 
+/// The S3 settings, read where GUCs may be read (the worker's main thread, a backend). Turning them into a bucket
+/// (`S3Spec::bucket`) reads the keys file or asks the AWS default chain, so that happens on the job's thread:
+/// the main loop never waits for a metadata service.
+#[derive(Clone)]
+pub(crate) struct S3Spec {
+    bucket: Option<String>,
+    endpoint: Option<String>,
+    region: String,
+    credentials: String, // pgbx.credentials_file: a path, or '' / 'aws-default' (s3auth.rs)
+}
+
+pub(crate) fn s3_spec() -> S3Spec {
+    S3Spec {
+        bucket: setting(&S3_BUCKET),
+        endpoint: setting(&S3_ENDPOINT),
+        region: setting(&S3_REGION).unwrap_or("us-east-1".into()),
+        credentials: setting(&CREDENTIALS_FILE).unwrap_or_default(),
+    }
+}
+
+impl S3Spec {
+    /// Any thread: no GUC reads.
+    pub(crate) fn bucket(&self) -> Result<Box<Bucket>, String> {
+        let name = self.bucket.clone().ok_or("pgbx.s3_bucket is not set")?;
+        let endpoint = self.endpoint.clone().ok_or("pgbx.s3_endpoint is not set")?;
+        let creds = if s3auth::uses_chain(&self.credentials) {
+            s3auth::from_chain()?.s3()
+        } else {
+            let (ak, sk) = credentials(&self.credentials)?;
+            Credentials::new(Some(&ak), Some(&sk), None, None, None).map_err(pe)?
+        };
+        let b = Bucket::new(&name, Region::Custom { region: self.region.clone(), endpoint }, creds).map_err(pe)?;
+        Ok(b.with_path_style())
+    }
+}
+
 pub(crate) fn bucket() -> Result<Box<Bucket>, String> {
-    let name = setting(&S3_BUCKET).ok_or("pgbx.s3_bucket is not set")?;
-    let endpoint = setting(&S3_ENDPOINT).ok_or("pgbx.s3_endpoint is not set")?;
-    let region = setting(&S3_REGION).unwrap_or("us-east-1".into());
-    let (ak, sk) = credentials()?;
-    let creds = Credentials::new(Some(&ak), Some(&sk), None, None, None).map_err(pe)?;
-    let b = Bucket::new(&name, Region::Custom { region, endpoint }, creds).map_err(pe)?;
-    Ok(b.with_path_style())
+    s3_spec().bucket()
 }
 
 /// Every setting a job needs, read on the main thread when the job starts (GUCs must not be read elsewhere).
 #[derive(Clone)]
 pub(crate) struct JobCfg {
-    bucket: Result<Box<Bucket>, String>,
+    s3: S3Spec,
     compression: Option<String>,
     compression_busy: Option<String>,
     lock_ms: i32,
@@ -271,7 +301,7 @@ pub(crate) struct JobCfg {
 impl JobCfg {
     pub(crate) fn now() -> JobCfg {
         JobCfg {
-            bucket: bucket(),
+            s3: s3_spec(),
             compression: setting(&DUMP_COMPRESSION),
             compression_busy: setting(&DUMP_COMPRESSION_BUSY),
             lock_ms: DUMP_LOCK_TIMEOUT.get(),
@@ -294,8 +324,9 @@ impl JobCfg {
         }
     }
 
+    /// On the job's thread: reads the keys file / asks the AWS default chain (cached), never a GUC.
     fn bucket(&self) -> Result<Box<Bucket>, String> {
-        self.bucket.clone()
+        self.s3.bucket()
     }
 }
 
@@ -396,15 +427,16 @@ fn tick(s: &mut Sched) -> Result<(), String> {
         // once per worker start, before any job runs: uploads a crash cut off are never a backup. On a thread of its
         // own: with S3 unreachable these calls wait for timeouts, and the poll loop (new databases, queued jobs,
         // shutdown) must never wait for S3.
-        if s.running.is_empty()
-            && !CLEANED.swap(true, Ordering::Relaxed)
-            && let Ok(b) = bucket()
-        {
+        if s.running.is_empty() && !CLEANED.swap(true, Ordering::Relaxed) {
             // listed uploads: only those older than 10 minutes (S3's clock may lag ours; the list file covers the rest)
             let (prefix, list, cutoff) = (format!("{}/", c.server), transfer::take_remembered(), Utc::now() - chrono::Duration::minutes(10));
-            let _ = std::thread::Builder::new().name("pgbx cleanup".into()).spawn(move || {
-                transfer::abort_remembered(&b, &list);
-                transfer::abort_orphans(&b, &prefix, cutoff);
+            let spec = s3_spec();
+            let _ = std::thread::Builder::new().name("pgbx cleanup".into()).spawn(move || match spec.bucket() {
+                Ok(b) => {
+                    transfer::abort_remembered(&b, &list);
+                    transfer::abort_orphans(&b, &prefix, cutoff);
+                }
+                Err(_) => transfer::remember_again(&list), // no S3 settings / credentials yet: at the next start
             });
         }
     }
@@ -1882,7 +1914,7 @@ fn backup(c: &Ctx, cfg: &JobCfg, db: &str, path: &str, forced: bool, progress: &
     set_child(0);
     let res = res?;
     if !res.status.success() || (up.is_ok() && shutting_down()) {
-        let _ = b.delete_object(&key); // never leave a truncated (or cancelled) dump that looks like a backup
+        let _ = s3auth::fresh(&b).map(|b| b.delete_object(&key)); // never leave a truncated (or cancelled) dump that looks like a backup
         let why = up.err().unwrap_or_else(|| {
             if shutting_down() { format!("stopped, {}", stop_reason()) } else { String::from_utf8_lossy(&res.stderr).trim().to_string() }
         });
@@ -2044,7 +2076,7 @@ pub(crate) fn client_tool(c: &Ctx, name: &str) -> (PathBuf, Option<u32>) {
 }
 
 fn list_dumps(c: &Ctx, b: &Bucket, path: &str) -> Result<Vec<String>, String> {
-    let mut keys: Vec<String> = b
+    let mut keys: Vec<String> = s3auth::fresh(b)?
         .list(prefix(c, path), None)
         .map_err(|e| format!("list: {e}"))?
         .into_iter()
@@ -2070,6 +2102,7 @@ fn prune(c: &Ctx, cfg: &JobCfg, path: &str, max_backups: i32, max_days: i32, gfs
     let mut gone = Vec::new();
     for i in crate::retention::to_delete(&times, max_backups, max_days, g.as_ref(), Utc::now()) {
         let k = &keys[i];
+        let b = s3auth::fresh(&b)?;
         b.delete_object(k).map_err(|e| format!("delete {k}: {e}"))?;
         let _ = b.delete_object(crate::globals::globals_key(k)); // absent for dumps taken before 0.6
         gone.push(k.clone());
