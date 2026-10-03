@@ -43,18 +43,19 @@ pgbx setup client prod --url 'postgres://postgres:$PGPASSWORD@db.example.com:543
 </TabItem>
 <TabItem label="Windows">
 
-PowerShell:
-
-```powershell
-powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"
-pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres 'password=$PGPASSWORD'
-```
-
-cmd.exe:
+Command Prompt (recommended: plain cmd.exe, so PowerShell execution policies never block it; uses only Windows'
+built-in curl, certutil and tar, and checks the download against the release's SHA256SUMS):
 
 ```bat
 curl -fsSL https://deemwar-products.github.io/pgbx/install.cmd -o install.cmd && install.cmd
 pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres password=$PGPASSWORD
+```
+
+Or PowerShell:
+
+```powershell
+powershell -c "irm https://deemwar-products.github.io/pgbx/install.ps1 | iex"
+pgbx setup client prod --adapter ssh target=ops@db.example.com user=postgres 'password=$PGPASSWORD'
 ```
 
 On Windows you get the pgbx CLI, `pgbx.exe` (in `%LOCALAPPDATA%\pgbx\bin`, added to your user PATH), the

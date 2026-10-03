@@ -81,7 +81,7 @@ Check "pgbx waited no more than grace + margin (<15 s)" ($took -lt 15) $true
 Check "password not in pgbx output" ($out.Contains($pw)) $false
 
 Write-Host "## c. pgbx killed while its adapter is starting: nothing is left behind"
-$p = Start-Process -FilePath $Pgbx -ArgumentList 'query','SELECT 1','--profile','slow','--json' -WindowStyle Hidden -PassThru
+$p = Start-Process -FilePath $Pgbx -ArgumentList 'query','"SELECT 1"','--profile','slow','--json' -WindowStyle Hidden -PassThru   # Start-Process does not quote: done here
 WaitFor (Join-Path $W 'slow.pid') 15 | Out-Null
 $apid = [int](Get-Content (Join-Path $W 'slow.pid'))
 Stop-Process -Id $p.Id -Force
