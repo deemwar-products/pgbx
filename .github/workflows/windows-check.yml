@@ -1,7 +1,7 @@
 name: Windows check
 
 # Manual only. Builds pgbx.exe on a GitHub Linux runner (cargo-xwin, as the release does) and runs the Windows-specific
-# checks on our own Windows VM (self-hosted pgbx-win, arm64; the amd64 exe runs there under emulation too):
+# checks on our own Windows VM (self-hosted pgbx-win, arm64; the x64 exe runs there under Windows' emulation):
 # --version, unit-free protocol checks of adapters (Job Object kill, stop, EOF), no secret in output or on disk.
 on:
   workflow_dispatch:
@@ -13,7 +13,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: arm64, target: aarch64-pc-windows-msvc }
           - { arch: amd64, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
@@ -24,10 +23,8 @@ jobs:
           cargo install --locked cargo-xwin
           # ring's C code must go through clang-cl: cargo-xwin passes MSVC-style flags (/imsvc ...) that plain clang rejects
           command -v clang-cl >/dev/null || sudo ln -sf "$(command -v clang)" /usr/local/bin/clang-cl
-          export CC_x86_64_pc_windows_msvc=clang-cl CC_aarch64_pc_windows_msvc=clang-cl
-          # ring builds aarch64-windows C with plain clang, so there cargo-xwin must pass clang-style (-isystem) flags
-          XC=""; [ "${{ matrix.target }}" = aarch64-pc-windows-msvc ] && XC="--cross-compiler clang"
-          cargo xwin build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }} $XC
+          export CC_x86_64_pc_windows_msvc=clang-cl
+          cargo xwin build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
           mkdir -p out && cp cli/target/${{ matrix.target }}/release/pgbx.exe out/pgbx-${{ matrix.arch }}.exe
       - uses: actions/upload-artifact@v4
         with: { name: 'pgbx-windows-${{ matrix.arch }}', path: out/ }
@@ -39,11 +36,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { path: bin, merge-multiple: true }
-      - name: adapter protocol on Windows (native arm64)
+      - name: adapter protocol on Windows (the x64 exe; on our ARM VM it runs under Windows' x64 emulation)
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows_adapter.ps1 -Pgbx "$pwd\bin\pgbx-arm64.exe"
-      - name: amd64 exe under emulation
-        shell: powershell
-        run: |
-          & "$pwd\bin\pgbx-amd64.exe" --version
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows_adapter.ps1 -Pgbx "$pwd\bin\pgbx-amd64.exe"

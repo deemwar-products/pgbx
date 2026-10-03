@@ -2,6 +2,8 @@
 
 ## 0.6.0 (unreleased)
 
+- Windows: one x64 build (`pgbx-windows-amd64.zip`). Windows on ARM runs it through its built-in x64 emulation, and `install.ps1` installs it there; the separate arm64 Windows build is dropped (its cross-build of the TLS/crypto C libraries fails).
+
 - **Breaking: pgbx's built-in SSH is gone** (ADR 0003). `--ssh`, `--ssh-port`, `--ssh-jump`, `--tunnel-idle` and
   `pgbx tunnel` are removed (they now fail with a pointer to the ssh adapter); doctor / logs / diagnose /
   setup no longer run over SSH. Use the ssh example adapter:

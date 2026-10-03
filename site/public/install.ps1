@@ -26,7 +26,7 @@ $cpu = $env:PROCESSOR_ARCHITECTURE
 if (-not $cpu) { $cpu = "$([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)".ToUpper() -replace '^X64$', 'AMD64' }
 $arch = switch ($cpu) {
     'AMD64' { 'amd64' }
-    'ARM64' { 'arm64' }
+    'ARM64' { 'amd64' }   # Windows on ARM runs the x64 build through its built-in emulation
     default { Fail "unsupported CPU $cpu (amd64 and arm64 only)" }
 }
 if (-not $BaseUrl) {
