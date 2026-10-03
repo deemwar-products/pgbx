@@ -45,8 +45,8 @@ curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh -s -- --versi
   pgbx gains instance-role credentials (e.g. `pgbx.credentials_file = 'instance-role'`, or used automatically when
   no file is set, via IMDSv2). The pgbx session will build this; the CloudFormation template then attaches an
   instance profile with `s3:PutObject/GetObject/ListBucket/DeleteObject/AbortMultipartUpload` on that bucket only.
-- Optional: encryption at rest for dumps (`pgbx.key_file`, a raw 32-byte key generated at first boot, root/postgres
-  only). Tell the customer to back up that key; without it the dumps can't be restored.
+- Optional: encryption for dumps (`pgbx.encryption_key_file`: 32 random bytes as base64 or hex, generated at first boot, postgres
+  only, chmod 600). Tell the customer to back up that key; without it the dumps can't be restored.
 
 ## 4. Smoke test (Packer build and launch test)
 
