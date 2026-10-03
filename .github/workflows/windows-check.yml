@@ -1,0 +1,43 @@
+name: Windows check
+
+# Manual only. Builds pgbx.exe on a GitHub Linux runner (cargo-xwin, as the release does) and runs the Windows-specific
+# checks on our own Windows VM (self-hosted pgbx-win, arm64; the amd64 exe runs there under emulation too):
+# --version, unit-free protocol checks of adapters (Job Object kill, stop, EOF), no secret in output or on disk.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - { arch: arm64, target: aarch64-pc-windows-msvc }
+          - { arch: amd64, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: '${{ matrix.target }}' }
+      - run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clang lld llvm
+          cargo install --locked cargo-xwin
+          cargo xwin build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
+          mkdir -p out && cp cli/target/${{ matrix.target }}/release/pgbx.exe out/pgbx-${{ matrix.arch }}.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: 'pgbx-windows-${{ matrix.arch }}', path: out/ }
+
+  test:
+    needs: build
+    runs-on: [self-hosted, pgbx-win]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: bin, merge-multiple: true }
+      - name: adapter protocol on Windows (native arm64)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows_adapter.ps1 -Pgbx "$pwd\bin\pgbx-arm64.exe"
+      - name: amd64 exe under emulation
+        shell: powershell
+        run: |
+          & "$pwd\bin\pgbx-amd64.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
