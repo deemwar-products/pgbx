@@ -115,6 +115,32 @@ sudo AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… pgbx setup server --yes \
   --server-name db-prod-1
 ```
 
+### On EC2: the instance role, no keys file
+
+Attach an instance profile whose role may use the bucket, and give pgbx no keys at all:
+
+```sh
+sudo pgbx setup server --yes --credentials aws-default \
+  --s3-endpoint https://s3.eu-central-1.amazonaws.com --s3-bucket my-backups --s3-region eu-central-1 \
+  --server-name db-prod-1
+```
+
+This writes `pgbx.credentials_file = 'aws-default'` and no credentials file. pgbx then takes temporary
+credentials from the instance role through IMDSv2 (never IMDSv1) and renews them before they expire; ECS task
+roles and EKS (IRSA, Pod Identity) work the same way. The role's policy, on your bucket only:
+
+```json
+{"Version": "2012-10-17", "Statement": [
+  {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+   "Resource": "arn:aws:s3:::my-backups"},
+  {"Effect": "Allow",
+   "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+   "Resource": "arn:aws:s3:::my-backups/*"}]}
+```
+
+`pgbx doctor` shows `s3 credentials ... source: instance-role (... role NAME ...)`, or what is missing. Details:
+[S3 credentials without a keys file](../../reference/settings/#s3-credentials-without-a-keys-file).
+
 ## Installer flags
 
 | install.sh | install.ps1 / install.cmd | |
@@ -150,7 +176,7 @@ pgbx.s3_endpoint      = 'https://hel1.your-objectstorage.com'
 pgbx.s3_bucket        = 'my-backups'
 pgbx.s3_region        = 'hel1'
 pgbx.server_name      = 'db-prod-1'        # folder for this server in the bucket
-pgbx.credentials_file = '/etc/pgbx/s3.credentials'
+pgbx.credentials_file = '/etc/pgbx/s3.credentials'   # or 'aws-default': the EC2 instance role, no keys file
 ```
 
 All settings: [Settings reference](../../reference/settings/). Build from source:

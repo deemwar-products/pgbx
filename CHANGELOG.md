@@ -101,6 +101,20 @@
   `pitr archiving`, `pitr base backups`, `pitr gaps`; a PITR card in `pgbx ui`. Settings `pgbx.pitr`,
   `pgbx.pitr_schedule`, `pgbx.pitr_retention`, `pgbx.wal_queue_max`, `pgbx.wal_gap_margin`, `pgbx.wal_alert_after`,
   `pgbx.wal_alert_size`, `pgbx.work_dir`, `pgbx.cli_path`. Designs ported from pgBackRest (MIT, see `NOTICE`).
+- **S3 credentials without a keys file** (EC2 instance role, for the AWS Marketplace AMI):
+  `pgbx.credentials_file = 'aws-default'` (or empty) uses the AWS default chain instead of static keys: env
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` (CLI only), web identity (EKS IRSA), container
+  credentials (ECS, EKS Pod Identity), then the **EC2 instance role through IMDSv2** (IMDSv1 is never used;
+  `AWS_EC2_METADATA_SERVICE_ENDPOINT` is honoured). Temporary credentials are cached and renewed 5 minutes before
+  they expire or on a 403 `ExpiredToken`, between multipart parts and download resumes, so long transfers run across
+  a refresh. Everywhere pgbx talks to S3: the worker and its jobs (which still read no settings: the job's own thread
+  resolves the credentials, so the poll loop never waits for a metadata service), `wal-push` / `wal-get` / `pitr`,
+  `backups --from-s3` and `db-restore --from-s3` (`--credentials-file` may now be left out, meaning `aws-default`).
+  `pgbx setup server --credentials aws-default` writes the setting and no keys file. doctor(): the
+  `credentials file` row is now `s3 credentials` and names the source in use (`file`, `env`, `web-identity`, `ecs`,
+  `instance-role`, with the role and expiry), or why none works and the IAM policy to attach; `s3 settings` no longer
+  requires `pgbx.credentials_file`. No key, secret or token is ever logged or stored. A non-empty file path behaves
+  exactly as before.
 - SQL signature changes: `set_retention(int, int, text)`, `restore(text, timestamptz, bool, text)`; old calls keep
   working through the defaults.
 - Fix: the startup cleanup of orphaned multipart uploads runs on a thread of its own (an unreachable S3 no longer
