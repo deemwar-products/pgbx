@@ -31,6 +31,8 @@ ring = "0.17"
 zstd = { version = "0.13", features = ["zstdmt"] }
 sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
+# S3 credentials from the instance role (IMDSv2) / container / web identity (../src/s3auth.rs): rust-s3's own HTTP client
+attohttpc = { version = "0.30", default-features = false }
 
 # adapter process groups and Ctrl-C (ADR 0003): both crates are already in the tree (socket2, mio), so no new code
 [target.'cfg(unix)'.dependencies]

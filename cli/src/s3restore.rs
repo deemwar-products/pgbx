@@ -5,7 +5,9 @@
 //!   pgbx db-restore --from-s3 --db shop --into shop [--backup KEY | --time TS] <s3 flags>
 //!
 //! The dump is streamed from S3 into pg_restore (no temp file); a dropped connection resumes from the byte
-//! reached (HTTP Range), so pg_restore never starts over. Credentials are read from a file and never printed.
+//! reached (HTTP Range), so pg_restore never starts over. Credentials come from a keys file (never printed) or,
+//! with --credentials-file aws-default (the default), the AWS default chain: env keys, web identity, container,
+//! instance role via IMDSv2 (src/s3auth.rs).
 //! Encrypted dumps (pgbx.encryption_key_file on the source) are decrypted in the stream with --key-file;
 //! --with-roles first replays the backup's roles file (<ts>.globals.sql.zst; see src/globals.rs).
 
@@ -36,7 +38,8 @@ pub fn s3_flags(a: &Args) -> Result<S3Flags, String> {
         bucket: need("s3-bucket")?,
         region: a.get("s3-region").filter(|v| !v.is_empty()).unwrap_or("us-east-1").to_string(),
         server: need("server-name")?,
-        credentials_file: need("credentials-file")?,
+        // absent = aws-default: env keys, web identity, container, then the EC2 instance role (src/s3auth.rs)
+        credentials_file: a.get("credentials-file").filter(|v| !v.is_empty()).unwrap_or(crate::s3auth::AWS_DEFAULT).to_string(),
     })
 }
 
@@ -54,9 +57,13 @@ pub fn parse_credentials(s: &str) -> Result<(String, String), String> {
 }
 
 fn bucket(f: &S3Flags) -> Result<Box<Bucket>, String> {
-    let text = std::fs::read_to_string(&f.credentials_file).map_err(|e| format!("read {}: {e}", f.credentials_file))?;
-    let (ak, sk) = parse_credentials(&text)?;
-    let creds = Credentials::new(Some(&ak), Some(&sk), None, None, None).map_err(|e| format!("credentials: {e}"))?;
+    let creds = if crate::s3auth::uses_chain(&f.credentials_file) {
+        crate::s3auth::from_chain().map_err(|e| format!("{e}; or pass --credentials-file FILE"))?.s3()
+    } else {
+        let text = std::fs::read_to_string(&f.credentials_file).map_err(|e| format!("read {}: {e}", f.credentials_file))?;
+        let (ak, sk) = parse_credentials(&text)?;
+        Credentials::new(Some(&ak), Some(&sk), None, None, None).map_err(|e| format!("credentials: {e}"))?
+    };
     let b = Bucket::new(&f.bucket, Region::Custom { region: f.region.clone(), endpoint: f.endpoint.clone() }, creds)
         .map_err(|e| format!("bucket: {e}"))?;
     Ok(b.with_path_style())
@@ -153,7 +160,7 @@ pub fn only_extension_errors(stderr: &str) -> bool {
 }
 
 fn list(b: &Bucket, pfx: &str) -> Result<Vec<(String, u64)>, String> {
-    let pages = b.list(pfx.to_string(), None).map_err(|e| format!("list s3://{}/{pfx}: {e}", b.name()))?;
+    let pages = crate::s3auth::fresh(b)?.list(pfx.to_string(), None).map_err(|e| format!("list s3://{}/{pfx}: {e}", b.name()))?;
     Ok(pages.into_iter().flat_map(|p| p.contents.into_iter().map(|o| (o.key, o.size))).filter(|(k, _)| k.ends_with(".dump")).collect())
 }
 
@@ -220,7 +227,7 @@ const BACKOFF_SECS: [u64; 8] = [1, 2, 4, 8, 16, 30, 30, 30];
 
 /// Download `key` into `w`, resuming from the last byte on network errors (same approach as the extension).
 fn download_resumable<W: Write + Send>(b: &Bucket, key: &str, w: &mut W) -> Result<u64, String> {
-    let (head, code) = b.head_object(key).map_err(|e| format!("stat {key}: {e}"))?;
+    let (head, code) = crate::s3auth::fresh(b)?.head_object(key).map_err(|e| format!("stat {key}: {e}"))?;
     if code / 100 != 2 {
         return Err(format!("stat {key}: HTTP {code}"));
     }
@@ -233,7 +240,8 @@ fn download_resumable<W: Write + Send>(b: &Bucket, key: &str, w: &mut W) -> Resu
         }
         let from = done;
         let mut t = Tracked { inner: w, written: &mut done, dest_failed: &mut dest_failed };
-        let r = b.get_object_range_to_writer(key, from, None, &mut t);
+        // credentials brought up to date per attempt (a resume may come after the role's session ended)
+        let r = crate::s3auth::fresh(b)?.get_object_range_to_writer(key, from, None, &mut t);
         if dest_failed {
             return Err(format!("pg_restore stopped reading after {done} bytes"));
         }
@@ -243,6 +251,7 @@ fn download_resumable<W: Write + Send>(b: &Bucket, key: &str, w: &mut W) -> Resu
             Ok(c) => last = format!("HTTP {c} at {done}/{size} bytes"),
             Err(e) => last = format!("{e} at {done}/{size} bytes"),
         }
+        crate::s3auth::note_error(&last);
     }
     Err(format!("download {key}: gave up after {} retries: {last}", BACKOFF_SECS.len()))
 }

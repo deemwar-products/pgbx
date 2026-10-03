@@ -75,7 +75,8 @@ pub fn parse_conf(text: &str, path: &Path) -> Result<Conf, String> {
             endpoint: need("s3_endpoint")?,
             bucket: need("s3_bucket")?,
             region: m.get("s3_region").cloned().unwrap_or_default(),
-            credentials_file: need("credentials_file")?,
+            // absent or aws-default: the AWS default chain (instance role via IMDSv2 on EC2; src/s3auth.rs)
+            credentials_file: m.get("credentials_file").filter(|v| !v.is_empty()).cloned().unwrap_or(crate::s3auth::AWS_DEFAULT.into()),
         },
         server: need("server_name")?,
         system_id: m.get("system_id").cloned().unwrap_or_default(),
@@ -96,7 +97,7 @@ pub fn parse_conf(text: &str, path: &Path) -> Result<Conf, String> {
 }
 
 pub fn render_conf(c: &Conf) -> String {
-    let mut s = String::from("# pgbx point-in-time restore settings; S3 keys are never stored here, only the path of the credentials file\n");
+    let mut s = String::from("# pgbx point-in-time restore settings; S3 keys are never stored here, only the path of the credentials file (or aws-default)\n");
     let mut kv = |k: &str, v: String| {
         if !v.is_empty() {
             s.push_str(&format!("{k}={v}\n"));
