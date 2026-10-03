@@ -10,6 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { arch: arm64, target: aarch64-pc-windows-msvc }
@@ -21,6 +22,9 @@ jobs:
       - run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq clang lld llvm
           cargo install --locked cargo-xwin
+          # ring's C code must go through clang-cl: cargo-xwin passes MSVC-style flags (/imsvc ...) that plain clang rejects
+          command -v clang-cl >/dev/null || sudo ln -sf "$(command -v clang)" /usr/local/bin/clang-cl
+          export CC_x86_64_pc_windows_msvc=clang-cl CC_aarch64_pc_windows_msvc=clang-cl
           cargo xwin build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
           mkdir -p out && cp cli/target/${{ matrix.target }}/release/pgbx.exe out/pgbx-${{ matrix.arch }}.exe
       - uses: actions/upload-artifact@v4
