@@ -1,0 +1,37 @@
+---
+// deemwar help section + lead form (posts to api.deemwar.com/api/leads, product=pgbx; Cloudflare Turnstile "deemwar-forms" covers *.deemwar.com).
+// From deemwar-site-workspace/jevx-services/snippets/deemwar-help-pgbx.html, colours mapped to Starlight's theme tokens. One per page (fixed ids).
+---
+<section class="dw-help" id="help">
+  <style is:inline>
+    .dw-help{--dw-accent:var(--sl-color-accent);--dw-line:var(--sl-color-hairline);--dw-muted:var(--sl-color-gray-2);border:1px solid var(--dw-line);border-radius:18px;padding:24px;margin:32px 0;font:16px/1.6 var(--sl-font, system-ui, sans-serif)}
+    .dw-help h2{margin:0 0 6px;font-size:24px}.dw-help p{margin:0 0 16px;color:var(--dw-muted)}
+    .dw-help form{display:grid;gap:12px;max-width:560px}.dw-help label{display:grid;gap:4px;font-size:14px;font-weight:600}
+    .dw-help input,.dw-help select,.dw-help textarea{font:inherit;padding:10px 12px;border:1px solid var(--dw-line);border-radius:10px;background:transparent;color:inherit}
+    .dw-help textarea{min-height:90px}.dw-help button{justify-self:start;border:0;border-radius:999px;padding:10px 18px;font-weight:600;background:var(--dw-accent);color:var(--sl-color-black);cursor:pointer}
+    .dw-help button:disabled{opacity:.6;cursor:default}.dw-help .dw-st{font-size:14px;color:var(--dw-muted)}
+  </style>
+  <h2>Need help? Installation, support and training by deemwar</h2>
+  <p>pgbx is free and open source (MIT). If you want it installed on your Postgres servers, restores tested on your data, or a person to call when a backup misbehaves, deemwar does that. We charge for people's time, scoped in writing; rate on request.</p>
+  <form id="dw-help-form" novalidate>
+    <label>Work email<input type="email" name="email" required autocomplete="email"></label>
+    <label>What do you need?<select name="intent"><option value="install">Installation</option><option value="support">Support</option><option value="training">Training</option><option value="question">A question</option></select></label>
+    <label>Anything we should know (optional)<textarea name="message" maxlength="2000" placeholder="Postgres versions, how many servers, where backups go"></textarea></label>
+    <div id="dw-help-ts"></div>
+    <button type="submit" id="dw-help-send" disabled>Send</button>
+    <span class="dw-st" id="dw-help-st">Running a quick security check…</span>
+  </form>
+  <script is:inline src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+  <script is:inline>
+  (function(){var f=document.getElementById('dw-help-form'),b=document.getElementById('dw-help-send'),st=document.getElementById('dw-help-st'),tok='',w=null;
+    function boot(){if(!window.turnstile)return setTimeout(boot,200);w=window.turnstile.render('#dw-help-ts',{sitekey:'0x4AAAAAAFMyLeCmKEOUUyt6',action:'lead',appearance:'interaction-only',callback:function(t){tok=t;b.disabled=false;st.textContent='';},'expired-callback':function(){tok='';b.disabled=true;}});}
+    boot();
+    f.addEventListener('submit',function(e){e.preventDefault();var em=f.email.value.trim();if(!em||!f.email.checkValidity()){st.textContent='Please enter a valid email.';return;}
+      b.disabled=true;st.textContent='Sending…';
+      fetch('https://api.deemwar.com/api/leads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,product:'pgbx',intent:f.intent.value,message:f.message.value.trim(),page:location.pathname,turnstileToken:tok,source:{referrer:document.referrer||null,landing_path:location.pathname}})})
+        .then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.message||'Could not send');});})
+        .then(function(){f.reset();st.textContent='Thanks. A person will reply by email, usually within a working day.';})
+        .catch(function(x){st.textContent=x.message+'. You can also email io@deemwar.com.';b.disabled=false;})
+        .finally(function(){tok='';if(window.turnstile&&w!==null)window.turnstile.reset(w);});});})();
+  </script>
+</section>

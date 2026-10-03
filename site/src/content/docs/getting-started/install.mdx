@@ -4,6 +4,7 @@ description: Install pgbx on the database server (pgbx setup server, one restart
 sidebar: { order: 1 }
 ---
 import { Tabs, TabItem } from '@astrojs/starlight/components';
+import DeemwarHelp from '../../../components/DeemwarHelp.astro';
 
 The installer puts two things in place: the **pgbx extension** on the database server (it runs inside
 Postgres and does the backups) and the **pgbx CLI** (`pgbx`, the client you run commands with), plus the
@@ -194,3 +195,5 @@ sudo rm /usr/local/bin/pgbx /etc/pgbx/s3.credentials
 ```
 
 Windows: `pgbx skill uninstall`, then delete `%LOCALAPPDATA%\pgbx` and remove it from your user PATH.
+
+<DeemwarHelp />
