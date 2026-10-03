@@ -44,5 +44,14 @@ if [ "${PGBX_DIAG_SMOKE:-0}" = 1 ]; then   # optional: pgbx doctor/diagnose with
   (cd .. && docker run --rm --name pgbx-diag-smoke -v "$PWD":/src -v pgbx-diag-target:/src/target \
      -v pgbx-diag-clitarget:/src/cli/target -w /src pgbx-dev sh tests/diag_smoke.sh); diag=$?
 fi
+# disk hygiene: the stacks go away with their volumes, and a LOCAL test bucket is emptied (never a real one)
+docker compose -f compose.test.yml down -v >/dev/null 2>&1
+docker compose -f compose.local.yml down -v >/dev/null 2>&1
+(set -a; . ./.env; set +a
+ case "$S3_ENDPOINT" in
+   *orb.local*|*localhost*|*127.0.0.1*|*host.docker.internal*)
+     docker run --rm --env-file local.env amazon/aws-cli --endpoint-url "$S3_ENDPOINT" s3 rm --recursive --quiet "s3://$S3_BUCKET/" >/dev/null 2>&1 \
+       && echo "== emptied the local test bucket $S3_BUCKET" ;;
+ esac)
 echo "== e2e exit $e2e, cli_e2e exit $cli, ui_e2e exit $ui, serve_e2e exit $serve, queue_e2e exit $queue, load_e2e exit $load, extras_e2e exit $extras, pitr_e2e exit $pitr, s3down_e2e exit $s3down, imds_e2e exit $imds, bench exit $bench, upgrade exit $upgrade, diag smoke exit $diag"
 [ $e2e -eq 0 ] && [ $cli -eq 0 ] && [ $ui -eq 0 ] && [ $serve -eq 0 ] && [ $queue -eq 0 ] && [ $load -eq 0 ] && [ $extras -eq 0 ] && [ $pitr -eq 0 ] && [ $s3down -eq 0 ] && [ $imds -eq 0 ] && [ $bench -eq 0 ] && [ $upgrade -eq 0 ] && [ $diag -eq 0 ]
