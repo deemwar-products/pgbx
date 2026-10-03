@@ -25,7 +25,9 @@ jobs:
           # ring's C code must go through clang-cl: cargo-xwin passes MSVC-style flags (/imsvc ...) that plain clang rejects
           command -v clang-cl >/dev/null || sudo ln -sf "$(command -v clang)" /usr/local/bin/clang-cl
           export CC_x86_64_pc_windows_msvc=clang-cl CC_aarch64_pc_windows_msvc=clang-cl
-          cargo xwin build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
+          # ring builds aarch64-windows C with plain clang, so there cargo-xwin must pass clang-style (-isystem) flags
+          XC=""; [ "${{ matrix.target }}" = aarch64-pc-windows-msvc ] && XC="--cross-compiler clang"
+          cargo xwin build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }} $XC
           mkdir -p out && cp cli/target/${{ matrix.target }}/release/pgbx.exe out/pgbx-${{ matrix.arch }}.exe
       - uses: actions/upload-artifact@v4
         with: { name: 'pgbx-windows-${{ matrix.arch }}', path: out/ }
