@@ -1,7 +1,7 @@
 # AWS Marketplace AMI: spec for the marketplace agent
 
-Free AMI: self-managed PostgreSQL on EC2 with pgbx backups built in. MIT; paid: installation, support, training
-(io@deemwar.com). Status: **spec, not built.** Owner decisions are in docs/adr/0003 (marketplace section).
+Free AMI: self-managed PostgreSQL on EC2 with pgbx backups built in. Standing rule for every listing: "pgbx is free
+(MIT). The only paid offers are installation, support and training: io@deemwar.com." Status: **spec, not built.** Owner decisions are in docs/adr/0003 (marketplace section).
 
 ## 1. Postgres
 
@@ -74,8 +74,8 @@ Without S3 (Packer build, no bucket yet): `SELECT extversion FROM pg_extension W
   > extension that backs up every database to your own S3 bucket automatically, including databases you create
   > later, and restores any of them with one command into a new database, even onto a new server. Backups are plain
   > pg_dump files you own: portable, restorable anywhere, kept on your schedule and retention. Optional
-  > point-in-time restore and encryption. The software is free; Deemwar offers paid installation, support and
-  > training (io@deemwar.com).
+  > point-in-time restore and encryption. pgbx is free (MIT). The only paid offers are installation, support and
+  > training: io@deemwar.com.
 
 ## 6. The AMI must NOT include
 
