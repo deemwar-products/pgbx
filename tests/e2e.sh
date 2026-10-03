@@ -161,9 +161,10 @@ P -d locked -c "CREATE TABLE t AS SELECT g AS id FROM generate_series(1,1000) g"
 # a migration holds ACCESS EXCLUSIVE on t for 25 s
 docker compose -f compose.test.yml exec -T db psql -U postgres -d locked -qAt -c "BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(25); COMMIT;" >/dev/null 2>&1 & holder=$!
 sleep 2; since=$(date -u +%Y-%m-%dT%H:%M:%SZ); id=$(P -d locked -c "SELECT pgbx.backup_now()")
-# the pg_dump waiting for its lock: nice / IO class as set between fork and exec (/proc: the image has no ps)
+# the pg_dump waiting for its lock: nice / IO class as set between fork and exec (/proc: the image has no ps);
+# skip the worker's short `pg_dump --version` probe, which is not the dump
 caps=$(docker compose -f compose.test.yml exec -T db sh -c 'for _ in $(seq 150); do for p in /proc/[0-9]*; do
-  [ "$(cat $p/comm 2>/dev/null)" = pg_dump ] && { echo "$(cut -d" " -f19 $p/stat)|$(ionice -p ${p#/proc/})"; exit 0; }; done; sleep 0.1; done')
+  [ "$(cat $p/comm 2>/dev/null)" = pg_dump ] && ! tr "\0" " " < $p/cmdline 2>/dev/null | grep -q -- --version && { echo "$(cut -d" " -f19 $p/stat)|$(ionice -p ${p#/proc/})"; exit 0; }; done; sleep 0.1; done')
 check "pg_dump runs at nice 10" "${caps%%|*}" 10
 check "pg_dump IO class best-effort 7" "${caps#*|}" "best-effort: prio 7"
 check "its connection is tagged pgbx_dump" "$(P -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='pgbx_dump'")" 1
