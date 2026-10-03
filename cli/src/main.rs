@@ -11,14 +11,23 @@ mod adapter;
 mod client_only;
 mod config;
 mod conn;
+#[path = "../../src/crypt.rs"]
+pub mod crypt;
+mod decrypt;
 mod diagnose;
+#[path = "../../src/globals.rs"]
+pub mod globals;
 mod jobs;
 mod load;
 mod memories;
+mod metrics;
+mod pitr;
+mod pitrcmd;
 mod policy;
 mod profile;
 mod query;
 mod s3restore;
+mod s3x;
 mod serve;
 mod setup;
 mod setup_client;
@@ -26,6 +35,7 @@ mod skill;
 mod tls;
 mod ui;
 mod vars;
+mod wal;
 
 use postgres::types::ToSql;
 use postgres::Client;
@@ -42,12 +52,16 @@ pub(crate) const DEFAULT_HOST: &str = "localhost";
 
 // ---------------------------------------------------------------- arguments
 
-const BOOL_FLAGS: &[&str] = &["json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite", "apply", "no-open", "allow-safe"];
+const BOOL_FLAGS: &[&str] = &[
+    "json", "wait", "from-s3", "help", "yes", "reset", "no-codex", "version", "strict", "all", "no-skill", "overwrite", "apply",
+    "with-roles", "pitr", "expire", "async-daemon", "prefetch-daemon", "yes-replace-whole-server", "no-open", "allow-safe",
+];
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
     "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "url", "adapter", "adapter-command",
-    "max-rows", "as", "hours", "gate",
+    "max-rows", "as", "hours", "gate", "key-file", "roles", "gfs", "in", "out", "conf", "target",
+    "system-id",
 ];
 /// Removed in 0.6 (ADR 0003): pgbx has no built-in SSH any more.
 const REMOVED_SSH: &str = "pgbx has no built-in SSH any more (0.6, ADR 0003): use the ssh adapter, e.g. \
@@ -55,7 +69,7 @@ const REMOVED_SSH: &str = "pgbx has no built-in SSH any more (0.6, ADR 0003): us
 const COMMANDS: &[&str] = &[
     "status", "list", "backups", "now", "verify", "db-restore", "doctor", "logs", "help", "schedule", "retention",
     "pause", "resume", "scope", "verify-schedule", "link", "overview", "skill", "diagnose", "ui", "setup", "profile", "query", "memories",
-    "jobs", "load", "serve",
+    "jobs", "load", "serve", "metrics", "decrypt", "pitr", "wal-push", "wal-get",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -132,25 +146,30 @@ read-only:
   pgbx load     [--db X]                     the load gate: last load sample, thresholds, per database what it would
                                              defer (shadow, the default), deferred (on) or forced
   pgbx ui       [--listen 127.0.0.1:8432] [--strict]
-                                             read-only audit web UI (overview, 30-day timeline, health);
-                                             --strict refuses a role that could change backups
+                                             read-only audit web UI (overview, 30-day timeline, health) and
+                                             Prometheus GET /metrics; --strict refuses a role that could change backups
   pgbx serve    [--profile P] [--listen 127.0.0.1:0] [--no-open] [--allow-safe]
                                              local web app (overview, database detail, restore helper, read-only
                                              query, health); random port + per-run token, opens the browser;
                                              --allow-safe enables backup now / verify now / restore into a NEW db /
                                              cancel a queued job, each confirmed (never guarded or destructive)
+  pgbx metrics                               the same Prometheus metrics once, as text
+  pgbx decrypt  --key-file F [--in FILE] [--out FILE]
+                                             decrypt an encrypted dump (e.g. from a download link; stdin -> stdout)
 safe:
   pgbx now      [--db X] [--wait]            queue a backup
   pgbx verify   [--db X] [--wait]            queue a restore test
-  pgbx db-restore --db X --into NEWDB [--time TS] [--wait]
-                                             restore into a NEW database on this server (via the extension)
+  pgbx db-restore --db X --into NEWDB [--time TS] [--with-roles [--roles referenced|all]] [--wait]
+                                             restore into a NEW database on this server (via the extension);
+                                             --with-roles first creates missing roles from the backup's roles file
 new server / disaster (no extension needed on the target; needs pg_restore):
   pgbx backups    --from-s3 --db X S3FLAGS   list X's dumps in S3, newest first
-  pgbx db-restore --from-s3 --db X --into NEWDB [--backup KEY | --time TS] S3FLAGS
+  pgbx db-restore --from-s3 --db X --into NEWDB [--backup KEY | --time TS] [--with-roles [--roles R]]
+                  [--key-file F] S3FLAGS      (--key-file: the pgbx.encryption_key_file of encrypted backups)
       S3FLAGS: --s3-endpoint URL --s3-bucket B [--s3-region R] --server-name S --credentials-file F
       newest dump at or before TS (default: newest) -> CREATE DATABASE NEWDB (refused if it exists) -> pg_restore
 policy / access (show with no arguments; changes that reduce protection need --yes):
-  pgbx schedule [TEXT]            pgbx retention [--max-backups N] [--max-days N]
+  pgbx schedule [TEXT]            pgbx retention [--max-backups N] [--max-days N] [--gfs 7d,4w,12m|off]
   pgbx schedule suggest [--db X] [--hours N] [--apply [--yes]]
                                   the quietest window learned from activity + the configure() call to copy;
                                   never applied by itself (--apply asks y/N on a terminal, else needs --yes)
@@ -160,7 +179,19 @@ policy / access (show with no arguments; changes that reduce protection need --y
   pgbx overview                   (admin database: every database on the server)
   pgbx jobs cancel ID [--db X] --yes        cancel a queued or running job (a running one is stopped, nothing left in S3)
   pgbx load --gate off|shadow|on|default --db X   the load gate for one database (on needs --yes)
-setup (guarded: shows the plan; --yes writes):
+point-in-time restore (optional, whole server; per-database dumps stay the default):
+  pgbx setup pitr [--yes]                    archive_mode=on, archive_command='<this pgbx> wal-push %p', pgbx.pitr=on
+                                             (ALTER SYSTEM; refuses a foreign archive_command; restart Postgres once)
+  pgbx pitr status                           window (restorable from .. until), last base backup, gaps, backlog
+  pgbx pitr backup-now [--wait]              queue a base backup (superuser)
+  pgbx pitr list   (--conf FILE | S3FLAGS [--system-id N])   base backups + gaps straight from S3
+  pgbx pitr restore --time TS|latest --target DIR (--conf FILE | S3FLAGS [--system-id N])
+                                             newest base backup before TS -> DIR + recovery settings; never starts
+                                             Postgres (prints the command); refuses a time inside a WAL gap; a copy
+                                             gets archive_mode=off. --yes-replace-whole-server: DIR is a STOPPED
+                                             server's data directory, moved aside (not deleted) first
+  pgbx wal-push %p [--conf FILE]             archive_command    pgbx wal-get %f %p --conf FILE   restore_command
+setup (guarded: shows the plan; --yes writes; `pgbx setup pitr` is above):
   pgbx setup server [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
               --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
       on the DB host, with sudo: writes <config dir>/conf.d/pgbx.conf (shared_preload_libraries merged with
@@ -212,10 +243,16 @@ pub enum Level {
 }
 
 pub fn level(cmd: &str, a: &Args) -> Level {
-    let shows = a.pos.is_empty() && !["max-backups", "max-days", "include", "exclude", "reset"].iter().any(|f| a.has(f));
+    let shows = a.pos.is_empty() && !["max-backups", "max-days", "gfs", "include", "exclude", "reset"].iter().any(|f| a.has(f));
     match cmd {
-        "now" | "verify" | "db-restore" | "resume" | "link" | "skill" => Level::Safe,
+        "now" | "verify" | "db-restore" | "resume" | "link" | "skill" | "wal-push" | "wal-get" => Level::Safe,
         "setup" if a.pos.first().map(String::as_str) == Some("client") => Level::Safe,
+        "pitr" => match a.pos.first().map(String::as_str) {
+            Some("restore") if a.has("yes-replace-whole-server") => Level::Destructive,
+            Some("restore" | "backup-now" | "backup" | "publish-gaps") => Level::Safe,
+            Some("expire") => Level::Guarded,
+            _ => Level::ReadOnly,
+        },
         "profile" if matches!(a.pos.first().map(String::as_str), Some("add" | "edit" | "remove" | "use")) => Level::Safe,
         "memories" if a.pos.first().map(String::as_str) == Some("import") => Level::Safe,
         "schedule" if shows => Level::ReadOnly,
@@ -247,6 +284,14 @@ pub fn check_time(t: &str) -> Result<(), String> {
         Ok(())
     } else {
         bad()
+    }
+}
+
+/// --roles: which roles of the backup's roles file --with-roles creates.
+pub fn check_roles_scope(r: Option<&str>) -> Result<String, String> {
+    match r.unwrap_or("referenced") {
+        s @ ("referenced" | "all") => Ok(s.to_string()),
+        s => Err(format!("--roles '{s}': use referenced (roles this database uses; default) or all")),
     }
 }
 
@@ -415,7 +460,17 @@ fn cmd_db_restore(cx: &mut Ctx) -> Out {
         check_time(t)?;
     }
     drop(c);
-    queue(cx, &db, "SELECT pgbx.restore($1, coalesce(($2::text)::timestamptz, now()))", &[&into, &time])
+    if cx.a.has("key-file") {
+        return Err("--key-file is for --from-s3 restores; on this server the worker uses pgbx.encryption_key_file".into());
+    }
+    if !cx.a.has("with-roles") {
+        if cx.a.has("roles") {
+            return Err("--roles works with --with-roles".into());
+        }
+        return queue(cx, &db, "SELECT pgbx.restore($1, coalesce(($2::text)::timestamptz, now()))", &[&into, &time]);
+    }
+    let roles = check_roles_scope(cx.a.get("roles"))?;
+    queue(cx, &db, "SELECT pgbx.restore($1, coalesce(($2::text)::timestamptz, now()), true, $3)", &[&into, &time, &roles])
 }
 
 /// doctor() rows that give advice (a better schedule, estimates still settling) rather than report a fault
@@ -619,7 +674,18 @@ fn main() {
         println!("{HELP}");
         return;
     }
+    // archive_command / restore_command: the exit code is the protocol (no JSON, no profile, no tunnel)
+    if a.cmd == "wal-push" {
+        std::process::exit(pitrcmd::wal_push_main(&a));
+    }
+    if a.cmd == "wal-get" {
+        std::process::exit(pitrcmd::wal_get_main(&a));
+    }
     let mut a = a;
+    // `pgbx setup --pitr` (0.6 pre-release spelling) is `pgbx setup pitr`
+    if a.cmd == "setup" && a.has("pitr") && a.pos.is_empty() {
+        a.pos.push("pitr".into());
+    }
     let cmd = a.cmd.clone();
     let lvl = level(&cmd, &a);
     let setup_sub = if cmd == "setup" { a.pos.first().cloned() } else { None };
@@ -665,10 +731,14 @@ fn main() {
         "diagnose" => cmd_diagnose(&mut cx),
         "ui" => ui::run(&mut cx),
         "serve" => serve::run(&mut cx),
+        "metrics" => metrics::cmd(&mut cx),
+        "decrypt" => decrypt::cmd(&mut cx),
+        "pitr" => pitrcmd::pitr(&mut cx),
         "setup" => match setup_sub.as_deref() {
             Some("client") => setup_client::run(&mut cx),
+            Some("pitr") => pitrcmd::setup_pitr(&mut cx),
             Some("server") | None => setup::run(&mut cx),
-            Some(x) => Err(format!("unknown setup '{x}' (pgbx setup server | pgbx setup client)")),
+            Some(x) => Err(format!("unknown setup '{x}' (pgbx setup server | pgbx setup client | pgbx setup pitr)")),
         },
         _ => unreachable!(),
     };
@@ -687,8 +757,12 @@ fn main() {
     }
     let v = vars::scrub_value(&v); // no password or expanded secret ever reaches output
     let ok = v["ok"] == true;
-    if as_json {
-        println!("{v}");
+    if as_json && !(cmd == "decrypt" && ok && v["out"].is_null()) {
+        println!("{v}"); // (decrypt without --out: stdout carries the plaintext dump)
+    } else if cmd == "decrypt" && ok {
+        eprintln!("pgbx decrypt: {} bytes decrypted", v["bytes"]);
+    } else if cmd == "metrics" && ok {
+        print!("{}", scalar(&v["text"]));
     } else if cmd == "link" && ok {
         println!("{}", scalar(&v["url"])); // bare URL so URL=$(pgbx link) works
     } else if cmd == "doctor" && v.get("checks").is_some() {
@@ -815,6 +889,34 @@ mod tests {
         assert_eq!(level("jobs", &p(&["jobs", "cancel", "7"])), Level::Guarded);
         assert_eq!(level("serve", &p(&["serve", "--no-open"])), Level::ReadOnly);
         assert_eq!(level("serve", &p(&["serve", "--allow-safe"])), Level::Safe);
+    }
+
+    #[test]
+    fn extras_flags_and_levels() {
+        let a = p(&["db-restore", "--db", "shop", "--into", "s2", "--with-roles", "--roles", "all", "--key-file", "/k"]);
+        assert!(a.has("with-roles") && a.get("roles") == Some("all") && a.get("key-file") == Some("/k"));
+        assert_eq!(check_roles_scope(None).unwrap(), "referenced");
+        assert_eq!(check_roles_scope(Some("all")).unwrap(), "all");
+        assert!(check_roles_scope(Some("everyone")).is_err());
+        assert_eq!(level("metrics", &p(&["metrics"])), Level::ReadOnly);
+        assert_eq!(level("decrypt", &p(&["decrypt", "--key-file", "k"])), Level::ReadOnly);
+        assert_eq!(level("retention", &p(&["retention", "--gfs", "7d,4w,12m"])), Level::Guarded);
+        assert!(parse_args(["mcp"].iter().map(|s| s.to_string())).is_err(), "no MCP server");
+    }
+
+    #[test]
+    fn pitr_commands_and_levels() {
+        assert_eq!(level("pitr", &p(&["pitr", "status"])), Level::ReadOnly);
+        assert_eq!(level("pitr", &p(&["pitr", "list", "--conf", "/c"])), Level::ReadOnly);
+        assert_eq!(level("pitr", &p(&["pitr", "backup-now"])), Level::Safe);
+        assert_eq!(level("pitr", &p(&["pitr", "restore", "--time", "latest", "--target", "/d"])), Level::Safe);
+        assert_eq!(level("pitr", &p(&["pitr", "restore", "--target", "/d", "--yes-replace-whole-server"])), Level::Destructive);
+        assert_eq!(level("pitr", &p(&["pitr", "expire"])), Level::Guarded);
+        assert_eq!(level("setup", &p(&["setup", "pitr"])), Level::Guarded);
+        assert_eq!(level("setup", &p(&["setup", "--pitr"])), Level::Guarded);
+        assert_eq!(level("wal-push", &p(&["wal-push", "pg_wal/x"])), Level::Safe);
+        let a = p(&["wal-get", "000000010000000000000003", "pg_wal/RECOVERYXLOG", "--conf", "/c"]);
+        assert_eq!((a.pos.len(), a.get("conf")), (2, Some("/c")));
     }
 
     #[test]

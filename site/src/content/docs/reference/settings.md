@@ -27,6 +27,10 @@ All settings below take effect on reload (`SELECT pg_reload_conf();`). Only `sha
 | `pgbx.dump_compression` | `auto` | `pg_dump --compress`; `auto` = zstd:3 with pg_dump 16+, gzip level 6 before; or e.g. `lz4`, `gzip:6`, `none`. The newest installed pg_dump/pg_restore is used |
 | `pgbx.audit_days` | `30` | days of `history` (the audit trail) kept; kept backups, queued/running jobs and the newest row of each kind are never pruned |
 | `pgbx.alert_command` | *(none)* | shell command run for every failed job; JSON on stdin, env `PGBX_DATABASE`, `PGBX_KIND`, `PGBX_JOB_ID`, `PGBX_ERROR`, `PGBX_SERVER` |
+| `pgbx.encryption_key_file` | *(none)* | encrypt every dump and its roles file with AES-256-GCM before upload; a file with 32 random bytes as base64 or hex, owned by `postgres`, `chmod 600` (refused when group or others can read it). Empty = no encryption. See [Encrypting backups](../../guides/encryption/) |
+| `pgbx.backup_role_passwords` | `off` | keep role password hashes in the roles file stored next to each dump (`pg_dumpall --globals-only`; off = `--no-role-passwords`). Turn encryption on first. See [Roles with every backup](../../guides/roles/) |
+| `pgbx.notify` | *(none)* | notification channels **by name**: `slack:NAME, telegram:NAME, webhook:NAME, email:NAME` (a bare `slack` = name `default`). A URL here is refused and never echoed. See [Notifications and metrics](../../guides/notifications/) |
+| `pgbx.notify_secrets_file` | *(none)* | the URLs / tokens / SMTP settings of the `pgbx.notify` channels (`slack.ops.url = ...`); owned by `postgres`, `chmod 600` (refused when group or others can read it). Never put a URL in a setting: settings are readable by every role |
 
 ## Resource caps
 
@@ -111,6 +115,24 @@ Set it per database with `SELECT pgbx.configure(load_gate => 'on')` or `pgbx loa
 | `pgbx.busy_loadavg` | `0.8` | busy above this 1-minute load average per core (Linux; 0 = ignore) |
 | `pgbx.gate_manual_jobs` | `warn` | `backup_now()` / `verify_now()` / `restore()`: `warn` = a NOTICE that it competes with the app, it starts anyway; `defer` = gated like scheduled jobs (restores never are); `off` |
 
+## Point-in-time restore (optional)
+
+Off by default; whole server. `pgbx setup pitr --yes` turns it on (see
+[Point-in-time restore](../../guides/point-in-time-restore/)). `pgbx.pitr` itself is a reload setting, but
+`archive_mode` needs one Postgres restart.
+
+| setting | default | what |
+|---|---|---|
+| `pgbx.pitr` | `off` | archive WAL with `pgbx wal-push` and take scheduled base backups; needs `archive_mode = on` and `archive_command = '<pgbx> wal-push %p'` (both written by `pgbx setup pitr`) |
+| `pgbx.pitr_schedule` | `daily at 01:00` | when base backups are queued (same forms as `set_schedule()`); they run as jobs of the server-wide queue |
+| `pgbx.pitr_retention` | `7 days` | restore window: every base backup needed to reach any moment of the last N days is kept (the newest one that stopped before the cutoff included), the newest base backup always; older base backups and WAL before the oldest kept backup's start are deleted (`.history` files kept) |
+| `pgbx.wal_queue_max` | `4GB` | when WAL waiting to be archived exceeds this (S3 down), `wal-push` **drops** WAL instead of filling the disk; each drop is logged and recorded as a **gap**; `off` = never drop |
+| `pgbx.wal_gap_margin` | `60s` | restores are also refused this long before a gap's last safe moment |
+| `pgbx.wal_alert_after` | `15 min` | alert when the oldest WAL waiting to be archived is older than this |
+| `pgbx.wal_alert_size` | `2GB` | alert when this much WAL waits to be archived; `off` = never |
+| `pgbx.work_dir` | `<data_directory>/../pgbx` | PITR state: `pgbx-wal.conf` (0600, no keys: only the credentials file's path), spool, drop log; must be **outside** the data directory |
+| `pgbx.cli_path` | `/usr/local/bin/pgbx` or `/usr/bin/pgbx` | the `pgbx` program the worker runs for base backups and gap uploads |
+
 ## Per-database defaults
 
 Stored in `pgbx.config`, one row per database. Change them with SQL, not settings.
@@ -124,3 +146,4 @@ Stored in `pgbx.config`, one row per database. Change them with SQL, not setting
 | data scope | every row |
 | path | database name |
 | load gate | the server's `pgbx.load_gate` |
+| GFS retention | none (`set_retention(gfs => '7d,4w,12m')`) |

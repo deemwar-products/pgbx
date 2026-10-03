@@ -25,6 +25,8 @@ pub const WRITE_FUNCTIONS: &[&str] = &[
     "pgbx.resume()",
     "pgbx.backup_now()",
     "pgbx.restore(text, timestamptz)",
+    "pgbx.restore(text, timestamptz, bool, text)",
+    "pgbx.set_retention(int, int, text)",
     "pgbx.configure(text, int, int, bool, text)",
     "pgbx.configure(text, int, int, bool, text, text)",
     "pgbx.cancel(bigint)",
@@ -42,6 +44,7 @@ pub enum Route {
     Health,
     Queue,
     Load,
+    Metrics,
     NotFound,
     MethodNotAllowed,
 }
@@ -57,6 +60,7 @@ pub fn route(method: &str, target: &str) -> Route {
         "/api/health" => Route::Health,
         "/api/queue" => Route::Queue,
         "/api/load" => Route::Load,
+        "/metrics" => Route::Metrics,
         "/api/timeline" => {
             let days = query_param(query, "days").and_then(|d| d.parse::<i32>().ok()).unwrap_or(30).clamp(1, 3650);
             Route::Timeline { days }
@@ -153,7 +157,10 @@ fn api_overview(cx: &Ctx) -> Result<Value, String> {
 pub(crate) fn overview_with(c: &mut Client) -> Result<Value, String> {
     let who = one(c, "SELECT current_user AS role, current_setting('default_transaction_read_only') AS read_only, \
                             now() AS server_time, current_setting('pgbx.server_name', true) AS server_name", &[])?;
-    Ok(json!({"ok": true, "connection": who, "databases": rows(c, "SELECT * FROM pgbx.overview()", &[])?}))
+    // point-in-time restore window (optional; absent on older extension versions)
+    let pitr = one(c, "SELECT enabled, state, restorable_from, wal_archived_until, last_base_backup_at, open_gaps, gaps \
+                            FROM pgbx.pitr_status()", &[]).unwrap_or(Value::Null);
+    Ok(json!({"ok": true, "connection": who, "pitr": pitr, "databases": rows(c, "SELECT * FROM pgbx.overview()", &[])?}))
 }
 
 /// History rows with a display kind (download_url / scope are recorded as 'config').
@@ -239,14 +246,15 @@ fn api_health(cx: &Ctx) -> Result<Value, String> {
     let mut c = admin(cx)?;
     let checks = rows(&mut c, "SELECT * FROM pgbx.doctor()", &[])?;
     let healthy = checks.iter().all(|r| r["ok"] == true);
-    Ok(json!({"ok": true, "healthy": healthy, "checks": checks}))
+    let pitr = one(&mut c, "SELECT * FROM pgbx.pitr_status()", &[]).unwrap_or(Value::Null);
+    Ok(json!({"ok": true, "healthy": healthy, "checks": checks, "pitr": pitr}))
 }
 
 // ---------------------------------------------------------------- http
 
 fn respond(s: &mut TcpStream, code: u16, ctype: &str, body: &[u8], extra: &str) {
     let reason = match code {
-        200 => "OK", 400 => "Bad Request", 403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed",
+        200 => "OK", 503 => "Service Unavailable", 400 => "Bad Request", 403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed",
         502 => "Bad Gateway", _ => "Error",
     };
     let head = format!(
@@ -303,6 +311,14 @@ fn handle(mut s: TcpStream, cx: &Ctx, loopback: bool) {
         Route::Health => json_resp(&mut s, api_health(cx)),
         Route::Queue => json_resp(&mut s, api_queue(cx)),
         Route::Load => json_resp(&mut s, api_load(cx)),
+        // Prometheus text exposition (read-only, same login as the UI); pgbx_up 0 + HTTP 503 when unreadable
+        Route::Metrics => {
+            let (ok, text) = match admin(cx) {
+                Ok(mut c) => crate::metrics::scrape(&mut c),
+                Err(e) => (false, format!("# pgbx: {}\n# TYPE pgbx_up gauge\npgbx_up 0\n", e.replace('\n', " "))),
+            };
+            respond(&mut s, if ok { 200 } else { 503 }, "text/plain; version=0.0.4; charset=utf-8", text.as_bytes(), "")
+        }
     }
 }
 
@@ -365,6 +381,8 @@ mod tests {
         assert_eq!(route("GET", "/api/health"), Route::Health);
         assert_eq!(route("GET", "/api/queue"), Route::Queue);
         assert_eq!(route("GET", "/api/load"), Route::Load);
+        assert_eq!(route("GET", "/metrics"), Route::Metrics);
+        assert_eq!(route("POST", "/metrics"), Route::MethodNotAllowed);
         assert_eq!(route("GET", "/api/timeline"), Route::Timeline { days: 30 });
         assert_eq!(route("GET", "/api/timeline?days=7"), Route::Timeline { days: 7 });
         assert_eq!(route("GET", "/api/timeline?days=0"), Route::Timeline { days: 1 });

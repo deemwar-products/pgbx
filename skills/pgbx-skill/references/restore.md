@@ -1,7 +1,7 @@
 # Restore — recipes
 
 Every restore goes into a NEW database = safe mutation. Swapping it in for the live database is
-**destructive** (RST-R-2, explicit approval). There is no whole-server restore.
+**destructive** (RST-R-2, explicit approval). Whole-server restore to a moment is the optional point-in-time restore (`pitr.md`, 0.6.0+).
 
 **User-visible formatting (family default):** "Restored <what> as of <time> into <where>; <what was untouched>."
 
@@ -75,3 +75,26 @@ Omit `--time` for the newest dump; `--backup <key>` picks one exactly. Needs `pg
 `--time` without a UTC offset → add `Z`/`+00`.
 
 **User-visible formatting:** "Restored myapp as of <taken_at> into myapp_restored on <server>; nothing else touched."
+
+### RST-R-5: Restore with the roles it needs (owners and grants kept)
+
+**When to use:** "restore with roles", "role does not exist after restore", "restore onto a new server with users".
+
+**Command:**
+```bash
+pgbx db-restore --db myapp --into myapp_restored --with-roles --wait --json          # same server
+pgbx db-restore --from-s3 --db myapp --into myapp --with-roles [--roles all] \
+  [--key-file /path/backup.key] <s3 flags> --json                                    # new server
+```
+Fallback (SQL): `psql -XAtq -d myapp -c "SELECT pgbx.restore('myapp_restored', with_roles => true)"`
+Missing roles are created from the backup's roles file; existing roles are never changed. `--roles referenced`
+(default) = only roles this database uses; `all` = every role of the old server (ask first on a shared server).
+Passwords are not in the file unless `pgbx.backup_role_passwords = on`: tell the user which roles need one.
+Encrypted backups (`pgbx.encryption_key_file`): same server needs nothing; `--from-s3` needs `--key-file`.
+
+**Expected response:** `roles: {"created":[..],"existing":[..],"out_of_scope":[..],"skipped":[..],"failed":[..]}`.
+
+**Common errors:** `roles file ... (backups taken before pgbx 0.6 have none ...)` → restore without `--with-roles`;
+`this backup is encrypted: give the key` → add `--key-file`; `wrong key, or the file was modified` → other key file.
+
+**User-visible formatting:** "Restored into <db>; created roles <list> (no passwords); left existing <list> unchanged."

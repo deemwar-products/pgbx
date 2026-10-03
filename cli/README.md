@@ -20,7 +20,13 @@ pgbx schedule [TEXT]   pgbx retention [--max-backups N] [--max-days N]   pgbx pa
 pgbx scope [--include P1,P2] [--exclude P1,P2] [--reset]   pgbx verify-schedule TEXT|never   pgbx overview
 pgbx link [--backup-id N] [--expires '1 hour']   (prints only the URL; never paste it into chat)
 pgbx skill install [--no-codex] | uninstall | where      pgbx --version
-pgbx ui [--listen 127.0.0.1:8432] [--strict]    (read-only audit web UI)
+pgbx ui [--listen 127.0.0.1:8432] [--strict]    (read-only audit web UI + Prometheus GET /metrics)
+pgbx metrics                                   pgbx decrypt --key-file F [--in FILE] [--out FILE]
+pgbx db-restore ... [--with-roles [--roles referenced|all]] [--key-file F]   pgbx retention ... [--gfs 7d,4w,12m|off]
+pgbx setup pitr [--yes]                        optional whole-server point-in-time restore (one restart)
+pgbx pitr status | list | backup-now [--wait]
+pgbx pitr restore --time TS|latest --target DIR (--conf F | <s3 flags> [--system-id N]) [--yes-replace-whole-server]
+pgbx wal-push %p [--conf F]   pgbx wal-get %f %p --conf F      (archive_command / restore_command)
 ```
 `--time` must carry a UTC offset (`+00`, `Z`). Policy commands show the current value when given no arguments.
 Every command takes `--json` (one JSON object on stdout, always with `ok`, `command`, `safety`) and exits non-zero on
@@ -31,10 +37,12 @@ PGPASSWORD honoured), `--admin-db`, `--timeout SECS` for `--wait`.
 
 | level | commands | rule |
 |---|---|---|
-| read-only | `status`, `list`, `backups --from-s3`, `doctor`, `logs`, `overview`, `ui`, policy commands with no arguments | never mutate anything |
-| safe | `now`, `verify`, `db-restore`, `resume`, `link`, `schedule TEXT`, `skill`, `db-restore --from-s3` | queue jobs / write only somewhere new; `db-restore` refuses an existing database or the source |
-| guarded | `pause`, lowering `retention`, narrowing `scope`, `verify-schedule never` | refused without `--yes` (with an explanation of what would be lost) |
-No command overwrites a live database: every restore goes into a NEW database.
+| read-only | `status`, `list`, `backups --from-s3`, `doctor`, `logs`, `overview`, `ui`, `metrics`, `decrypt`, `pitr status`, `pitr list`, policy commands with no arguments | never mutate anything |
+| safe | `now`, `verify`, `db-restore`, `resume`, `link`, `schedule TEXT`, `skill`, `db-restore --from-s3`, `pitr backup-now`, `pitr restore` (empty directory) | queue jobs / write only somewhere new; `db-restore` refuses an existing database or the source |
+| guarded | `pause`, lowering `retention` or changing GFS, narrowing `scope`, `verify-schedule never`, `setup pitr` | refused without `--yes` (with an explanation of what would be lost) |
+| destructive | `pitr restore --yes-replace-whole-server` | only onto a STOPPED server's data directory, which is moved aside (never deleted) |
+No command overwrites a live database: every restore goes into a NEW database (or, for point-in-time restore, an empty
+directory).
 
 ## Diagnose (Postgres down, disk full, pg_wal growing)
 

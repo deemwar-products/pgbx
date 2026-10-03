@@ -121,3 +121,25 @@ so and prefer waiting a week. `refusing without --yes` → the schedule is never
 
 **User-visible formatting:** "Quietest: <start_at> (<score>x vs <current_score>x now, <confidence> confidence); apply
 with: <apply_sql>". Never apply on your own.
+
+### POL-R-7: GFS retention (keep daily / weekly / monthly)
+
+**When to use:** "keep monthly backups for a year", "gfs retention", "grandfather father son".
+
+**Command:**
+```bash
+pgbx retention --db myapp --json                                   # shows max_backups, max_days, gfs
+pgbx retention --db myapp --max-backups 7 --gfs 7d,4w,12m --json   # adding GFS where there was none: safe
+pgbx retention --db myapp --gfs off --yes --json                   # changing/clearing an existing GFS: ask first
+```
+Fallback (SQL): `psql -XAtq -d myapp -c "SELECT pgbx.set_retention(gfs => '7d,4w,12m')"`
+GFS also keeps the newest backup per day / ISO week / month (UTC); GFS keepers are never deleted by
+max_backups/max_days; the newest backup is always kept. The span must fit `pgbx.max_days_limit` (server
+setting: raising it is the human's call).
+
+**Expected response:** `keeping at most 7 backups and nothing older than 90 days, plus the newest backup per period of gfs 7d,4w,12m …`.
+
+**Common errors:** `reaches back N days, beyond this server's limit` → ask the human to raise `pgbx.max_days_limit`;
+`should look like 7d, 4w, 12m or 2y` → fix the spec.
+
+**User-visible formatting:** "Keeping: <n> newest + newest per day (7), week (4), month (12)."

@@ -47,8 +47,10 @@ Every `--json` reply is one object with at least:
 | `overview` | readonly | `databases[]` (rows of `overview()`) |
 | `doctor` | readonly | `healthy`, `postgres_up`, `checks[]` (`name, ok, detail, fix`); `diagnosis` when Postgres is down (not through an adapter: an `info` row says to run it on the host) |
 | `diagnose [--log F] [--pgdata DIR]` | readonly | `postgres`, `probable_cause`, `evidence[]`, `steps[]`, `facts`; on the database host only (refused with an adapter profile) |
-| `ui [--listen 127.0.0.1:8432] [--strict]` | readonly | serves the read-only [audit UI](../../guides/audit-ui/); `GET` only |
+| `ui [--listen 127.0.0.1:8432] [--strict]` | readonly | serves the read-only [audit UI](../../guides/audit-ui/) (with a point-in-time restore card) and Prometheus `GET /metrics`; `GET` only |
 | `serve [--listen 127.0.0.1:0] [--no-open] [--allow-safe]` | readonly / safe (`--allow-safe`) | the local [web app](../serve/): overview, database detail, restore helper, read-only query, health; per-run token; safe actions only with `--allow-safe`; start line: `url`, `listen`, `warnings` |
+| `metrics` | readonly | `text`: one Prometheus scrape (text mode prints just the metrics); see [Notifications and metrics](../../guides/notifications/) |
+| `decrypt --key-file F [--in FILE] [--out FILE]` | readonly | decrypts an encrypted dump (e.g. from a download link); stdin → stdout by default (then the summary goes to stderr); `bytes`, `out` |
 | `logs [--lines N]` | readonly | `recent_failures[]` |
 | `jobs` | readonly | `jobs[]` (`database, job_id, kind, trigger, state, position, slot, detail, progress, eta_start, eta_finish, est_bytes, done_bytes`), `slots`; text mode: one line per job |
 | `jobs cancel ID [--db X] --yes` | guarded | `database`, `job_id`, `message`; `--db` may be left out when the id is unique in the queue |
@@ -57,15 +59,16 @@ Every `--json` reply is one object with at least:
 | `schedule suggest [--db X] [--hours N] [--apply [--yes]]` | readonly / safe (`--apply`) | `suggestion` (row of `suggest_window()`), `apply_sql`, `applied`; never applied unless asked: `--apply` asks y/N on a terminal, else needs `--yes` |
 | `now [--db X] [--wait]` | safe | `database`, `job_id`, `state`, `watch`; with `--wait`: `job` |
 | `verify [--db X] [--wait]` | safe | same as `now` |
-| `db-restore --db X --into NEWDB [--time TS] [--wait]` | safe | same as `now`; refuses an existing database or the source |
-| `db-restore --from-s3 --db X --into NEWDB [--backup KEY \| --time TS] <s3 flags>` | safe | `restored_into`, `key`, `bytes`; works without the extension on the target |
+| `db-restore --db X --into NEWDB [--time TS] [--with-roles [--roles referenced\|all]] [--wait]` | safe | same as `now`; refuses an existing database or the source; `--with-roles` creates the missing roles from the backup's roles file first and keeps owners |
+| `db-restore --from-s3 --db X --into NEWDB [--backup KEY \| --time TS] [--with-roles [--roles R]] [--key-file F] <s3 flags>` | safe | `restored_into`, `key`, `bytes`, `encrypted`, `roles` (`created, existing, out_of_scope, skipped, failed`); works without the extension on the target; `--key-file` = the source's `pgbx.encryption_key_file` for encrypted dumps |
 | `resume` | safe | `database`, `message` |
 | `link [--backup-id N] [--expires '1 hour']` | safe | `database`, `url`, `expires` (text mode prints only the URL) |
 | `schedule [TEXT]` | readonly / safe | `database`, `schedule` |
-| `retention [--max-backups N] [--max-days N] [--yes]` | readonly / guarded | `database`, `max_backups`, `max_days` |
+| `retention [--max-backups N] [--max-days N] [--gfs 7d,4w,12m\|off] [--yes]` | readonly / guarded | `database`, `max_backups`, `max_days`, `gfs`; lowering, or changing / clearing an existing GFS spec, needs `--yes` (adding GFS where there was none does not) |
 | `pause --reason T --yes` | guarded | `database`, `message` |
 | `scope [--include P1,P2] [--exclude P1,P2] [--reset] [--yes]` | readonly / guarded | `database`, `data_scope` |
 | `verify-schedule TEXT\|never [--yes]` | safe / guarded (`never`) | `database`, result |
+| `setup pitr [--yes]` (alias `setup --pitr`) | guarded | without `--yes`: `plan`, `current`; with it: `written`, `restart_needed`, `next`. ALTER SYSTEM `archive_mode = on`, `archive_command = '<this pgbx> wal-push %p'`, `pgbx.pitr = on`; refuses an `archive_command` pgbx did not write; needs a superuser; restart Postgres once |
 | `skill install [--no-codex] \| uninstall \| where` | safe | `version`, `installed_to`, `files` / `removed`, `skipped` |
 | `query "SQL" [--db D] [--max-rows 1000] [--timeout 30s]` | readonly | `columns[]` (`name, type`), `rows[]`, `row_count`, `truncated`, `database`, `user` |
 | `memories export [FILE\|-] [--db D]` | readonly | `file`, `connection`, `databases[]`, `files`; one JSON bundle of `~/pgbx/<connection>/<db>/{memories,tables}.md` |
@@ -76,6 +79,23 @@ Every `--json` reply is one object with at least:
 | `profile list` / `profile show NAME` | readonly | `default`, `profiles[]`, `adapters`, `secrets` / `profile` (passwords masked) |
 | `profile remove NAME` / `profile use NAME` | safe | `removed` / `default` |
 | `--version` | — | `{"ok": true, "version": "..."}` |
+
+## Point-in-time restore (optional, 0.6.0)
+
+| command | safety | what |
+|---|---|---|
+| `pitr status` | readonly | `pitr` (row of `pitr_status()`) |
+| `pitr list (--conf F \| <s3 flags> [--system-id N])` | readonly | `system_id`, `restorable_from`, `base_backups[]`, `gaps[]`, read straight from S3 |
+| `pitr backup-now [--wait]` | safe | `job_id`; queues a base backup (superuser); with `--wait`: `job` |
+| `pitr restore --time TS\|latest --target DIR (--conf F \| <s3 flags> [--system-id N])` | safe | `base_backup`, `data_directory`, `mode`, `start_command`, `restore_conf`, `bytes`, `mb_per_s`; restores into an **empty** directory and never starts Postgres; refuses a time inside a WAL gap |
+| `… --yes-replace-whole-server` | destructive | `--target` is a **stopped** server's data directory; it is moved aside to `<dir>.pgbx-replaced-<time>` (not deleted); refused while Postgres runs |
+| `wal-push %p [--conf F]` | — | `archive_command`: exit 0 = archived (or deliberately dropped under `pgbx.wal_queue_max`), otherwise Postgres retries |
+| `wal-get %f %p --conf F` | — | `restore_command`: 0 delivered (verified), 1 not in the archive, 127 hard error |
+| `pitr backup [--expire] / expire / publish-gaps --conf F` | — | run by the worker (a base backup job runs `pitr backup --expire --json`) |
+
+`--conf` is `<pgbx.work_dir>/pgbx-wal.conf` (written by the worker; S3 settings and the credentials file's **path**,
+never keys). With the server gone, use the S3 flags below instead. See
+[Point-in-time restore](../../guides/point-in-time-restore/).
 
 ## S3 flags (`--from-s3`)
 
@@ -88,8 +108,9 @@ Every `--json` reply is one object with at least:
 | `--credentials-file F` | `access_key_id=` / `secret_access_key=` lines; never printed |
 
 `db-restore --from-s3` creates `--into` (refusing if it exists) on the server of the current connection
-(profile, `--url` or `--host/--port/--user`), then streams the dump into `pg_restore --no-owner`, resuming
-downloads with HTTP Range. `pg_restore` gets the password through its environment, never its arguments.
+(profile, `--url` or `--host/--port/--user`), then streams the dump into `pg_restore --no-owner` (owners kept with
+`--with-roles`), resuming downloads with HTTP Range; `--key-file` decrypts an encrypted dump in the stream (plain
+dumps pass through). `pg_restore` gets the password through its environment, never its arguments.
 Example: [Disaster recovery](../../guides/disaster-recovery/).
 
 ## Profiles

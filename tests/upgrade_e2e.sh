@@ -61,7 +61,11 @@ check "template1 updated at worker start" "$(ver template1)" "$want"
 P -c "CREATE DATABASE born" >/dev/null
 check "a new database is born at $want" "$(ver born)" "$want"
 
-if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
+pg_major() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n 's/^PG_MAJOR=//p'; }
+if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1 && [ "$(pg_major "$PREV")" != "$(pg_major "$NEW")" ]; then
+  # one data directory is started by both images: they must be the same PostgreSQL major
+  echo "## 2. skipped: $PREV is PostgreSQL $(pg_major "$PREV"), $NEW is $(pg_major "$NEW") (tests/pitr_e2e.sh section 6 compares the 0.5.0 -> 0.6.0 catalog on any major)"
+elif [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
   echo "## 2. previous release ($PREV) -> $want: the update script"
   cleanup; start "$PREV" pgbx || { echo "previous server not up"; exit 1; }
   for _ in $(seq 60); do [ -n "$(ver postgres)" ] && break; sleep 2; done
@@ -73,7 +77,7 @@ if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
   for _ in $(seq 60); do [ "$(ver prev)" = "$want" ] && [ "$(ver template1)" = "$want" ] && break; sleep 1; done
   check "worker updated prev $old -> $want" "$(ver prev)" "$want"
   check "template1 updated" "$(ver template1)" "$want"
-  P -c "CREATE DATABASE fresh" >/dev/null
+  P -c "CREATE DATABASE fresh TEMPLATE template0" >/dev/null   # a FRESH install (template1 was updated, not installed)
   for _ in $(seq 60); do [ -n "$(ver fresh)" ] && break; sleep 1; done
   defs="SELECT md5(string_agg(pg_get_functiondef(p.oid), '' ORDER BY p.proname, p.oid::regprocedure::text))
         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pgbx'"
@@ -84,7 +88,7 @@ if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
   check "updated tables and columns = fresh install" "$(P -d prev -c "$cols")" "$(P -d fresh -c "$cols")"
   acls="SELECT md5(coalesce((SELECT string_agg(c.relname || ':' || coalesce(c.relacl::text, '-'), ',' ORDER BY c.relname)
                              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'pgbx'), '')
-                || coalesce((SELECT string_agg(p.oid::regprocedure::text || ':' || coalesce(p.proacl::text, '-'), ',' ORDER BY 1)
+                || coalesce((SELECT string_agg(p.oid::regprocedure::text || ':' || coalesce(p.proacl::text, '-'), ',' ORDER BY p.oid::regprocedure::text)
                              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pgbx'), ''))"
   check "updated privileges = fresh install" "$(P -d prev -c "$acls")" "$(P -d fresh -c "$acls")"
   if [ "$(P -d prev -c "$acls")" != "$(P -d fresh -c "$acls")" ]; then
@@ -92,7 +96,32 @@ if [ -n "$PREV" ] && docker image inspect "$PREV" >/dev/null 2>&1; then
        UNION ALL SELECT c.relname || ':' || coalesce(c.relacl::text, '-') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'pgbx' ORDER BY 1"
     diff <(P -d prev -c "$q") <(P -d fresh -c "$q") | head -20
   fi
+  # the whole catalog: functions (definition + ACL), columns (type, not null, default), constraints, relations (+ ACL),
+  # views, indexes; one line each, compared as text
+  cat_sql="SELECT 'F ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' || md5(pg_get_functiondef(p.oid))
+                 || ' acl=' || coalesce((SELECT string_agg(a::text, ',' ORDER BY a::text) FROM unnest(p.proacl) a), '-')
+             FROM pg_proc p WHERE p.pronamespace = 'pgbx'::regnamespace
+           UNION ALL SELECT 'C ' || c.relname || '.' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod) || ' ' || a.attnotnull
+                 || ' ' || coalesce(pg_get_expr(d.adbin, d.adrelid), '-')
+             FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+             LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum WHERE c.relnamespace = 'pgbx'::regnamespace
+           UNION ALL SELECT 'K ' || conrelid::regclass::text || ' ' || conname || ' ' || pg_get_constraintdef(oid)
+             FROM pg_constraint WHERE connamespace = 'pgbx'::regnamespace
+           UNION ALL SELECT 'R ' || c.relname || ' ' || c.relkind::text || ' acl='
+                 || coalesce((SELECT string_agg(a::text, ',' ORDER BY a::text) FROM unnest(c.relacl) a), '-')
+             FROM pg_class c WHERE c.relnamespace = 'pgbx'::regnamespace
+           UNION ALL SELECT 'V ' || viewname || ' ' || md5(definition) FROM pg_views WHERE schemaname = 'pgbx'
+           UNION ALL SELECT 'I ' || indexname || ' ' || indexdef FROM pg_indexes WHERE schemaname = 'pgbx' ORDER BY 1"
+  if diff <(P -d prev -c "$cat_sql") <(P -d fresh -c "$cat_sql") > /tmp/pgbx-upgrade-cat.diff; then d=same; else d=different; head -20 /tmp/pgbx-upgrade-cat.diff; fi
+  check "whole catalog: updated == fresh ($(P -d fresh -c "$cat_sql" | wc -l | tr -d ' ') objects)" "$d" same
+  rm -f /tmp/pgbx-upgrade-cat.diff
   check "doctor() has long_running_job after the update" "$(P -c "SELECT count(*) FROM pgbx.doctor() WHERE name='long_running_job'")" 1
+  # 0.6 extras on an updated database: new signatures, old calls still work, privileges as on a fresh install
+  check "old 2-argument set_retention still callable" "$(P -d prev -c "SELECT pgbx.set_retention(6, 30) LIKE 'keeping at most 6%'")" t
+  check "set_retention(gfs) after the update" "$(P -d prev -c "SELECT pgbx.set_retention(gfs => '7d') LIKE '%gfs 7d%'")" t
+  check "status() shows gfs after the update" "$(P -d prev -c "SELECT retention LIKE '%gfs 7d' FROM pgbx.status()")" t
+  check "admin may call restore(with_roles)" "$(P -d prev -c "SELECT has_function_privilege('pgbx_admin', 'pgbx.restore(text, timestamptz, bool, text)', 'EXECUTE')")" t
+  check "PUBLIC may not" "$(P -d prev -c "SELECT has_function_privilege('public', 'pgbx.restore(text, timestamptz, bool, text)', 'EXECUTE')")" f
   id=$(P -d prev -c "SELECT pgbx.backup_now()"); check "backup after the update" "$(wait_job prev "$id" pgbx)" done
 else
   echo "## 2. skipped (set PGBX_PREV_IMAGE to an image of the previous pgbx release to test the update script)"

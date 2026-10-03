@@ -99,15 +99,21 @@ pgbx.alert_command    = 'curl -s -X POST -d @- https://hooks.example/alert'   # 
 pgbx.dump_compression = 'auto'
 pgbx.audit_days       = 30                       # history (audit trail) kept; kept backups never pruned
 ```
-No `archive_mode` and no WAL archiving are needed: pgbx does per-database backups only. `doctor()` reports inactive `replication_slots` pinning WAL.
+No `archive_mode` and no WAL archiving are needed for the default per-database backups. Optional since 0.6.0:
+client-side encryption (`pgbx.encryption_key_file`), the roles kept next to every dump (`restore(..., with_roles => true)`),
+Slack / Telegram / webhook / email notifications (`pgbx.notify`), Prometheus metrics (`pgbx metrics`, `GET /metrics`),
+GFS retention (`set_retention(gfs => '7d,4w,12m')`) and whole-server **point-in-time restore** (`pgbx setup pitr --yes`,
+one restart; WAL archived by `pgbx wal-push`, base backups as queue jobs, `pgbx pitr restore --time TS --target DIR`;
+see [the guide](site/src/content/docs/guides/point-in-time-restore.md)). `doctor()` reports inactive
+`replication_slots` pinning WAL.
 When Postgres is down, `pgbx diagnose` (and `pgbx doctor`) names the probable cause with tiered steps it never runs.
 Backups land at `s3://<bucket>/<server_name>/<database>/<UTC timestamp>.dump`.
 
 ## Robustness
 - Streaming: `pg_dump` -> 16 MB multipart parts -> S3, no temp file; restore streams S3 -> `pg_restore`.
 - Each part retried with backoff (~2 min); a restore download resumes from the byte it reached.
-- Half-finished uploads are aborted; orphaned ones are cleaned at startup.
-- A Postgres shutdown never waits on a backup (stops within ~1 s; the job is marked interrupted).
+- Half-finished uploads are aborted; orphaned ones (the worker's own, older than 10 minutes) are cleaned at startup, off the poll loop.
+- A Postgres shutdown never waits on a backup (stops within ~1 s, at most 5 s; the job is marked interrupted).
 
 ## Test
 `tests/run_all.sh` — rebuild, fresh containers, unique S3 folder, then

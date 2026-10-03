@@ -107,7 +107,15 @@ async function overview() {
     ["next", r => ts(r.next_backup_at)], ["size", r => esc(r.last_backup_size)], ["kept", r => esc(r.backups_kept)],
     ["last restore test", r => r.last_verify ? st(r.last_verify) : "<span class=mute>never</span>", 1],
     ["last error", r => r.last_error ? `<span class=bad>${esc(r.last_error)}</span>` : "", 1],
-  ], j.databases, "no databases reported yet (the worker publishes them every poll)") + "</div>";
+  ], j.databases, "no databases reported yet (the worker publishes them every poll)") + "</div>" + pitrCard(j.pitr);
+}
+
+function pitrCard(p) {
+  if (!p || !p.enabled) return `<div class="card"><h2>Point-in-time restore</h2><span class=mute>off (optional, whole server; per-database dumps are the default)</span></div>`;
+  return `<div class="card"><h2>Point-in-time restore: ${st(p.state)}</h2>` +
+    `<p>restorable from <b>${ts(p.restorable_from)}</b> until <b>${ts(p.wal_archived_until)}</b>` +
+    ` · last base backup ${ts(p.last_base_backup_at)} <span class=mute>${ago(p.last_base_backup_at)}</span></p>` +
+    (p.gaps ? `<p class=${p.open_gaps > 0 ? "bad" : "mute"}>WAL gaps (no restore inside): ${esc(p.gaps)}</p>` : "") + "</div>";
 }
 
 const histCols = withDb => [
@@ -153,7 +161,7 @@ async function health() {
   return `<div class="card"><h2 class="${j.healthy ? "ok" : "bad"}">${j.healthy ? "healthy" : "NOT healthy"}</h2>` + table([
     ["check", r => `<span class="dot ${r.ok ? "ok" : "bad"}"></span>${esc(r.name)}`],
     ["detail", r => esc(r.detail), 1], ["fix (shown only — run it yourself)", r => r.fix ? `<code>${esc(r.fix)}</code>` : "", 1],
-  ], j.checks) + "</div>";
+  ], j.checks) + "</div>" + pitrCard(j.pitr);
 }
 
 function suggestCard(name, w) {
