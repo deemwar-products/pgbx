@@ -16,7 +16,9 @@ access_key_id=...
 secret_access_key=...
 ```
 
-Same format as the extension's `pgbx.credentials_file`. `chmod 600` it. pgbx never prints the keys.
+Same format as the extension's `pgbx.credentials_file`. `chmod 600` it. pgbx never prints the keys. On EC2 (or ECS / EKS) with a role
+that may read the bucket, skip the file: leave `--credentials-file` out (or pass `aws-default`) and pgbx uses the
+instance role through IMDSv2 ([details](../../reference/settings/#s3-credentials-without-a-keys-file)).
 
 ## 2. List what is there
 

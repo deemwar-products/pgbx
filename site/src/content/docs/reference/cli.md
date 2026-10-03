@@ -105,7 +105,7 @@ never keys). With the server gone, use the S3 flags below instead. See
 | `--s3-bucket B` | bucket |
 | `--s3-region R` | region (default `us-east-1`) |
 | `--server-name S` | the old server's folder (`pgbx.server_name`) |
-| `--credentials-file F` | `access_key_id=` / `secret_access_key=` lines; never printed |
+| `--credentials-file F` | `access_key_id=` / `secret_access_key=` lines; never printed. Left out or `aws-default`: env keys, web identity, container credentials, then the EC2 instance role via IMDSv2 ([details](../settings/#s3-credentials-without-a-keys-file)) |
 
 `db-restore --from-s3` creates `--into` (refusing if it exists) on the server of the current connection
 (profile, `--url` or `--host/--port/--user`), then streams the dump into `pg_restore --no-owner` (owners kept with

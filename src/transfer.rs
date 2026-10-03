@@ -3,7 +3,10 @@
 //! part is retried with backoff while memory stays bounded at one part, whatever the database size.
 //! Download: if the connection drops, continue from the byte we reached (HTTP Range) into the same writer,
 //! so a running pg_restore never restarts from zero.
+//! Every request goes through `s3auth::fresh`: with temporary credentials (instance role) they are renewed between
+//! parts / resumes, so a transfer longer than the role's session still finishes.
 
+use crate::s3auth::{self, fresh};
 use crate::worker::{log, shutting_down, stop_reason};
 use s3::Bucket;
 use std::collections::VecDeque;
@@ -65,7 +68,10 @@ pub fn retry<T>(what: &str, mut f: impl FnMut() -> Result<T, String>) -> Result<
         }
         match f() {
             Ok(v) => return Ok(v),
-            Err(e) => last = e,
+            Err(e) => {
+                s3auth::note_error(&e); // S3 refused temporary credentials: the next attempt fetches new ones
+                last = e;
+            }
         }
     }
     Err(format!("{what}: gave up after {} retries: {last}", BACKOFF_SECS.len()))
@@ -143,14 +149,14 @@ pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read, kbps: i32, progre
         }
         let t0 = Instant::now();
         retry(&format!("upload {key}"), || {
-            let resp = b.put_object(key, &buf[..n]).map_err(|e| e.to_string())?;
+            let resp = fresh(b)?.put_object(key, &buf[..n]).map_err(|e| e.to_string())?;
             if resp.status_code() / 100 == 2 { Ok(()) } else { Err(format!("HTTP {}", resp.status_code())) }
         })?;
         sample(&UPLOAD_RATES, n as u64, t0.elapsed().as_secs_f64());
         progress(n as u64);
         return Ok(n as u64);
     }
-    let id = retry(&format!("start upload {key}"), || b.initiate_multipart_upload(key, CT).map_err(|e| e.to_string()))?.upload_id;
+    let id = retry(&format!("start upload {key}"), || fresh(b)?.initiate_multipart_upload(key, CT).map_err(|e| e.to_string()))?.upload_id;
     remember_upload(key, &id); // a crash from here on leaves an upload the next worker start aborts
     let result = (|| {
         let mut parts = Vec::new();
@@ -162,7 +168,7 @@ pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read, kbps: i32, progre
             throttle.pace(len); // meanwhile the pipe fills up, which slows pg_dump down
             let t0 = Instant::now();
             let part = retry(&format!("upload {key} part {number}"), || {
-                b.put_multipart_chunk(chunk, key, number, &id, CT).map_err(|e| e.to_string())
+                fresh(b)?.put_multipart_chunk(chunk, key, number, &id, CT).map_err(|e| e.to_string())
             })?;
             sample(&UPLOAD_RATES, len as u64, t0.elapsed().as_secs_f64());
             parts.push(part);
@@ -178,13 +184,13 @@ pub fn upload_stream(b: &Bucket, key: &str, r: &mut impl Read, kbps: i32, progre
             return Err(format!("upload {key}: stopped, {}", stop_reason()));
         }
         retry(&format!("finish upload {key}"), || {
-            let resp = b.complete_multipart_upload(key, &id, parts.clone()).map_err(|e| e.to_string())?;
+            let resp = fresh(b)?.complete_multipart_upload(key, &id, parts.clone()).map_err(|e| e.to_string())?;
             if resp.status_code() / 100 == 2 { Ok(()) } else { Err(format!("HTTP {}", resp.status_code())) }
         })?;
         Ok(total)
     })();
     if result.is_err() {
-        let _ = b.abort_upload(key, &id);
+        let _ = fresh(b).map(|b| b.abort_upload(key, &id));
     }
     forget_upload(&id);
     result
@@ -225,14 +231,21 @@ pub fn take_remembered() -> Vec<(String, String)> {
 /// aborted now goes back on the list for the next start.
 pub fn abort_remembered(b: &Bucket, list: &[(String, String)]) {
     for (key, id) in list {
-        match b.abort_upload(key, id) {
+        match fresh(b).and_then(|b| b.abort_upload(key, id).map_err(|e| e.to_string())) {
             Ok(_) => log(&format!("aborted orphaned upload {key}")),
-            Err(e) if e.to_string().contains("NoSuchUpload") || e.to_string().contains("404") => {}
+            Err(e) if e.contains("NoSuchUpload") || e.contains("404") => {}
             Err(e) => {
                 log(&format!("abort orphaned upload {key}: {e}; retried at the next start"));
                 remember_upload(key, id);
             }
         }
+    }
+}
+
+/// Put a taken list back (S3 could not be reached at all): the next worker start tries again.
+pub fn remember_again(list: &[(String, String)]) {
+    for (key, id) in list {
+        remember_upload(key, id);
     }
 }
 
@@ -279,7 +292,7 @@ pub fn download_resumable<W: Write + Send>(
     b: &Bucket, key: &str, w: &mut W, kbps: i32, progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<u64, String> {
     let size = retry(&format!("stat {key}"), || {
-        let (head, code) = b.head_object(key).map_err(|e| e.to_string())?;
+        let (head, code) = fresh(b)?.head_object(key).map_err(|e| e.to_string())?;
         if code / 100 != 2 {
             return Err(format!("HTTP {code}"));
         }
@@ -302,7 +315,8 @@ pub fn download_resumable<W: Write + Send>(
             inner: w, written: &mut done, dest_failed: &mut dest_failed, throttle: &mut throttle,
             progress: &mut *progress, reported: &mut reported,
         };
-        let r = b.get_object_range_to_writer(key, from, None, &mut t);
+        let fb = fresh(b)?; // a resume may come after the role's session ended
+        let r = fb.get_object_range_to_writer(key, from, None, &mut t);
         let wire = t0.elapsed().saturating_sub(throttle.slept - slept0);
         sample(&DOWNLOAD_RATES, done - from, wire.as_secs_f64());
         if dest_failed {
@@ -327,6 +341,10 @@ pub fn download_resumable<W: Write + Send>(
 /// Only uploads initiated before `before` (the worker's start): one a job of this worker started since is live.
 pub fn abort_orphans(b: &Bucket, prefix: &str, before: chrono::DateTime<chrono::Utc>) {
     let old = |t: &str| chrono::DateTime::parse_from_rfc3339(t).is_ok_and(|t| t < before);
+    let b = match fresh(b) {
+        Ok(b) => b,
+        Err(e) => return log(&format!("list orphaned uploads: {e}")),
+    };
     match b.list_multiparts_uploads(Some(prefix), None) {
         Ok(pages) => {
             for page in pages {

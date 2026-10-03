@@ -21,22 +21,28 @@ BEGIN
 
     name := 's3 settings';
     v := concat_ws(', ', CASE WHEN coalesce(current_setting('pgbx.s3_endpoint', true), '') = '' THEN 'pgbx.s3_endpoint' END,
-                         CASE WHEN coalesce(current_setting('pgbx.s3_bucket', true), '') = '' THEN 'pgbx.s3_bucket' END,
-                         CASE WHEN coalesce(current_setting('pgbx.credentials_file', true), '') = '' THEN 'pgbx.credentials_file' END);
+                         CASE WHEN coalesce(current_setting('pgbx.s3_bucket', true), '') = '' THEN 'pgbx.s3_bucket' END);
     ok := v = '';
     detail := CASE WHEN ok THEN format('bucket %s at %s', current_setting('pgbx.s3_bucket', true), current_setting('pgbx.s3_endpoint', true)) ELSE 'not set: ' || v END;
     fix := CASE WHEN ok THEN NULL ELSE 'set ' || v || ' in postgresql.conf, then SELECT pg_reload_conf()' END;
     RETURN NEXT;
 
-    -- judged from what the worker reported (last_error per database); the file itself is never read here
-    name := 'credentials file';
-    ok := NOT EXISTS (SELECT 1 FROM pgbx.server_overview s
-                      WHERE s.last_error ~* '(credentials_file|access_key_id missing|secret_access_key missing|read [^ ]*credentials)');
-    detail := CASE WHEN coalesce(current_setting('pgbx.credentials_file', true), '') = '' THEN 'pgbx.credentials_file is not set'
-                   WHEN su THEN 'pgbx.credentials_file = ' || current_setting('pgbx.credentials_file', true)
-                   ELSE 'pgbx.credentials_file is set' END
-              || CASE WHEN ok THEN '; the worker reported no problem reading it' ELSE '; the worker cannot read it or it lacks access_key_id= / secret_access_key= lines' END;
-    fix := CASE WHEN ok THEN NULL ELSE 'make the file readable by the postgres OS user (chmod 600, chown postgres) with access_key_id= and secret_access_key= lines' END;
+    -- a keys file: judged from what the worker reported (last_error per database); the file itself is never read here.
+    -- '' / 'aws-default': asked now (pgbx._s3_credentials: which source answers, never a key or token)
+    name := 's3 credentials';
+    IF coalesce(current_setting('pgbx.credentials_file', true), '') IN ('', 'aws-default') THEN
+        SELECT c.ok, c.detail INTO ok, detail FROM pgbx._s3_credentials() c;
+        fix := CASE WHEN ok THEN NULL ELSE 'on EC2: attach an instance profile whose role allows s3:PutObject, s3:GetObject, s3:ListBucket, '
+            || 's3:DeleteObject, s3:AbortMultipartUpload and s3:ListMultipartUploadParts on the bucket (IMDSv2; hop limit 2 when '
+            || 'Postgres runs in a container); or set pgbx.credentials_file to a keys file (access_key_id and secret_access_key lines)' END;
+    ELSE
+        ok := NOT EXISTS (SELECT 1 FROM pgbx.server_overview s
+                          WHERE s.last_error ~* '(credentials_file|access_key_id missing|secret_access_key missing|read [^ ]*credentials)');
+        detail := 'source: file; '
+                  || CASE WHEN su THEN 'pgbx.credentials_file = ' || current_setting('pgbx.credentials_file', true) ELSE 'pgbx.credentials_file is set' END
+                  || CASE WHEN ok THEN '; the worker reported no problem reading it' ELSE '; the worker cannot read it or it lacks access_key_id= / secret_access_key= lines' END;
+        fix := CASE WHEN ok THEN NULL ELSE 'make the file readable by the postgres OS user (chmod 600, chown postgres) with access_key_id= and secret_access_key= lines' END;
+    END IF;
     RETURN NEXT;
 
     name := 'database backups';
@@ -752,6 +758,9 @@ ALTER TABLE pgbx.server_overview ADD COLUMN last_backup_bytes bigint, ADD COLUMN
 -- GFS retention: config.gfs, set_retention(..., gfs) (new signature: drop and create, then the install's lockdown)
 ALTER TABLE pgbx.config ADD COLUMN gfs text;
 CREATE FUNCTION pgbx."_gfs_span"("spec" TEXT) RETURNS INT IMMUTABLE STRICT LANGUAGE c AS 'MODULE_PATHNAME', 'gfs_span_wrapper';
+-- doctor(): which S3 credentials source answers when pgbx.credentials_file is '' / 'aws-default' (instance role)
+CREATE FUNCTION pgbx."_s3_credentials"() RETURNS TABLE ("ok" bool, "detail" TEXT) STRICT LANGUAGE c AS 'MODULE_PATHNAME', 's3_credentials_wrapper';
+REVOKE ALL ON FUNCTION pgbx._s3_credentials() FROM PUBLIC;
 DROP FUNCTION pgbx.set_retention(int, int);
 CREATE OR REPLACE FUNCTION pgbx.set_retention(max_backups int DEFAULT NULL, max_days int DEFAULT NULL, gfs text DEFAULT NULL) RETURNS text
 LANGUAGE plpgsql AS $$

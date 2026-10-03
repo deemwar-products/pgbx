@@ -14,10 +14,41 @@ All settings below take effect on reload (`SELECT pg_reload_conf();`). Only `sha
 | `pgbx.s3_bucket` | *(none)* | bucket for all backups of this server |
 | `pgbx.s3_region` | `us-east-1` | S3 region |
 | `pgbx.server_name` | hostname | top-level folder for this server in the bucket |
-| `pgbx.credentials_file` | `/etc/pgbx/s3.credentials` | `access_key_id=` and `secret_access_key=` lines; readable by `postgres` only |
+| `pgbx.credentials_file` | `/etc/pgbx/s3.credentials` | a keys file: `access_key_id=` and `secret_access_key=` lines, readable by `postgres` only. Or `aws-default` (or empty): no keys file, the AWS default chain, see [S3 credentials without a keys file](#s3-credentials-without-a-keys-file) |
 | `pgbx.socket_dir` | `/var/run/postgresql` | Unix socket the worker connects through |
 | `pgbx.admin_db` | `postgres` | database that holds `server_overview` (read with `overview()` / `doctor()`) |
 | `pgbx.poll_seconds` | `5` | how often the worker looks for new databases and due jobs (1–3600) |
+
+### S3 credentials without a keys file
+
+`pgbx.credentials_file = 'aws-default'` (`sudo pgbx setup server --credentials aws-default`): the worker, its
+jobs, `wal-push` / `wal-get` and the CLI take credentials from the first of these that is configured. A configured
+source that fails is an error; pgbx does not quietly move on to the next.
+
+| order | source | where it applies |
+|---|---|---|
+| 1 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`) | the CLI only; the extension never takes keys from the Postgres server's environment |
+| 2 | web identity (EKS IRSA): `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` → STS `AssumeRoleWithWebIdentity` | everywhere |
+| 3 | container credentials (ECS task role, EKS Pod Identity): `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` / `_FULL_URI` | everywhere |
+| 4 | the **EC2 instance role through IMDSv2**: a session token from `PUT /latest/api/token`, then the role's credentials with it | everywhere |
+
+- **IMDSv2 only.** If the metadata service gives no session token (an IMDSv1-only endpoint), pgbx refuses and
+  says so; it never falls back to IMDSv1. `AWS_EC2_METADATA_SERVICE_ENDPOINT` moves the endpoint,
+  `AWS_EC2_METADATA_DISABLED=true` skips it. Postgres in a container on EC2 needs the instance's metadata
+  hop limit at 2.
+- **Temporary credentials** are cached per process and fetched again 5 minutes before they expire, or when S3
+  refuses them (403 `ExpiredToken`). A long multipart upload or a resumed download takes the new ones between
+  parts, so it runs across a refresh. The worker logs `s3 credentials from instance role via IMDSv2 (role NAME),
+  temporary, valid until ...` each time; no key, secret or token is ever logged or stored.
+- The role needs, on the bucket: `s3:ListBucket` (and `s3:ListBucketMultipartUploads` for the crash clean-up) on
+  `arn:aws:s3:::BUCKET`, and `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload`,
+  `s3:ListMultipartUploadParts` on `arn:aws:s3:::BUCKET/*`.
+- `doctor()` → `s3 credentials` shows the source in use (`file`, `env`, `web-identity`, `ecs`, `instance-role`), the
+  role and until when; when nothing works, why and what to attach.
+- Download links (`pgbx.download_url`) signed with temporary credentials stop working when those credentials
+  expire (for an instance role at most ~6 hours), whatever interval was asked for.
+- CLI: `--credentials-file aws-default`, or leave `--credentials-file` out: `backups --from-s3`,
+  `db-restore --from-s3` and `pitr list|restore` then use the same chain.
 
 ## Per-database backups
 
@@ -130,7 +161,7 @@ Off by default; whole server. `pgbx setup pitr --yes` turns it on (see
 | `pgbx.wal_gap_margin` | `60s` | restores are also refused this long before a gap's last safe moment |
 | `pgbx.wal_alert_after` | `15 min` | alert when the oldest WAL waiting to be archived is older than this |
 | `pgbx.wal_alert_size` | `2GB` | alert when this much WAL waits to be archived; `off` = never |
-| `pgbx.work_dir` | `<data_directory>/../pgbx` | PITR state: `pgbx-wal.conf` (0600, no keys: only the credentials file's path), spool, drop log; must be **outside** the data directory |
+| `pgbx.work_dir` | `<data_directory>/../pgbx` | PITR state: `pgbx-wal.conf` (0600, no keys: only the credentials file's path, or `aws-default`), spool, drop log; must be **outside** the data directory |
 | `pgbx.cli_path` | `/usr/local/bin/pgbx` or `/usr/bin/pgbx` | the `pgbx` program the worker runs for base backups and gap uploads |
 
 ## Per-database defaults

@@ -62,7 +62,7 @@ metrics columns `last_backup_bytes`, `failures_total` (failed backups / restores
 ```sql
 pgbx.doctor() RETURNS TABLE (name text, ok bool, detail text, fix text)
 ```
-Who: viewer (runs as `SECURITY DEFINER`). Health checks: `extension loaded`, `s3 settings`, `credentials file`,
+Who: viewer (runs as `SECURITY DEFINER`). Health checks: `extension loaded`, `s3 settings`, `s3 credentials` (the source in use: file, env, web-identity, ecs, instance-role),
 `database backups` (age vs schedule), `restore tests`, `workers`, `archive_mode` (info only; while `pgbx.pitr` is
 off), `replication_slots` and `long_running_job` (a pg_dump / pg_restore running longer than `pgbx.doctor_long_job`).
 With `pgbx.pitr = on` the `archive_mode` row is replaced by `pitr archiving` (archive_mode on, archive_command is

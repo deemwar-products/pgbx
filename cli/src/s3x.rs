@@ -7,6 +7,7 @@
 //!
 //! Portions Copyright (c) 2013-2026, David Steele (pgBackRest), MIT License.
 
+use crate::s3auth;
 use s3::{creds::Credentials, Bucket, Region};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -31,9 +32,17 @@ pub fn read_credentials(file: &str) -> Result<(String, String), String> {
     crate::s3restore::parse_credentials(&text)
 }
 
+/// Credentials for `credentials_file`: a keys file, or (empty / `aws-default`) the AWS default chain (s3auth.rs).
+pub fn credentials(credentials_file: &str) -> Result<Credentials, String> {
+    if s3auth::uses_chain(credentials_file) {
+        return Ok(s3auth::from_chain()?.s3());
+    }
+    let (ak, sk) = read_credentials(credentials_file)?;
+    Credentials::new(Some(&ak), Some(&sk), None, None, None).map_err(|e| format!("credentials: {e}"))
+}
+
 pub fn bucket(c: &S3Conf) -> Result<Box<Bucket>, String> {
-    let (ak, sk) = read_credentials(&c.credentials_file)?;
-    let creds = Credentials::new(Some(&ak), Some(&sk), None, None, None).map_err(|e| format!("credentials: {e}"))?;
+    let creds = credentials(&c.credentials_file)?;
     let region = if c.region.is_empty() { "us-east-1".to_string() } else { c.region.clone() };
     let mut b = Bucket::new(&c.bucket, Region::Custom { region, endpoint: c.endpoint.clone() }, creds)
         .map_err(|e| format!("bucket: {e}"))?
@@ -52,6 +61,7 @@ pub fn retry<T>(what: &str, waits: &[u64], mut f: impl FnMut() -> Result<T, Stri
         match f() {
             Ok(v) => return Ok(v),
             Err(e) => {
+                s3auth::note_error(&e); // S3 refused temporary credentials: the next attempt fetches new ones
                 last = e;
                 if i == waits.len() {
                     break;
@@ -74,6 +84,8 @@ pub struct Head {
 
 /// HEAD an object: Ok(None) when it does not exist.
 pub fn head(b: &Bucket, key: &str) -> Result<Option<Head>, String> {
+    let fb = s3auth::fresh(b)?;
+    let b: &Bucket = &fb;
     match b.head_object(key) {
         Ok((_, 404)) => Ok(None),
         Ok((h, code)) if code / 100 == 2 => Ok(Some(Head {
@@ -90,6 +102,8 @@ pub fn head(b: &Bucket, key: &str) -> Result<Option<Head>, String> {
 
 /// PUT unless the key already exists (If-None-Match: * where the store supports it). Ok(false) = it existed.
 pub fn put_new(b: &Bucket, key: &str, body: &[u8], meta: &[(&str, &str)]) -> Result<bool, String> {
+    let fb = s3auth::fresh(b)?;
+    let b: &Bucket = &fb;
     let mut req = b.put_object_builder(key, body).with_content_type(CT);
     for (k, v) in meta {
         req = req.with_metadata(*k, *v).map_err(|e| e.to_string())?;
@@ -107,6 +121,8 @@ pub fn put_new(b: &Bucket, key: &str, body: &[u8], meta: &[(&str, &str)]) -> Res
 }
 
 pub fn put(b: &Bucket, key: &str, body: &[u8]) -> Result<(), String> {
+    let fb = s3auth::fresh(b)?;
+    let b: &Bucket = &fb;
     let r = b.put_object(key, body).map_err(|e| format!("PUT {key}: {e}"))?;
     if r.status_code() / 100 == 2 { Ok(()) } else { Err(format!("PUT {key}: HTTP {}", r.status_code())) }
 }
@@ -121,6 +137,8 @@ pub type WithMeta = (Vec<u8>, std::collections::HashMap<String, String>);
 
 /// GET a whole object with its x-amz-meta-* values (lower-case names, prefix stripped).
 pub fn get_meta(b: &Bucket, key: &str) -> Result<Option<WithMeta>, String> {
+    let fb = s3auth::fresh(b)?;
+    let b: &Bucket = &fb;
     match b.get_object(key) {
         Ok(r) if r.status_code() == 404 => Ok(None),
         Ok(r) if r.status_code() / 100 == 2 => {
@@ -141,6 +159,8 @@ pub fn get_meta(b: &Bucket, key: &str) -> Result<Option<WithMeta>, String> {
 
 /// Every key under `prefix` (with sizes).
 pub fn list(b: &Bucket, prefix: &str) -> Result<Vec<(String, u64)>, String> {
+    let fb = s3auth::fresh(b)?;
+    let b: &Bucket = &fb;
     Ok(b
         .list(prefix.to_string(), None)
         .map_err(|e| format!("list {prefix}: {e}"))?
@@ -151,6 +171,8 @@ pub fn list(b: &Bucket, prefix: &str) -> Result<Vec<(String, u64)>, String> {
 
 /// Immediate "folders" under `prefix` (delimiter '/').
 pub fn list_dirs(b: &Bucket, prefix: &str) -> Result<Vec<String>, String> {
+    let fb = s3auth::fresh(b)?;
+    let b: &Bucket = &fb;
     let mut out = vec![];
     for p in b.list(prefix.to_string(), Some("/".to_string())).map_err(|e| format!("list {prefix}: {e}"))? {
         for c in p.common_prefixes.unwrap_or_default() {
@@ -162,7 +184,7 @@ pub fn list_dirs(b: &Bucket, prefix: &str) -> Result<Vec<String>, String> {
 
 pub fn delete(b: &Bucket, key: &str) -> Result<(), String> {
     retry(&format!("delete {key}"), SHORT, || {
-        let r = b.delete_object(key).map_err(|e| e.to_string())?;
+        let r = s3auth::fresh(b)?.delete_object(key).map_err(|e| e.to_string())?;
         if r.status_code() / 100 == 2 || r.status_code() == 404 { Ok(()) } else { Err(format!("HTTP {}", r.status_code())) }
     })
 }
@@ -190,7 +212,7 @@ pub fn upload_parallel(b: &Bucket, key: &str, r: &mut impl Read, concurrency: us
         retry(&format!("upload {key}"), LONG, || put(b, key, &first[..n]))?;
         return Ok(n as u64);
     }
-    let id = retry(&format!("start upload {key}"), LONG, || b.initiate_multipart_upload(key, CT).map_err(|e| e.to_string()))?
+    let id = retry(&format!("start upload {key}"), LONG, || s3auth::fresh(b)?.initiate_multipart_upload(key, CT).map_err(|e| e.to_string()))?
         .upload_id;
     let failed = Arc::new(AtomicBool::new(false));
     let err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -208,7 +230,8 @@ pub fn upload_parallel(b: &Bucket, key: &str, r: &mut impl Read, concurrency: us
                     continue; // drain
                 }
                 match retry(&format!("upload {key} part {num}"), LONG, || {
-                    b.put_multipart_chunk(&data, key, num, &id, CT).map_err(|e| e.to_string())
+                    // credentials brought up to date per part: an upload longer than the role's session goes on
+                    s3auth::fresh(b)?.put_multipart_chunk(&data, key, num, &id, CT).map_err(|e| e.to_string())
                 }) {
                     Ok(p) => parts.lock().unwrap().push(p),
                     Err(e) => {
@@ -248,17 +271,17 @@ pub fn upload_parallel(b: &Bucket, key: &str, r: &mut impl Read, concurrency: us
         drop(tx);
     });
     if let Some(e) = err.lock().unwrap().take() {
-        let _ = b.abort_upload(key, &id);
+        let _ = s3auth::fresh(b).map(|b| b.abort_upload(key, &id));
         return Err(e);
     }
     let mut parts = std::mem::take(&mut *parts.lock().unwrap());
     parts.sort_by_key(|p| p.part_number);
     let done = retry(&format!("finish upload {key}"), LONG, || {
-        let resp = b.complete_multipart_upload(key, &id, parts.clone()).map_err(|e| e.to_string())?;
+        let resp = s3auth::fresh(b)?.complete_multipart_upload(key, &id, parts.clone()).map_err(|e| e.to_string())?;
         if resp.status_code() / 100 == 2 { Ok(()) } else { Err(format!("HTTP {}", resp.status_code())) }
     });
     if let Err(e) = done {
-        let _ = b.abort_upload(key, &id);
+        let _ = s3auth::fresh(b).map(|b| b.abort_upload(key, &id));
         return Err(e);
     }
     Ok(total)
@@ -301,7 +324,7 @@ pub fn download_parallel(b: &Bucket, key: &str, size: u64, w: &mut impl Write, c
                 let from = i as u64 * chunk;
                 let to = (from + chunk).min(size) - 1;
                 let r = retry(&format!("download {key} bytes {from}-{to}"), LONG, || {
-                    let resp = b.get_object_range(key, from, Some(to)).map_err(|e| e.to_string())?;
+                    let resp = s3auth::fresh(b)?.get_object_range(key, from, Some(to)).map_err(|e| e.to_string())?;
                     if resp.status_code() / 100 != 2 {
                         return Err(format!("HTTP {}", resp.status_code()));
                     }

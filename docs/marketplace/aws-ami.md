@@ -24,8 +24,9 @@ curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh -s -- --versi
 - No system deps beyond Postgres itself (`pg_dump` / `pg_restore` come with it) and `curl` + `sha256sum` for the
   installer. The CLI is a static binary.
 - Config: `shared_preload_libraries = 'pgbx'` (one restart), plus `pgbx.s3_endpoint`, `pgbx.s3_bucket`,
-  `pgbx.s3_region`, `pgbx.server_name` and `pgbx.credentials_file`. `sudo pgbx setup server --yes` writes all of
-  them into `conf.d/pgbx.conf` and prints the restart command. **No `CREATE EXTENSION` is needed:** the pgbx
+  `pgbx.s3_region`, `pgbx.server_name` and `pgbx.credentials_file = 'aws-default'` (no keys file: the instance
+  role, see §3). `sudo pgbx setup server --credentials aws-default --yes` writes all of them into
+  `conf.d/pgbx.conf` and prints the restart command. **No `CREATE EXTENSION` is needed:** the pgbx
   worker creates the extension in `template1` and every database by itself (name: `pgbx`, schema `pgbx`).
 - Optional point-in-time restore: `sudo pgbx setup pitr --yes` (sets `archive_mode`/`archive_command`; another
   restart). Leave it off by default; document it.
@@ -40,11 +41,28 @@ curl -fsSL https://deemwar-products.github.io/pgbx/install.sh | sh -s -- --versi
 - **pgbx-specific:** `pgbx.server_name` = the instance id (IMDSv2), so each instance gets its own folder in the
   bucket. S3 bucket/region come from CloudFormation parameters (or EC2 user data), written by
   `pgbx setup server --yes`.
-- **S3 credentials: BLOCKER.** pgbx today reads static keys from `pgbx.credentials_file` only; it cannot yet use
-  the EC2 instance role (IMDSv2). Static keys in a marketplace AMI are poor practice. **Required before listing:**
-  pgbx gains instance-role credentials (e.g. `pgbx.credentials_file = 'instance-role'`, or used automatically when
-  no file is set, via IMDSv2). The pgbx session will build this; the CloudFormation template then attaches an
-  instance profile with `s3:PutObject/GetObject/ListBucket/DeleteObject/AbortMultipartUpload` on that bucket only.
+- **S3 credentials: the instance role, no keys anywhere.** `pgbx.credentials_file = 'aws-default'` (written by
+  `pgbx setup server --credentials aws-default`): the worker, its jobs, `wal-push` / `wal-get` and the CLI take
+  temporary credentials from the EC2 instance role through **IMDSv2** (session token first; IMDSv1 is never used),
+  cache them and fetch new ones 5 minutes before they expire, so a long upload runs across a refresh. Launch the
+  instance with `HttpTokens=required` (IMDSv2 only); `HttpPutResponseHopLimit` 1 is fine for Postgres on the host
+  (2 if it ever runs in a container). The CloudFormation template attaches an instance profile whose role has this
+  policy, scoped to the customer's bucket only:
+
+  ```json
+  {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+     "Resource": "arn:aws:s3:::BUCKET"},
+    {"Effect": "Allow",
+     "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+     "Resource": "arn:aws:s3:::BUCKET/*"}]}
+  ```
+
+  (`ListBucketMultipartUploads` lets the worker clean up uploads a crash left behind; without it that cleanup is
+  skipped and logged, nothing else breaks.) `SELECT detail FROM pgbx.doctor() WHERE name = 's3 credentials'`
+  shows `source: instance-role (instance role via IMDSv2 (role NAME), temporary, valid until ...)`; with no role
+  attached it says so and the fix names this policy. Download links (`pgbx.download_url`) signed with role
+  credentials stop working when that role session ends (at most ~6 hours), whatever interval was asked for.
 - Optional: encryption for dumps (`pgbx.encryption_key_file`: 32 random bytes as base64 or hex, generated at first boot, postgres
   only, chmod 600). Tell the customer to back up that key; without it the dumps can't be restored.
 
@@ -64,7 +82,7 @@ SELECT state, error FROM pgbx.history WHERE kind = 'backup' ORDER BY id DESC LIM
 
 Without S3 (Packer build, no bucket yet): `SELECT extversion FROM pg_extension WHERE extname = 'pgbx'` returns
 `0.6.0` in `template1`, and `pgbx --version` prints `pgbx 0.6.0`. `pgbx doctor --json` reports only the
-"s3 settings" check as not ok.
+"s3 settings" check as not ok (and "s3 credentials" if the build instance has no instance profile).
 
 ## 5. Listing text
 

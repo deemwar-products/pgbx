@@ -1,7 +1,8 @@
 //! `pgbx setup`: first-time server configuration after the installer put the files in place.
 //! Writes ONE drop-in file `<config dir>/conf.d/pgbx.conf` (shared_preload_libraries MERGED with what is
 //! already loaded, plus the pgbx.s3_* settings) and the S3 credentials file (0600, owned by the postgres OS
-//! user). Never edits postgresql.conf except to add one `include_dir = 'conf.d'` line when it is missing, and never
+//! user), or with `--credentials aws-default` no keys file at all (`pgbx.credentials_file = 'aws-default'`: the EC2
+//! instance role via IMDSv2 and the rest of the AWS default chain, src/s3auth.rs). Never edits postgresql.conf except to add one `include_dir = 'conf.d'` line when it is missing, and never
 //! restarts Postgres. Guarded: without --yes it only shows the plan.
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 use crate::{Ctx, Out};
@@ -62,6 +63,16 @@ pub fn render_conf(o: &Opts, preload: &str) -> String {
         s.push_str(&format!("{k} = {}\n", quote(&v)));
     }
     s
+}
+
+/// `--credentials aws-default` (or `--credentials-file aws-default`): no keys file, the AWS default chain.
+/// Ok(true) = aws-default; any other --credentials value is refused.
+pub fn wants_aws_default(credentials: Option<&str>, credentials_file: Option<&str>) -> Result<bool, String> {
+    match credentials {
+        Some(crate::s3auth::AWS_DEFAULT) => Ok(true),
+        Some(v) => Err(format!("--credentials takes only aws-default (got '{v}'); a keys file is --credentials-file FILE")),
+        None => Ok(credentials_file == Some(crate::s3auth::AWS_DEFAULT)),
+    }
 }
 
 pub fn render_credentials(key: &str, secret: &str) -> String {
@@ -273,13 +284,23 @@ pub fn run(cx: &mut Ctx) -> Out {
         server_name: get("server-name", "Server name (folder in the bucket)", Some(host), false)?,
         credentials_file: String::new(),
     };
-    o.credentials_file = get("credentials-file", "Credentials file", Some(DEFAULT_CREDS.into()), true)?;
+    let aws_default = wants_aws_default(cx.a.get("credentials"), cx.a.get("credentials-file"))?;
+    if aws_default && (cx.a.has("access-key-env") || cx.a.has("secret-key-env")) {
+        return Err("--credentials aws-default writes no keys file: drop --access-key-env / --secret-key-env".into());
+    }
+    o.credentials_file = if aws_default {
+        crate::s3auth::AWS_DEFAULT.to_string()
+    } else {
+        get("credentials-file", "Credentials file", Some(DEFAULT_CREDS.into()), true)?
+    };
 
     // keys: only from named env vars or a no-echo prompt; never from argv, never printed
     let key_env = cx.a.get("access-key-env").unwrap_or("AWS_ACCESS_KEY_ID").to_string();
     let sec_env = cx.a.get("secret-key-env").unwrap_or("AWS_SECRET_ACCESS_KEY").to_string();
-    let creds_exist = Path::new(&o.credentials_file).exists();
+    // aws-default: nothing to write, and keys in this shell's environment are NOT copied anywhere
+    let creds_exist = aws_default || Path::new(&o.credentials_file).exists();
     let mut keys = match (env(&key_env), env(&sec_env)) {
+        _ if aws_default => None,
         (Some(k), Some(s)) => Some((k, s, format!("from ${key_env} / ${sec_env}"))),
         _ if cx.a.has("access-key-env") || cx.a.has("secret-key-env") => {
             return Err(format!("${key_env} and ${sec_env} must both be set (they are read, never printed)"))
@@ -325,6 +346,8 @@ pub fn run(cx: &mut Ctx) -> Out {
         warnings.push(m);
     }
     let creds_action = match &keys {
+        _ if aws_default => "no keys file: S3 credentials from the instance role via IMDSv2 (or the rest of the AWS default \
+            chain: web identity, container credentials)".to_string(),
         Some((_, _, src)) => format!("write {} (0600, owner postgres; keys {src})", o.credentials_file),
         None => format!("keep existing {}", o.credentials_file),
     };
@@ -341,7 +364,7 @@ pub fn run(cx: &mut Ctx) -> Out {
         "shared_preload_libraries": {"before": found.preload, "after": preload},
         "settings": {"pgbx.s3_endpoint": o.endpoint, "pgbx.s3_bucket": o.bucket, "pgbx.s3_region": o.region,
                      "pgbx.server_name": o.server_name, "pgbx.credentials_file": o.credentials_file},
-        "credentials_file": {"path": o.credentials_file, "written": false},
+        "credentials_file": {"path": o.credentials_file, "written": false, "aws_default": aws_default},
         "changes": changes, "warnings": warnings, "restart": restart,
     });
     if !cx.a.has("yes") {
@@ -350,7 +373,7 @@ pub fn run(cx: &mut Ctx) -> Out {
     }
 
     let owner = postgres_ids();
-    if crate::is_root() && owner.is_none() {
+    if crate::is_root() && owner.is_none() && !aws_default {
         return Err("no 'postgres' OS user found; the credentials file must be owned by the user Postgres runs as".into());
     }
     let owner = if crate::is_root() { owner } else { None };
@@ -437,6 +460,18 @@ mod tests {
         assert_eq!(major_from_path("/srv/pg/postgresql.conf"), None);
         assert!(check_major(Some(12)).unwrap_err().contains("supports PostgreSQL 13–18; found 12"));
         assert!(check_major(Some(13)).is_ok() && check_major(None).is_ok());
+    }
+
+    #[test]
+    fn aws_default_flag() {
+        assert_eq!(wants_aws_default(Some("aws-default"), None), Ok(true));
+        assert_eq!(wants_aws_default(None, Some("aws-default")), Ok(true));
+        assert_eq!(wants_aws_default(None, Some("/etc/pgbx/s3.credentials")), Ok(false));
+        assert_eq!(wants_aws_default(None, None), Ok(false));
+        assert!(wants_aws_default(Some("instance-role"), None).unwrap_err().contains("only aws-default"));
+        let o = Opts { endpoint: "https://s3.eu-central-1.amazonaws.com".into(), bucket: "b".into(), region: "eu-central-1".into(),
+                       server_name: "db1".into(), credentials_file: "aws-default".into() };
+        assert!(render_conf(&o, "pgbx").contains("pgbx.credentials_file = 'aws-default'\n"));
     }
 
     #[test]

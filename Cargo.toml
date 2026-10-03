@@ -30,6 +30,10 @@ ring = "0.17"
 zstd = { version = "0.13", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
+# 0.6: S3 credentials from the instance role (IMDSv2) / container / web identity (src/s3auth.rs): both crates are
+# already in the tree (attohttpc is rust-s3's HTTP client, serde_json comes with pgrx), so nothing new is pulled in
+attohttpc = { version = "0.30", default-features = false }
+serde_json = "1"
 
 [dev-dependencies]
 [dev-dependencies.pgrx-tests]

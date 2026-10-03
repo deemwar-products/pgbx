@@ -26,6 +26,8 @@ mod pitrcmd;
 mod policy;
 mod profile;
 mod query;
+#[path = "../../src/s3auth.rs"]
+pub mod s3auth;
 mod s3restore;
 mod s3x;
 mod serve;
@@ -59,7 +61,7 @@ const BOOL_FLAGS: &[&str] = &[
 const VALUE_FLAGS: &[&str] = &[
     "db", "into", "time", "backup", "pgdata", "host", "port", "user", "admin-db", "timeout", "lines", "reason", "max-backups",
     "max-days", "include", "exclude", "backup-id", "expires", "log", "s3-endpoint", "s3-bucket", "s3-region", "server-name",
-    "credentials-file", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "url", "adapter", "adapter-command",
+    "credentials-file", "credentials", "listen", "access-key-env", "secret-key-env", "pg-conf", "profile", "url", "adapter", "adapter-command",
     "max-rows", "as", "hours", "gate", "key-file", "roles", "gfs", "in", "out", "conf", "target",
     "system-id",
 ];
@@ -166,7 +168,9 @@ new server / disaster (no extension needed on the target; needs pg_restore):
   pgbx backups    --from-s3 --db X S3FLAGS   list X's dumps in S3, newest first
   pgbx db-restore --from-s3 --db X --into NEWDB [--backup KEY | --time TS] [--with-roles [--roles R]]
                   [--key-file F] S3FLAGS      (--key-file: the pgbx.encryption_key_file of encrypted backups)
-      S3FLAGS: --s3-endpoint URL --s3-bucket B [--s3-region R] --server-name S --credentials-file F
+      S3FLAGS: --s3-endpoint URL --s3-bucket B [--s3-region R] --server-name S [--credentials-file F]
+               (F: access_key_id=/secret_access_key= lines; absent or aws-default: AWS_ACCESS_KEY_ID & co., web
+               identity, container credentials, then the EC2 instance role via IMDSv2)
       newest dump at or before TS (default: newest) -> CREATE DATABASE NEWDB (refused if it exists) -> pg_restore
 policy / access (show with no arguments; changes that reduce protection need --yes):
   pgbx schedule [TEXT]            pgbx retention [--max-backups N] [--max-days N] [--gfs 7d,4w,12m|off]
@@ -193,10 +197,11 @@ point-in-time restore (optional, whole server; per-database dumps stay the defau
   pgbx wal-push %p [--conf FILE]             archive_command    pgbx wal-get %f %p --conf FILE   restore_command
 setup (guarded: shows the plan; --yes writes; `pgbx setup pitr` is above):
   pgbx setup server [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F
-              --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--yes]
+              --access-key-env VAR --secret-key-env VAR --pg-conf FILE] [--credentials aws-default] [--yes]
       on the DB host, with sudo: writes <config dir>/conf.d/pgbx.conf (shared_preload_libraries merged with
       what is loaded) and the credentials file (0600, owner postgres; keys read from env vars, default
       AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY); prints the ONE restart command, never restarts Postgres.
+      --credentials aws-default: no keys file; pgbx.credentials_file = 'aws-default' (EC2 instance role via IMDSv2).
       `pgbx setup` alone is the same as `pgbx setup server`.
   pgbx setup client [NAME] [--url URL | --adapter A [key=value ...] | --host H --port P --user U] [--db D]
               [--s3-endpoint U --s3-bucket B --s3-region R --server-name S --credentials-file F] [--no-skill] [--yes]
@@ -654,6 +659,8 @@ fn cmd_skill(cx: &mut Ctx) -> Out {
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    // credentials_file aws-default: AWS_ACCESS_KEY_ID & co. of the user running pgbx count (never in the extension)
+    s3auth::allow_env_keys();
     let a = match parse_args(raw.clone()) {
         Ok(a) => a,
         Err(e) => {
