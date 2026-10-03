@@ -173,10 +173,14 @@ worker. That runner does not exist today.
 Recommendation: no listing before 0.6. Build the runner mode next if the managed-Postgres buyer is the target,
 and list the container first (it covers the most buyers), with the AMI as an easy second.
 
+**Decided (owner, 2026-10-03): pgbx stays MIT. It is listed on every cloud marketplace we can reach (AWS, GCP,
+Azure, and others); the software stays free, and revenue comes from training and support fees** (e.g. paid
+support/training offers attached to the listing, or a separate support listing).
+
 ## Open questions for the owner
 
 1. **Host-side commands** (`doctor`, `logs`, `setup server`, `diagnose`) over an adapter: an optional `exec` action
    is undecided and **out of v1**.
-2. Licence: MIT, or a one-time fee? This also decides the marketplace pricing model.
-3. Marketplace target: managed Postgres (needs a new runner mode) or self-managed (an AMI with today's extension)?
-4. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?
+2. Marketplace order: which listing first? Managed Postgres needs a new runner mode (container listing); self-managed
+   works with today's extension (AMI). Licence and revenue model are decided (MIT; training and support fees).
+3. Should custom adapter recipes be shared (a docs page of examples), or only the contract documented?

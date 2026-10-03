@@ -164,7 +164,10 @@ that score highest on trust name a *check* ("checked weekly", "with proof", "gat
 
 ---
 
-## 5. Offer and packaging [all hypothesis]
+## 5. Offer and packaging
+
+**Decided (owner, 2026-10-03): MIT, free software everywhere; listed on every cloud marketplace we can reach;
+revenue from training and support fees.** The paid-feature ideas below stay hypotheses, and none is planned.
 
 - **Free OSS core, forever, MIT:** everything in v0.5 and everything planned for v0.6 (PITR, encryption, metrics,
   GFS retention, profiles, load-aware backups). Rule: **nothing that keeps data safe is ever paid.**
