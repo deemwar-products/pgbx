@@ -34,9 +34,13 @@ echo "  restore: $st in ${secs}s = $(mbps "$size" "$secs") of database ${err:+($
 check "restore done" "$st" done
 check "all rows restored" "$(P -d big_r1 -c 'SELECT count(*) FROM t')" "$rows"
 
+# the chaos must hit the TRANSFER: wait until the job is running and has moved bytes (a fixed sleep raced the job's
+# start on a busy box, so S3 went down before the restore even listed its dumps), then stop S3 for 10 s
+mid_transfer() { for _ in $(seq 240); do [ "$(P -d big -c "SELECT (state='running' AND coalesce(bytes,0) > 0)::text FROM pgbx.history WHERE id=$1")" = true ] && return; sleep 0.5; done; }
+outage() { $DC stop s3 >/dev/null 2>&1; echo "  S3 stopped mid-transfer ($(P -d big -c "SELECT coalesce(bytes,0)/1048576 FROM pgbx.history WHERE id=$1") MiB moved)"; sleep 10; $DC start s3 >/dev/null 2>&1; echo "  S3 back 10 s later"; }
+
 echo "## 3. chaos: S3 down for 10 s during a backup"
-id=$(P -d big -c "SELECT pgbx.backup_now()"); sleep 4
-$DC stop s3 >/dev/null 2>&1; echo "  S3 stopped at +4s"; sleep 10; $DC start s3 >/dev/null 2>&1; echo "  S3 back at +14s"
+id=$(P -d big -c "SELECT pgbx.backup_now()"); mid_transfer "$id"; outage "$id"
 r=$(wait_job "$id"); IFS='|' read -r st bytes secs err <<<"$r"; echo "  backup: $st in ${secs}s ${err:+($err)}"
 check "backup survived S3 outage" "$st" done
 echo "  retries logged: $($DC logs db 2>&1 | grep -c 'retry [0-9]')"
@@ -44,8 +48,7 @@ id=$(P -d big -c "SELECT pgbx.restore(into_db => 'big_r2')"); r=$(wait_job "$id"
 check "that backup restores completely" "$(P -d big_r2 -c 'SELECT count(*) FROM t' 2>/dev/null)" "$rows"
 
 echo "## 4. chaos: S3 down for 10 s during a restore (resume from the byte reached)"
-id=$(P -d big -c "SELECT pgbx.restore(into_db => 'big_r3')"); sleep 4
-$DC stop s3 >/dev/null 2>&1; echo "  S3 stopped at +4s"; sleep 10; $DC start s3 >/dev/null 2>&1; echo "  S3 back at +14s"
+id=$(P -d big -c "SELECT pgbx.restore(into_db => 'big_r3')"); mid_transfer "$id"; outage "$id"
 r=$(wait_job "$id"); IFS='|' read -r st bytes secs err <<<"$r"; echo "  restore: $st in ${secs}s ${err:+($err)}"
 check "restore survived S3 outage" "$st" done
 check "all rows after resumed download" "$(P -d big_r3 -c 'SELECT count(*) FROM t' 2>/dev/null)" "$rows"
