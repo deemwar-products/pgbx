@@ -129,7 +129,7 @@ sudo pgbx setup server --yes --credentials aws-default \
 
 This writes `pgbx.credentials_file = 'aws-default'` and no credentials file. pgbx then takes temporary
 credentials from the instance role through IMDSv2 (never IMDSv1) and renews them before they expire; ECS task
-roles and EKS (IRSA, Pod Identity) work the same way. The role's policy, on your bucket only:
+roles and EKS (IRSA, Pod Identity) work the same way. Tested on real EC2 against real Amazon S3 (pgbx 0.6.1, us-east-1, x86_64, IMDSv2 only, 2026-10-04: a backup and a restore with matching checksum, also with the instance cut off from the internet and S3 reached through a VPC endpoint). Not yet tested: other regions, Graviton (arm64), and runs longer than one role-credential lifetime (~6 h) on real EC2; credential rotation itself is tested against a fake IMDSv2 in `tests/imds_e2e.sh`. The role's policy, on your bucket only:
 
 ```json
 {"Version": "2012-10-17", "Statement": [
