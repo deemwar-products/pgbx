@@ -1,0 +1,862 @@
+== pgbx v0.6.1-7-g82ee437 commit 82ee437, 2026-10-04T11:58:14Z, host dev-server x86_64, PG_MAJOR=16
+== build dev image: docker build -f docker/Dockerfile.dev --build-arg PG_MAJOR=16 -t pgbx-dev .
+== cli unit tests: cargo test --locked --manifest-path cli/Cargo.toml
+test result: ok. 143 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.05s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+== full suite: tests/run_all.sh
+== run pgbx-test-20261004122055
+ Image pgbx:test Building 
+ Image pgbx:test Built 
+== server ready
+## 1. create a database, do nothing else -> backed up automatically
+NOTICE:  database "shop" does not exist, skipping
+NOTICE:  database "shop_restored" does not exist, skipping
+  first backup after 2s: done pgbx-test-20261004122055/shop/2026-10-04T12-34-28Z.dump 5681 
+  PASS automatic first backup
+## 4. policy from a migration; bucket is server-wide
+  PASS configure()
+  server-wide: bucket=pgbx-test server=pgbx-test-20261004122055
+## 2. manual backup_now()
+NOTICE:  pgbx: backup job 4 queued, starts ~now, takes ~1 s (5692 bytes, low confidence, limited by cpu (127 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.49 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  #4: done pgbx-test-20261004122055/shop/2026-10-04T12-34-33Z.dump 6243 
+  PASS backup_now
+## 3. drop the table -> restore() into a new database
+  PASS orders gone from shop
+NOTICE:  pgbx: restore job 5 queued, starts ~now, takes ~1 s (6243 bytes, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.21 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  #5: done pgbx-test-20261004122055/shop/2026-10-04T12-34-33Z.dump 6243 
+  PASS restore job
+  PASS rows back in shop_restored
+  PASS restored copy backs up to its own folder
+## 5. friendly schedules
+  PASS to_cron('every 1 hour')
+  PASS to_cron('every 15 minutes')
+  PASS to_cron('daily at 02:30')
+  PASS to_cron('weekly on sunday at 03:00')
+  PASS to_cron('hourly')
+  schedule set to "every 1 hour" (cron 0 * * * *); next backup at 2026-10-04 13:00:00+00
+  PASS status shows new schedule
+  PASS bad schedule rejected: pgbx: can't read schedule 'sometimes'; use: 'hourly', 'daily', 'weekly', 'every N minutes', 'every N hours', '
+CONTEXT:  PL/pgSQL function set_schedule(text) line 2 during statement block local variable initialization
+  PASS max_days above server limit rejected
+## 6. pause / resume
+  automatic backups paused (migrating); resume with SELECT pgbx.resume()
+  PASS status paused
+  PASS no automatic backup while paused
+  automatic backups resumed; next backup at 2026-10-04 12:36:00+00
+  PASS scheduled backup after resume (every 1 minute)
+## 7. expiry: keep max 2 backups
+NOTICE:  pgbx: backup job 12 queued, starts ~now, takes ~1 s (5630 bytes, low confidence, limited by cpu (127 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.33 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+NOTICE:  pgbx: backup job 13 queued, starts ~now, takes ~1 s (4480 bytes, low confidence, limited by cpu (101 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.54 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  backups before: 5
+  keeping at most 2 backups and nothing older than 30 days (newest always kept); pruning now
+  PASS prune job finished (not stuck running)
+  PASS only 2 backups kept
+  PASS rest marked expired
+## 8. streaming: a database big enough for a multipart upload
+NOTICE:  database "big" does not exist, skipping
+NOTICE:  database "big_restored" does not exist, skipping
+NOTICE:  pgbx: backup job 2 queued, starts ~now, takes ~2 s (9009 bytes, low confidence, limited by cpu (12 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.77 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  big backup: done pgbx-test-20261004122055/big/2026-10-04T12-36-18Z.dump 55244367  (9s)
+  PASS big dump > 8 MiB (multipart)
+NOTICE:  pgbx: restore job 3 queued (1 job(s) running or waiting on this server), starts ~now, takes ~8 s (53 MB, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 5.06 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  big restore: done
+  PASS 1,000,000 rows streamed back
+## 9. restore test (verify)
+  restore test "weekly on sunday at 04:00" (cron 0 4 * * 0); next at 2026-10-11 04:00:00+00
+  PASS set_verify_schedule()
+NOTICE:  pgbx: verify job 17 queued, starts ~now, takes ~1 s (3386 bytes, low confidence, limited by download (12 MB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 5.01 per core > 0.8): this verify will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  verify #17: done
+  PASS verify passed
+  PASS status shows verify result
+  PASS scratch database dropped
+  PASS set_verify_schedule('never')
+## 10. alerts on failure
+NOTICE:  pgbx: restore job 19 queued, starts ~now, takes ~1 s (3386 bytes, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 5.01 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  restore into existing db: failed — create shop: database "shop" already exists
+  PASS failed as expected
+  alert: {"server":"pgbx-test-20261004122055","database":"shop","kind":"restore","job_id":19,"error":"create shop: database \"shop\" already exists",
+  PASS alert_command got the failure
+## 11. doctor(): per-database checks only
+  PASS doctor() runs only in the admin db
+  PASS doctor(): s3 settings ok
+  PASS doctor(): worker alive
+  PASS doctor(): archive_mode row is info only
+## 12. access control
+NOTICE:  role "app_user" does not exist, skipping
+NOTICE:  role "viewer_user" does not exist, skipping
+NOTICE:  role "admin_user" does not exist, skipping
+  PASS plain user cannot read status
+  PASS plain user cannot pause
+  PASS plain user cannot get a download link
+  PASS viewer can read status
+  PASS viewer can list backups
+  PASS viewer cannot pause
+  PASS viewer cannot write tables directly
+  PASS admin can pause
+  PASS admin can resume
+  PASS admin can set schedule
+  PASS admin cannot write tables directly
+  PASS admin cannot call the internal signer
+## 13. download_url (presigned, no keys needed)
+NOTICE:  table "urltest" does not exist, skipping
+NOTICE:  pgbx: backup job 23 queued, starts ~now, takes ~1 s (3403 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 6.29 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS admin got a signed link (http://10.8.0.5:9000/pgbx-test/pgbx-test-20261004122055/shop/2026-10-04T12-36-55Z.dump?…)
+  PASS link downloads (HTTP 200)
+NOTICE:  database "shop_from_url" does not exist, skipping
+  PASS curl | pg_restore from the link
+  PASS expiry limit enforced
+  PASS link request is audited
+## 14. overview() — every database in one place
+  PASS overview lists the databases
+  PASS viewer can read overview
+  big|active|daily at 02:00|53 MB|
+  big_restored|failing|daily at 02:00|2435 bytes|interrupted (worker restart or copied by restore)
+  postgres|active|daily at 02:00|2664 bytes|
+  shop|active|daily at 02:00|4279 bytes|create shop: database "shop" already exists
+  shop_from_url|failing|daily at 02:00|3386 bytes|interrupted (worker restart or copied by restore)
+  shop_restored|failing|every 6 hours|5681 bytes|interrupted (worker restart or copied by restore)
+## 15. data scope: every table always, rows only where wanted
+NOTICE:  database "scoped" does not exist, skipping
+NOTICE:  database "scoped_r1" does not exist, skipping
+NOTICE:  database "scoped_r2" does not exist, skipping
+NOTICE:  database "scoped_r3" does not exist, skipping
+  backups keep every table definition; rows skipped for 2 table(s) right now — see pgbx.rowless_tables()
+  PASS rowless_tables() after exclude
+NOTICE:  pgbx: backup job 3 queued (1 job(s) running or waiting on this server), starts ~now, takes ~1 s (5502 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 5.61 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+NOTICE:  pgbx: restore job 4 queued, starts ~now, takes ~1 s (4427 bytes, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 241 tps > 200, load 5.61 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS exclude: tables kept, those rows skipped (users/sessions/audit/invoices)
+  backups keep every table definition; rows skipped for 2 table(s) right now — see pgbx.rowless_tables()
+NOTICE:  pgbx: backup job 6 queued, starts ~now, takes ~1 s (4984 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 271 tps > 200, load 5.68 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+NOTICE:  pgbx: restore job 7 queued, starts ~now, takes ~1 s (4671 bytes, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 268 tps > 200, load 6.22 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS include: only billing.* and users keep rows
+  PASS status shows the scope
+  PASS backup records skipped tables
+NOTICE:  pgbx: verify job 8 queued, starts ~now, takes ~1 s (4671 bytes, low confidence, limited by download (12 MB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 283 tps > 200, load 6.45 per core > 0.8): this verify will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS restore test passes on a scoped backup
+  backups keep every table and every row
+NOTICE:  pgbx: backup job 10 queued, starts ~now, takes ~1 s (4671 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 6.17 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+NOTICE:  pgbx: restore job 11 queued (1 job(s) running or waiting on this server), starts ~now, takes ~1 s (6173 bytes, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 6.00 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS reset: every row is back
+  PASS admin may set the scope
+## 16. resource caps: niced pg_dump, never queued behind DDL (lock_timeout -> retried later)
+NOTICE:  database "locked" does not exist, skipping
+NOTICE:  pgbx: backup job 2 queued, starts ~now, takes ~1 s (2471 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (1 active session(s) now, last sample: 363 tps > 200, load 5.42 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS pg_dump runs at nice 10
+  PASS pg_dump IO class best-effort 7
+  PASS its connection is tagged pgbx_dump
+  PASS doctor(): long_running_job sees it
+  PASS lock timeout re-queues the backup (not failed)
+  PASS logged once
+  PASS runs after the lock is released
+  PASS not forced (deadline far away)
+  PASS doctor(): long_running_job ok again
+NOTICE:  pgbx: backup job 3 queued, starts ~now, takes ~1 s (3655 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (1 active session(s) now, last sample: 349 tps > 200, load 4.01 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS at the deadline: one forced try, then failed
+  PASS and alerted
+## 17. bandwidth caps (token bucket): pgbx.upload_kbps / download_kbps = 2048 (2 MiB/s)
+NOTICE:  database "big_capped" does not exist, skipping
+NOTICE:  pgbx: backup job 4 queued, starts ~now, takes ~40 s (26 MB, medium confidence, limited by pgbx.upload_kbps (2048 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 3.73 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  backup: done 1.75 MiB/s
+  PASS upload capped at 2 MiB/s (1.5-2.2)
+NOTICE:  pgbx: restore job 5 queued (1 job(s) running or waiting on this server), starts ~now, takes ~79 s (53 MB, medium confidence, limited by pgbx.download_kbps (2048 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.50 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS pg_restore runs at nice 10, best-effort 7, synchronous_commit=off
+  PASS its connection is tagged pgbx_restore
+  restore: done 2.04 MiB/s
+  PASS download capped at 2 MiB/s (1.5-2.2)
+  PASS capped restore is complete
+## 18. coalesced backup_now() / verify_now() and cancel() of a queued job
+  PASS 5x backup_now() in a row = one job
+  PASS coalesced count recorded
+  PASS that one job runs
+  PASS 2x verify_now() = one job
+  PASS queued restore test cancelled
+  PASS a cancelled job never starts
+  PASS cancel of a finished job refused
+  PASS coalesce_manual=off queues each call
+## status()
+  database|shop
+  state|active
+  schedule|daily at 02:00
+  cron|0 2 * * *
+  next_backup_at|2026-10-05 02:00:00+00
+  last_backup_at|2026-10-04 12:40:56.315191+00
+  last_backup_age|00:00:09.187085
+  last_backup_size|4406 bytes
+  last_backup_key|pgbx-test-20261004122055/shop/2026-10-04T12-40-55Z.dump
+  backups_kept|2
+  retention|max 2 backups, max 30 days
+  data_scope|all tables, all rows
+  verify_schedule|never
+  last_verified_at|2026-10-04 12:36:38.809226+00
+  last_verify_result|ok: restored 0 tables from 2026-10-04T12-36-00Z.dump
+  last_error|create shop: database "shop" already exists
+  last_error_at|2026-10-04 12:36:43.739054+00
+  paused_reason|
+  paused_at|
+  queued_jobs|0
+  location|s3://pgbx-test/pgbx-test-20261004122055/shop/
+  running_job|
+  next_job|
+  queue_position|
+  waiting_reason|
+  job_progress|
+  job_eta|next backup at 2026-10-05 02:00, takes ~1 s
+  suggested_schedule|no activity samples yet (the worker learns them hour by hour)
+  load_gate|shadow
+  last_load|busy: load 3.31 per core > 0.8 at 12:41:01 UTC
+  would_defer_7d|2
+## backups
+  25|2026-10-04 12:40:56|manual|4406 bytes|pgbx-test-20261004122055/shop/2026-10-04T12-40-55Z.dump
+  23|2026-10-04 12:36:56|manual|4279 bytes|pgbx-test-20261004122055/shop/2026-10-04T12-36-55Z.dump
+## history of shop
+  1|backup|first|expired|pgbx-test-20261004122055/shop/2026-10-04T12-34-28Z.dump
+  2|config|migration|done|-
+  3|prune|migration|done|-
+  4|backup|manual|expired|pgbx-test-20261004122055/shop/2026-10-04T12-34-33Z.dump
+  5|restore|manual|done|pgbx-test-20261004122055/shop/2026-10-04T12-34-33Z.dump
+  6|config|migration|done|-
+  7|pause|migration|done|-
+  8|config|migration|done|-
+  9|resume|migration|done|-
+  10|backup|schedule|expired|pgbx-test-20261004122055/shop/2026-10-04T12-35-51Z.dump
+  11|config|migration|done|-
+  12|backup|manual|expired|pgbx-test-20261004122055/shop/2026-10-04T12-35-56Z.dump
+  13|backup|manual|expired|pgbx-test-20261004122055/shop/2026-10-04T12-36-00Z.dump
+  14|config|migration|done|-
+  15|prune|manual|done|-
+  16|config|migration|done|-
+  17|verify|manual|done|pgbx-test-20261004122055/shop/2026-10-04T12-36-00Z.dump
+  18|config|migration|done|-
+  19|restore|manual|failed|-
+  20|pause|migration|done|-
+  21|resume|migration|done|-
+  22|config|migration|done|-
+  23|backup|manual|done|pgbx-test-20261004122055/shop/2026-10-04T12-36-55Z.dump
+  24|config|migration|done|-
+  25|backup|manual|done|pgbx-test-20261004122055/shop/2026-10-04T12-40-55Z.dump
+  26|verify|manual|cancelled|-
+  27|backup|manual|cancelled|-
+  28|backup|manual|cancelled|-
+RESULT: 85 passed, 0 failed
+NOTICE:  database "cli_copy_dummy" does not exist, skipping
+## a. doctor
+  PASS doctor --json healthy, exit 0
+  PASS doctor(): every check ok (advice rows aside)
+NOTICE:  role "cli_viewer" does not exist, skipping
+  PASS doctor() callable as a viewer
+## b. policy commands (--json)
+  PASS schedule set
+  PASS schedule shows it
+  PASS raising retention needs no --yes
+  PASS retention shows it
+  PASS lowering retention refused without --yes
+  PASS lowering retention with --yes
+  PASS pause refused without --yes
+  PASS pause with --yes
+  PASS status paused
+  PASS resume
+  PASS scope --exclude refused without --yes
+  PASS scope --exclude with --yes
+  PASS scope --include with --yes
+  PASS scope shows it
+  PASS scope --reset (widening) needs no --yes
+  PASS scope after reset
+  PASS verify-schedule never refused without --yes
+  PASS verify-schedule never with --yes
+  PASS verify-schedule back on
+  PASS now --db shop --wait
+  PASS verify --db shop --wait
+  PASS link: fetchable from the host (HTTP 200)
+  PASS overview lists shop
+  PASS list
+  PASS jobs: the server-wide queue
+  PASS jobs cancel needs --yes
+## c. refusals (one JSON object, exit 1; usage errors exit 2)
+  PASS db-restore into the source
+  PASS --time without UTC offset
+  PASS unknown command: JSON usage error, exit 2
+  PASS unknown flag: JSON usage error, exit 2
+## d. pgbx query (read ones of pgbx.* allowed; the rest refused; more in tests/ssh_e2e.sh)
+  PASS query pgbx.status()
+  PASS query pgbx.backup_now() refused
+  PASS query DELETE refused
+## e. setup client against this server (direct)
+  PASS setup client: ok, extension found, status read
+  PASS setup client: first profile is the default
+  PASS plain setup is the server alias
+## h. agent skill
+  PASS skill install
+  PASS link points at a dir with SKILL.md
+  PASS where: versions match
+  PASS skill uninstall
+  PASS uninstall removed only ours
+## j. new server: db-restore --from-s3 onto a plain Postgres WITHOUT the extension
+  PASS plain server has no pgbx available
+NOTICE:  table "cli_dr" does not exist, skipping
+  PASS fresh backup of shop
+  PASS backups --from-s3: ok, newest first = status()'s last key
+  PASS backups --from-s3 never prints keys
+  PASS backups without --from-s3
+  PASS missing S3 flags
+  PASS --from-s3 --time without offset
+  PASS --time before the first backup
+  PASS empty folder
+  PASS --into an existing database
+  PASS refusals created nothing
+  PASS db-restore --from-s3 (newest): ok, exit 0, key
+  PASS rows restored on the plain server
+  PASS no extension objects on the plain server
+  PASS second restore into the same name
+  PASS --time before cli_dr existed: ok
+  PASS that restore predates the table
+  PASS --backup <file name> restores that exact dump
+## k. profiles (stored in a scratch config dir; never hold secrets)
+  PASS profile add
+  PASS profile file is 0600 and has no key values
+  PASS profile list
+  PASS backups --from-s3 via --profile
+  PASS unknown --profile
+  PASS profile remove
+RESULT: 68 passed, 0 failed
+== pgbx ui
+NOTICE:  role "pgbx_ui_e2e" does not exist, skipping
+  PASS viewer starts under --strict
+  PASS GET /
+  PASS page has no external fetches
+  PASS GET /api/overview
+  PASS GET /api/db/postgres
+  PASS GET /api/timeline?days=30
+  PASS GET /api/health
+  PASS GET /api/queue
+  PASS overview: databases, read-only
+  PASS timeline: rows with who/when/what
+  PASS timeline: has backups
+  PASS timeline: newest first
+  PASS health: doctor rows
+  PASS POST -> 405
+  PASS PUT -> 405
+  PASS DELETE -> 405
+  PASS PATCH -> 405
+  PASS HEAD -> 405
+  PASS foreign Host -> 403
+  PASS unknown -> 404
+  PASS viewer cannot backup_now
+  PASS read-only session refuses writes
+  PASS superuser refused under --strict
+== ui_e2e: pass=23 fail=0
+## 1. read-only (the default)
+  PASS starts: json line, read-only, loopback, random port
+  PASS token: 32 hex chars, in the URL fragment
+  PASS GET / -> the app
+  PASS app loads its embedded script and style
+  PASS GET /assets/index.js
+  PASS app fetches no other origin
+  PASS CSP: connect-src 'self'
+  PASS no token -> 401
+  PASS wrong token -> 401
+  PASS foreign Host -> 403
+  PASS foreign Host on the app -> 403
+  PASS PUT -> 405
+  PASS unknown api -> 404
+  PASS session: read-only, no actions
+  PASS GET /api/session
+  PASS GET /api/overview
+  PASS GET /api/queue
+  PASS GET /api/load
+  PASS GET /api/health
+  PASS GET /api/db/postgres
+  PASS GET /api/suggest/postgres
+  PASS GET /api/memory/postgres
+  PASS overview: backups on, databases, read-only session
+  PASS overview: per database state, last backup, next run, kept, restore test
+  PASS overview: quiet-window data
+  PASS queue: jobs + slots
+  PASS load: sample + settings + databases
+  PASS health: doctor rows with fixes
+  PASS health: advice rows are warnings
+  PASS db detail: status, backups, history
+  PASS suggestion: the configure() call + CLI to copy
+  PASS no such database -> error
+  PASS query: rows + columns
+  PASS query guard refuses a write
+  PASS query guard refuses two statements
+  PASS query guard refuses backup_now()
+  PASS query: max_rows caps
+  PASS memory: none yet
+  PASS Save to memory appends (MEM-W-1 shape)
+  PASS memory: the saved question is read back
+  PASS memory: bad name refused
+  PASS POST /api/action/backup refused without --allow-safe
+  PASS POST /api/action/verify refused without --allow-safe
+  PASS POST /api/action/restore refused without --allow-safe
+  PASS POST /api/action/cancel refused without --allow-safe
+  PASS guarded action does not exist
+  PASS nothing was queued by the refusals
+## 2. --allow-safe
+  PASS starts: safety safe
+  PASS session: the four safe actions
+  PASS backup now: queued, through the CLI path
+  PASS restore into the source refused
+  PASS restore into an existing database refused
+  PASS restore --time needs a UTC offset
+  PASS cancel a queued job
+  PASS history shows it cancelled
+  PASS cancel of a job that is not queued refused (UI never stops a running job)
+  PASS restore into a NEW database: queued
+  PASS restore finished, new database exists
+## 3. client-only server (stock postgres, no pgbx extension)
+  PASS overview: backups off, said plainly
+  PASS overview: the databases are still listed
+  PASS overview: how to turn backups on
+  PASS health: healthy, extension row is info
+  PASS query works without the extension
+  PASS queue: refused in one plain sentence
+## 4. an adapter profile: one adapter for the whole run
+  PASS adapter profile: overview through the adapter
+  PASS query through the adapter
+  PASS one adapter for all those calls
+  PASS switcher lists the adapter profile (url redacted, never a password)
+  PASS switch to another profile
+  PASS switching back reuses the running adapter
+  PASS no API answer carries the password
+  PASS Ctrl-C: serve says stop to its adapter
+  PASS the password never reached serve's output
+== serve_e2e: pass=73 fail=0
+## setup: qa (~20 MB dump, multipart), qb, both with a first backup
+NOTICE:  database "qa" does not exist, skipping
+NOTICE:  database "qb" does not exist, skipping
+NOTICE:  database "qc" does not exist, skipping
+NOTICE:  database "qb_restored" does not exist, skipping
+NOTICE:  database "qb_restored2" does not exist, skipping
+NOTICE:  pgbx: backup job 2 queued (1 job(s) running or waiting on this server), starts ~now, takes ~1 s (5045 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 357 tps > 200, load 3.19 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS uncapped qa backup (has the table)
+NOTICE:  pgbx: backup job 2 queued (1 job(s) running or waiting on this server), starts ~now, takes ~1 s (2476 bytes, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 3.50 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS uncapped qb backup
+  qa dump: 27253891 bytes
+  PASS qa dump is multipart (> 16 MiB)
+## 1. the worker keeps polling while a job runs; restore lane; max_concurrent_jobs; pick order; why a job waits
+NOTICE:  pgbx: backup job 3 queued, starts ~now, takes ~3 min (13 MB, medium confidence, limited by pgbx.upload_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 352 tps > 200, load 3.54 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS slow qa backup running
+  PASS new database qc found and its first backup queued while qa dumps
+  PASS qc in the overview
+  PASS one slot: only one job runs
+  PASS restore_lane on by default
+NOTICE:  pgbx: restore job 3 queued (2 job(s) running or waiting on this server), starts ~12:45, takes ~1 s (4722 bytes, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 3.42 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS restore lane: qb's restore runs and finishes while qa's dump holds the only slot
+  PASS restored
+  PASS server_queue: qa's dump in slot 1
+NOTICE:  pgbx: restore job 4 queued (2 job(s) running or waiting on this server), starts ~12:46, takes ~1 s (4722 bytes, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 368 tps > 200, load 3.35 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+NOTICE:  pgbx: verify job 5 queued (2 job(s) running or waiting on this server), starts ~12:46, takes ~1 s (4722 bytes, low confidence, limited by download (23 MB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 368 tps > 200, load 3.35 per core > 0.8): this verify will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS restore_lane off: the restore waits for the slot
+  PASS qa still running (not blocked by the queue)
+  PASS server_queue: restore is #1 in line and says why
+  PASS status() in qb says why its next job waits
+  PASS status() in qa: running_job
+  PASS job_eta() of the queued restore: #1 in line, a start and a finish
+  PASS server_queue: the running dump reports progress
+  PASS pgbx jobs --json: qa running, qb restore queued #1
+  PASS pgbx jobs (text)
+NOTICE:  role "q_viewer" does not exist, skipping
+NOTICE:  role "q_plain" does not exist, skipping
+  PASS viewer reads server_queue
+  PASS plain role cannot read server_queue
+  PASS viewer cannot cancel
+  PASS max_concurrent_jobs=2: qb restore starts while qa still dumps
+  PASS restore done
+  PASS then qc's first backup and qb's restore test
+  PASS pick order: restore, then first backup, then restore test
+  PASS advisory slots held = 1 (only qa runs)
+  PASS slow qa backup done
+## 2. overrun_policy=skip: an every-minute schedule with ~90 s dumps
+  PASS default overrun_policy
+  PASS a scheduled backup runs
+  PASS dump > 1 min; next run records skipped_slots and waits for the next slot after it finished
+  PASS that one runs too
+## 3. cancel() of running jobs
+NOTICE:  pgbx: backup job 8 queued, starts ~now, takes ~5 min (26 MB, medium confidence, from the last 4 backup jobs of this database, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 421 tps > 200, load 3.52 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS multipart upload open while it runs
+  PASS pgbx jobs cancel without --yes refused
+  PASS pgbx jobs cancel ID --yes (database found in the queue)
+  PASS running backup cancelled within seconds
+  PASS error says who
+  PASS no multipart upload left
+  PASS no dump in history or S3
+  PASS no alert for a cancel
+  PASS pgbx_dump process gone
+NOTICE:  database "qa_r" does not exist, skipping
+NOTICE:  pgbx: restore job 9 queued, starts ~now, takes ~5 min (26 MB, medium confidence, limited by pgbx.download_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 403 tps > 200, load 3.98 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS restore writing qa_r
+  PASS cancel() of a running restore
+  PASS restore cancelled
+  PASS half-restored database dropped
+  PASS cancel of a cancelled job refused
+## 4. time estimates
+  NOTICE:  pgbx: backup job 10 queued, starts ~now, takes ~5 min (26 MB, medium confidence, from the last 4 backup jobs of this database, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 375 tps > 200, load 3.33 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS NOTICE on create: when it starts, how long, how big, why
+  while running: 99 % · ~0 s left
+  PASS live progress while running (done_bytes > 0, 'N % · ~T left')
+  PASS finished
+  4th capped backup: actual|estimate = 27|84 s (from the last 5 backup jobs of this database, slower: server busy (x3.0))
+  FAIL after 3 runs the estimate is within +-50 % of the actual (got 'done|false', want 'done|true')
+  PASS capacity measured (cpu probe, upload speed)
+  PASS doctor(): capacity and eta_accuracy rows
+## 5. crash: the job never leaves a dump or an open multipart upload behind
+NOTICE:  pgbx: backup job 14 queued, starts ~now, takes ~5 min (26 MB, medium confidence, limited by pgbx.upload_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 208 tps > 200, load 5.36 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS multipart upload open while it runs
+  PASS SIGTERM restart mid-upload: job failed
+  error: interrupted (worker restart or copied by restore)
+  PASS no multipart upload left
+  PASS no new dump in history or S3
+NOTICE:  pgbx: backup job 15 queued, starts ~now, takes ~5 min (26 MB, medium confidence, limited by pgbx.upload_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 201 tps > 200, load 4.49 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS found the scheduler process
+  PASS kill -9 of the worker mid-upload: job failed (interrupted)
+  PASS the restarted worker aborted the orphaned upload
+  PASS no multipart upload left
+  PASS no new dump in history or S3
+NOTICE:  pgbx: backup job 48 queued, starts ~now, takes ~82 s (26 MB, medium confidence, from the last 5 backup jobs of this database, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 219 tps > 200, load 3.88 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS backups work after the crash
+== queue_e2e: 62 passed, 1 failed
+## 1. quiet window
+NOTICE:  database "win" does not exist, skipping
+  PASS the worker copies the server-wide histogram into a new database
+  PASS daily quiet hour 03:00 UTC, high confidence, quieter than 02:00
+  PASS status() shows it, never applied by itself
+  PASS doctor(): schedule_in_quiet_window warns about win at 12:00 and names 0 3 * * *
+  win: "daily at 12:00" runs at 1.714x average activity; 0 3 * * * would be 0.009x; shop_restored: "every 6 hours" runs at 1.714x average activity; 0 3 * * * would be 0.009x; shop: "every 2 hours" runs at 1.714x average 
+  PASS pgbx schedule suggest --json
+  PASS --apply without --yes (no terminal) refused
+  PASS nothing changed
+  PASS --apply --yes applies it
+  PASS doctor(): win no longer listed
+NOTICE:  database "win2" does not exist, skipping
+  PASS an hour another database's backup starts in is avoided
+NOTICE:  role "w_viewer" does not exist, skipping
+  PASS viewer may call suggest_window()
+NOTICE:  database "winw" does not exist, skipping
+  PASS weekday split: a weekly weekend slot
+NOTICE:  database "winl" does not exist, skipping
+  PASS one day of samples: low confidence
+NOTICE:  database "winn" does not exist, skipping
+  PASS no samples at all: confidence none, nothing to apply
+## 2. load gate (pgbench: 6 clients)
+  PASS default pgbx.load_gate = shadow
+NOTICE:  database "gate" does not exist, skipping
+NOTICE:  database "gate2" does not exist, skipping
+  PASS pgbx load: busy
+  6 active sessions > 2, 526 tps > 400
+  PASS human job: NOTICE that it competes with the app; it starts anyway
+  PASS and it runs
+  PASS shadow: a scheduled backup under load is not delayed
+  PASS shadow: would_defer recorded with the reason
+  PASS pgbx load --gate on needs --yes
+  PASS pgbx load --gate on --db gate --yes
+  PASS status() shows the gate
+  PASS on: the scheduled backup is deferred (busy)
+  PASS pgbx load lists it as deferred
+  PASS still queued after 50 s
+  PASS it ran at its deadline, forced
+  PASS next one deferred too
+  PASS load stopped: it runs at its next retry, before the deadline, not forced
+  PASS pgbx load: quiet again
+  PASS pgbx load: per-database counts
+  PASS doctor(): load_gate row
+== load_e2e: 32 passed, 0 failed
+== extras_e2e image pgbx:test (server folder x6-20261004125711)
+## server 1: notifications to a webhook; encryption turned on after a first plain backup
+  PASS plain backup (encryption off) done
+  PASS history says not encrypted
+  PASS encrypted backup done
+  PASS history says encrypted
+  PASS roles file key next to the dump
+  PASS referenced roles recorded
+  PASS parent role of a grantee referenced
+  PASS unrelated role not referenced
+  PASS the S3 object is ciphertext (PGBXENC1 header)
+  PASS backups --from-s3 lists dumps only, never a roles file
+  PASS restore test of an encrypted dump
+  PASS the older unencrypted dump still restores (key set)
+  PASS   ... with its rows (as of the plain dump)
+## restore with_roles on the same server: roles exist, owners kept
+  PASS restore with_roles
+  PASS existing roles reported, not changed
+  PASS owner kept
+  PASS rows restored (decrypted)
+  PASS restore without roles: owner is the restoring role
+  PASS bad roles scope refused
+## failure -> one webhook message, repeat suppressed, recovery once
+  PASS restore into an existing database fails
+  PASS next restore ok
+  PASS webhook: one failure message (deduplicated)
+  PASS webhook: one recovered message
+  PASS webhook body has no URL
+  PASS a URL in pgbx.notify is refused (names only, logged)
+  PASS   ... and the log line does not quote the URL's host
+## GFS retention
+  PASS set_retention gfs
+  PASS status shows gfs
+  PASS gfs beyond max_days_limit refused
+  PASS bad gfs refused
+  PASS pgbx retention: clearing GFS needs --yes
+  PASS gfs off
+  PASS gfs cleared
+  PASS pgbx retention --gfs (adding: no --yes needed)
+  PASS old 2-argument set_retention still works
+## metrics
+  PASS metrics: encrypted flag
+  PASS metrics: restore test
+  PASS metrics: size
+  PASS metrics: failures
+  PASS metrics: up
+  PASS ui /metrics content type
+  PASS ui /metrics body
+## server 2: a NEW server, db-restore --from-s3 --with-roles --key-file
+  PASS no key: refused
+  PASS wrong key: refused
+  PASS key file readable by others: refused
+  PASS restored with roles
+  PASS roles created
+  PASS other tenant's role not created
+  PASS owner on the new server
+  PASS grant on the new server
+  PASS membership on the new server
+  PASS no passwords restored (backup_role_passwords off)
+  PASS second restore: roles already exist (idempotent)
+  PASS   ... and are reported as existing
+  PASS unencrypted dump restores with no key
+## pgbx decrypt (what a download link gives you is ciphertext)
+pgbx decrypt: 31969 bytes decrypted
+  PASS decrypt | pg_restore -l
+  PASS decrypt with the wrong key fails
+  PASS decrypt of a truncated file fails
+  PASS decrypt of a tampered file fails
+== extras_e2e: 59 passed, 0 failed
+== pitr_e2e PG 16 image pgbx:test (server folder pitr-e2e-125825)
+## 1. pgbx setup pitr
+  PASS foreign archive_command refused
+  PASS setup without --yes only shows the plan
+  PASS setup --pitr (alias of setup pitr) ok + restart needed
+  PASS archive_command is pgbx wal-push
+  PASS archive_mode on
+## 2. base backup, rows, restore to T into a copy
+  PASS first base backup (trigger first) done
+  PASS WAL archived (no .ready left)
+  PASS pitr restore --time T ok
+  PASS restore into a non-empty dir refused
+  PASS in-place restore refused while Postgres runs
+  PASS time without UTC offset refused
+  PASS copy promoted
+  PASS rows as of T present (A+B)
+  PASS rows after T absent (C)
+  PASS copy: archive_mode off
+  PASS copy: pgbx.pitr off
+  PASS copy: own server_name
+## 3. wal-push idempotency, checksum refusal, wal-get missing
+  PASS wal-get archived segment exit 0
+  PASS wal-push same file again = success (idempotent)
+  PASS wal-push changed file refused (exit 1)
+  PASS refusal names the checksum conflict
+  PASS wal-get missing segment exit 1
+  PASS wal-get missing history exit 1
+## 4. S3 down -> backlog -> gap -> heal
+  S3 stopped
+  PASS gap recorded (wal_gap running)
+  PASS drops logged by wal-push
+  PASS wal_gap alert sent
+  PASS pitr_status says gap
+  PASS S3 down: a new database gets the extension within 15 s (0s)
+  PASS S3 down: its first backup runs (retrying on its job thread) or failed, never stuck queued
+  PASS no false 'recovered' alert while S3 is down
+  S3 back
+  PASS healing base backup queued by the gap
+  PASS gap closed with healed_at
+  PASS restore inside the gap refused (S3 flags, no conf)
+  PASS restore latest after heal ok
+  PASS latest restore has the row written after the heal
+## 5. status, doctor, privileges
+  PASS pitr_status active
+  PASS restorable_from set
+  PASS doctor pitr rows ok
+  PASS backup_now refused for a non-superuser
+  PASS viewer may read pitr_status
+  PASS per-database status ignores PITR rows (never running/failing from them)
+  PASS pgbx pitr status
+  PASS pgbx pitr list from S3
+## 6. upgrade 0.5.0 -> 0.6.0 == fresh 0.6.0
+  SKIP upgrade check: no pgbx--0.5.0.sql in pgbx:0.5.0-prev
+## 7. a base backup is a job: pgbx jobs shows it, cancel stops it, shutdown does not wait for it
+  PASS pgbx jobs lists the running base backup
+  PASS pgbx jobs cancel stops a running base backup (S3 not answering)
+  PASS the cancelled base backup never became one (no new backup.json in S3)
+  PASS Postgres stopped within 10 s during a base backup (1s)
+  PASS no server process died by a signal in the whole run (no crash restart)
+  PASS clean shutdown
+== pitr_e2e PG 16: 49 passed, 0 failed
+== s3down_e2e image pgbx:test (S3 endpoint: a black hole)
+## new databases while S3 does not answer
+  PASS database a1 gets the extension within 15 s (2s)
+  PASS database a2 gets the extension within 15 s (1s)
+  PASS database a3 gets the extension within 15 s (1s)
+  PASS a first backup is running (stuck on S3, on its job thread)
+  PASS the worker heartbeat keeps moving while a job waits on S3
+  PASS every database reported in
+  PASS pgbx jobs answers while S3 is down
+## cancel and shutdown with a job stuck on S3
+  PASS cancel stops the stuck backup (within the 60 s S3 request timeout)
+  PASS Postgres stopped within 10 s while a backup waits on S3 (7s)
+  PASS no server process died by a signal (no crash restart)
+  PASS clean shutdown
+== s3down_e2e: 11 passed, 0 failed
+== imds_e2e image pgbx:test (server folder imds-20261004130206, rotation every 30s, old keys disabled 10s later)
+  PASS MinIO users for the role
+  PASS fake IMDS issued first credentials
+## 1 doctor, backup and restore with the instance role
+  PASS doctor: s3 credentials ok
+  PASS doctor names the role and IMDSv2
+  PASS doctor: s3 settings ok without a credentials file
+  PASS backup_now with aws-default
+  PASS restore with aws-default
+  PASS restored rows
+  PASS worker logged where the credentials came from
+  PASS every IMDS GET carried an IMDSv2 token
+## 2 a long multipart upload across two credential rotations
+  PASS long upload done
+  (upload: 96s, 95258601 bytes; IMDS rotations 1 -> 4; worker refreshes 1 -> 4)
+  PASS upload took longer than two rotations
+  PASS multipart (more than 3 parts of 16 MiB)
+  PASS credentials rotated at least twice during it
+  PASS the worker refreshed during it
+  PASS no retry and no 403 on the way (refreshed BEFORE expiry)
+  PASS keys of a retired rotation are refused by S3
+  PASS restore of the long upload
+  PASS same data after the round trip
+## 3 the CLI with aws-default
+  PASS backups --from-s3, no --credentials-file (instance role)
+  PASS db-restore --from-s3 --credentials-file aws-default
+  PASS rows restored by the CLI
+  PASS pitr list (S3 engine of wal-push / wal-get) with the instance role
+  PASS CLI: env keys come before the instance role (these are wrong, so S3 refuses)
+  PASS setup server --credentials aws-default: plan sets the setting
+  PASS setup server --credentials aws-default: no keys file
+## 4 no key, secret or token anywhere
+  PASS secrets to look for
+  PASS none in the Postgres log
+  PASS none in shop's history
+  PASS none in postgres's history
+  PASS none in server_overview or doctor()
+  PASS none in CLI output
+## 5 IMDSv1 only, and no role attached
+  PASS doctor: IMDSv1-only endpoint refused
+  PASS doctor says why: no IMDSv2 token, no fall-back
+  PASS doctor fix: the instance profile policy
+  PASS CLI refuses IMDSv1 too
+  PASS no IMDSv1 GET was made
+  PASS no role attached is named
+  PASS back to IMDSv2: doctor ok again
+== imds_e2e: 39 passed, 0 failed
+## 1. extension: a backup job over https to real S3 (dummy keys)
+NOTICE:  pgbx: backup job 2 queued (1 job(s) running or waiting on this server), starts ~now, takes ~1 s (2405 kB, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.36 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  job: failed: upload https-test/postgres/2026-10-04T13-07-13Z.dump: gave up after 8 retries: HTTP 403
+  PASS job finished (failed on the dummy keys, as expected)
+  PASS no panic / CryptoProvider error
+  PASS AWS answered over TLS (InvalidAccessKeyId / 403 / AccessDenied)
+  PASS no panic in the worker log
+## 2. CLI: --from-s3 over https (dummy keys)
+  PASS CLI: no panic / CryptoProvider error
+  PASS CLI: AWS answered over TLS (its XML error came back)
+== https_s3_e2e: 6 passed, 0 failed
+ Container pgbx-local-db-1 Started 
+## build a ~1.2 GB database
+NOTICE:  database "big" does not exist, skipping
+NOTICE:  database "big_r1" does not exist, skipping
+NOTICE:  database "big_r2" does not exist, skipping
+NOTICE:  database "big_r3" does not exist, skipping
+  loaded 1220 MB in 131s
+## 1. streaming backup (pg_dump --compress zstd:3 -> 16 MB multipart parts)
+NOTICE:  pgbx: backup job 3 queued, starts ~now, takes ~26 s (372 kB, low confidence, limited by cpu (43 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 1 writing transaction(s) open > 30s, load 5.97 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  backup: done, dump 356M in 103.5s = 12 MB/s of database
+  PASS backup done
+## 2. streaming restore (S3 -> pg_restore stdin, no temp file)
+NOTICE:  pgbx: restore job 4 queued, starts ~now, takes ~56 s (355 MB, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 6.40 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  restore: done in 65.0s = 19 MB/s of database 
+  PASS restore done
+  PASS all rows restored
+## 3. chaos: S3 down for 10 s during a backup
+NOTICE:  pgbx: backup job 5 queued, starts ~now, takes ~3 min (178 MB, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.38 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  S3 stopped at +4s
+  S3 back at +14s
+  backup: done in 91.4s 
+  PASS backup survived S3 outage
+  retries logged: 5
+NOTICE:  pgbx: restore job 6 queued, starts ~now, takes ~3 min (355 MB, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 3.87 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS that backup restores completely
+## 4. chaos: S3 down for 10 s during a restore (resume from the byte reached)
+NOTICE:  pgbx: restore job 7 queued, starts ~now, takes ~3 min (355 MB, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.25 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  S3 stopped at +4s
+  S3 back at +14s
+  restore: failed in 1.0s (list: attohttpc: Io Error: failed to lookup address information: Name or service not known)
+  FAIL restore survived S3 outage (got 'failed', want 'done')
+  FAIL all rows after resumed download (got '', want '9000000')
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  database "big_r3" does not exist
+  FAIL same data (checksum) (got '', want '7a17d21b5d6db5915292c06a901658dc')
+  resumes logged: 1
+## 5. Postgres stop during a backup must not wait for it
+NOTICE:  pgbx: backup job 8 queued, starts ~now, takes ~5 min (355 MB, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.30 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  Postgres stopped 8s after the request (backup was mid-upload)
+  PASS shutdown not blocked by the backup (<10s)
+  PASS interrupted job marked failed, not stuck
+NOTICE:  pgbx: backup job 9 queued, starts ~now, takes ~5 min (355 MB, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 3.81 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS next backup works
+RESULT: 8 passed, 3 failed
+## 1. current image (pgbx:test)
+  PASS admin db at 0.6.1
+## 2. auto-update: a database on an older version is updated by the worker
+  PASS worker updated upd 0.0.1 -> 0.6.1
+  PASS update logged
+  PASS template1 at the fake old version
+## 3. at worker start template1 is updated and new databases are born current
+  PASS template1 updated at worker start
+  PASS a new database is born at 0.6.1
+## 2. skipped (set PGBX_PREV_IMAGE to an image of the previous pgbx release to test the update script)
+== upgrade_e2e: 6 passed, 0 failed (S3 folder pgbx-upgrade-20261004131935)
+== e2e exit 0, cli_e2e exit 0, ui_e2e exit 0, serve_e2e exit 0, queue_e2e exit 1, load_e2e exit 0, extras_e2e exit 0, pitr_e2e exit 0, s3down_e2e exit 0, imds_e2e exit 0, https_s3_e2e exit 0, bench exit 1, upgrade exit 0, diag smoke exit 0
+exit=1

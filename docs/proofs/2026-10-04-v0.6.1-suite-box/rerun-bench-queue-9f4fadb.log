@@ -1,0 +1,161 @@
+== pgbx v0.6.1-8-g9f4fadb commit 9f4fadb, 2026-10-04T13:22:09Z, host dev-server x86_64, load 5.11 11.75 12.63
+== tests/bench_local.sh
+ Container pgbx-local-db-1 Started 
+## build a ~1.2 GB database
+NOTICE:  database "big" does not exist, skipping
+NOTICE:  database "big_r1" does not exist, skipping
+NOTICE:  database "big_r2" does not exist, skipping
+NOTICE:  database "big_r3" does not exist, skipping
+  loaded 1220 MB in 86s
+## 1. streaming backup (pg_dump --compress zstd:3 -> 16 MB multipart parts)
+NOTICE:  pgbx: backup job 3 queued, starts ~now, takes ~16 s (373 kB, low confidence, limited by cpu (60 kB/s), slower: server busy (x2.5))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: 1 writing transaction(s) open > 30s, load 1.65 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  backup: done, dump 356M in 51.3s = 24 MB/s of database
+  PASS backup done
+## 2. streaming restore (S3 -> pg_restore stdin, no temp file)
+NOTICE:  pgbx: restore job 4 queued (1 job(s) running or waiting on this server), starts ~now, takes ~56 s (355 MB, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 2.06 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  restore: done in 54.9s = 22 MB/s of database 
+  PASS restore done
+  PASS all rows restored
+## 3. chaos: S3 down for 10 s during a backup
+NOTICE:  pgbx: backup job 5 queued, starts ~now, takes ~56 s (178 MB, medium confidence, from recent backup jobs on this server, slower: server busy (x2.2))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 1.37 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  S3 stopped mid-transfer (32 MiB moved)
+  S3 back 10 s later
+  backup: done in 70.0s 
+  PASS backup survived S3 outage
+  retries logged: 4
+NOTICE:  pgbx: restore job 6 queued, starts ~now, takes ~2 min (355 MB, medium confidence, from recent restore jobs on this server, slower: server busy (x2.5))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 1.67 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS that backup restores completely
+## 4. chaos: S3 down for 10 s during a restore (resume from the byte reached)
+NOTICE:  pgbx: restore job 7 queued, starts ~now, takes ~3 min (355 MB, medium confidence, from recent restore jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 2.96 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  S3 stopped mid-transfer (48 MiB moved)
+  S3 back 10 s later
+  restore: done in 91.3s 
+  PASS restore survived S3 outage
+  PASS all rows after resumed download
+  PASS same data (checksum)
+  resumes logged: 4
+## 5. Postgres stop during a backup must not wait for it
+NOTICE:  pgbx: backup job 8 queued, starts ~now, takes ~3 min (355 MB, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 3.90 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  Postgres stopped 3s after the request (backup was mid-upload)
+  PASS shutdown not blocked by the backup (<10s)
+  PASS interrupted job marked failed, not stuck
+NOTICE:  pgbx: backup job 9 queued, starts ~now, takes ~3 min (355 MB, medium confidence, from recent backup jobs on this server, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.29 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS next backup works
+RESULT: 11 passed, 0 failed
+bench exit=0
+== tests/queue_e2e.sh (load 19.17 14.88 12.96)
+## setup: qa (~20 MB dump, multipart), qb, both with a first backup
+NOTICE:  database "qa" does not exist, skipping
+NOTICE:  database "qb" does not exist, skipping
+NOTICE:  database "qc" does not exist, skipping
+NOTICE:  database "qb_restored" does not exist, skipping
+NOTICE:  database "qb_restored2" does not exist, skipping
+NOTICE:  pgbx: backup job 2 queued, starts ~now, takes ~1 s (9117 bytes, low confidence, limited by cpu (18 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.74 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS uncapped qa backup (has the table)
+NOTICE:  pgbx: backup job 2 queued (1 job(s) running or waiting on this server), starts ~now, takes ~1 s (2463 bytes, low confidence, limited by cpu (45 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 5.33 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS uncapped qb backup
+  qa dump: 27253879 bytes
+  PASS qa dump is multipart (> 16 MiB)
+## 1. the worker keeps polling while a job runs; restore lane; max_concurrent_jobs; pick order; why a job waits
+NOTICE:  pgbx: backup job 3 queued, starts ~now, takes ~3 min (13 MB, medium confidence, limited by pgbx.upload_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 5.17 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS slow qa backup running
+  PASS new database qc found and its first backup queued while qa dumps
+  PASS qc in the overview
+  PASS one slot: only one job runs
+  PASS restore_lane on by default
+NOTICE:  pgbx: restore job 3 queued (2 job(s) running or waiting on this server), starts ~13:36, takes ~1 s (4712 bytes, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.98 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS restore lane: qb's restore runs and finishes while qa's dump holds the only slot
+  PASS restored
+  PASS server_queue: qa's dump in slot 1
+NOTICE:  pgbx: restore job 4 queued (2 job(s) running or waiting on this server), starts ~13:36, takes ~1 s (4712 bytes, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.94 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+NOTICE:  pgbx: verify job 5 queued (2 job(s) running or waiting on this server), starts ~13:36, takes ~1 s (4712 bytes, low confidence, nothing measured yet: pgbx.eta_default_mbps, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.94 per core > 0.8): this verify will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS restore_lane off: the restore waits for the slot
+  PASS qa still running (not blocked by the queue)
+  PASS server_queue: restore is #1 in line and says why
+  PASS status() in qb says why its next job waits
+  PASS status() in qa: running_job
+  PASS job_eta() of the queued restore: #1 in line, a start and a finish
+  PASS server_queue: the running dump reports progress
+  PASS pgbx jobs --json: qa running, qb restore queued #1
+  PASS pgbx jobs (text)
+NOTICE:  role "q_viewer" does not exist, skipping
+NOTICE:  role "q_plain" does not exist, skipping
+  PASS viewer reads server_queue
+  PASS plain role cannot read server_queue
+  PASS viewer cannot cancel
+  PASS max_concurrent_jobs=2: qb restore starts while qa still dumps
+  PASS restore done
+  PASS then qc's first backup and qb's restore test
+  PASS pick order: restore, then first backup, then restore test
+  PASS advisory slots held = 1 (only qa runs)
+  PASS slow qa backup done
+## 2. overrun_policy=skip: an every-minute schedule with ~90 s dumps
+  PASS default overrun_policy
+  PASS a scheduled backup runs
+  PASS dump > 1 min; next run records skipped_slots and waits for the next slot after it finished
+  PASS that one runs too
+## 3. cancel() of running jobs
+NOTICE:  pgbx: backup job 8 queued, starts ~now, takes ~5 min (26 MB, medium confidence, from the last 4 backup jobs of this database, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 2.21 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS multipart upload open while it runs
+  PASS pgbx jobs cancel without --yes refused
+  PASS pgbx jobs cancel ID --yes (database found in the queue)
+  PASS running backup cancelled within seconds
+  PASS error says who
+  PASS no multipart upload left
+  PASS no dump in history or S3
+  PASS no alert for a cancel
+  PASS pgbx_dump process gone
+NOTICE:  database "qa_r" does not exist, skipping
+NOTICE:  pgbx: restore job 9 queued, starts ~now, takes ~5 min (26 MB, low confidence, limited by pgbx.download_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 1.90 per core > 0.8): this restore will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS restore writing qa_r
+  PASS cancel() of a running restore
+  PASS restore cancelled
+  PASS half-restored database dropped
+  PASS cancel of a cancelled job refused
+## 4. time estimates
+  NOTICE:  pgbx: backup job 10 queued, starts ~now, takes ~5 min (26 MB, medium confidence, from the last 4 backup jobs of this database, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 2.92 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS NOTICE on create: when it starts, how long, how big, why
+  while running: 99 % · ~0 s left
+  PASS live progress while running (done_bytes > 0, 'N % · ~T left')
+  PASS finished
+  4th capped backup: actual|estimate = 31|95 s (from the last 5 backup jobs of this database, slower: server busy (x3.0))
+  FAIL after 3 runs the estimate is within +-50 % of the actual (got 'done|false', want 'done|true')
+  PASS capacity measured (cpu probe, upload speed)
+  PASS doctor(): capacity and eta_accuracy rows
+## 5. crash: the job never leaves a dump or an open multipart upload behind
+NOTICE:  pgbx: backup job 14 queued, starts ~now, takes ~5 min (26 MB, medium confidence, limited by pgbx.upload_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 5.36 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS multipart upload open while it runs
+  PASS SIGTERM restart mid-upload: job failed
+  error: interrupted (worker restart or copied by restore)
+  PASS no multipart upload left
+  PASS no new dump in history or S3
+NOTICE:  pgbx: backup job 15 queued, starts ~now, takes ~5 min (26 MB, medium confidence, limited by pgbx.upload_kbps (256 kB/s), slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 4.24 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS found the scheduler process
+  PASS kill -9 of the worker mid-upload: job failed (interrupted)
+  PASS the restarted worker aborted the orphaned upload
+  PASS no multipart upload left
+  PASS no new dump in history or S3
+NOTICE:  pgbx: backup job 48 queued, starts ~now, takes ~2 min (26 MB, medium confidence, from the last 5 backup jobs of this database, slower: server busy (x3.0))
+NOTICE:  pgbx: the server is busy (0 active session(s) now, last sample: load 2.95 per core > 0.8): this backup will compete with the app; it starts anyway (pgbx.gate_manual_jobs = warn)
+  PASS backups work after the crash
+== queue_e2e: 62 passed, 1 failed
+queue exit=1
+exit=done
