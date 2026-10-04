@@ -3,7 +3,6 @@
 /target
 *.iml
 **/*.rs.bk
-Cargo.lock
 docker/test.credentials
 docker/.env
 docker/local.env
