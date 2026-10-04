@@ -1,0 +1,14 @@
+date: 2026-10-04T06:44:56Z  release: v0.6.0  cli: pgbx 0.6.0
+version: 0.6.0  endpoint scheme: https  server folder: release-proof-v0.6.0-20261004T064449
+backup job 1: failed|0|job panicked:
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+
+restore skipped: no backup
+source:   200000 fae4629217c64d5bce0190b557ae644f
+restored: <none>
+thread 'pgbx cleanup' (121) panicked at /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+PROOF FAIL
