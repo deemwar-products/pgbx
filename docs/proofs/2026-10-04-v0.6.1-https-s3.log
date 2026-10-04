@@ -1,0 +1,7 @@
+date: 2026-10-04T06:38:44Z  release: v0.6.1  cli: pgbx 0.6.1
+version: 0.6.1  endpoint scheme: https  server folder: release-proof-v0.6.1-20261004T063836
+backup job 1: done|4125270|
+restore job 2: done|4125270|
+source:   200000 fae4629217c64d5bce0190b557ae644f
+restored: 200000 fae4629217c64d5bce0190b557ae644f
+PROOF PASS
