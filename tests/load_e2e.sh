@@ -79,7 +79,9 @@ check "default pgbx.load_gate = shadow" "$(P -c 'SHOW pgbx.load_gate')" shadow
 P -c "DROP DATABASE IF EXISTS gate WITH (FORCE)" -c "DROP DATABASE IF EXISTS gate2 WITH (FORCE)" -c "CREATE DATABASE gate" -c "CREATE DATABASE gate2" >/dev/null
 $DC exec -T db pgbench -U postgres -i -s 5 -q gate >/dev/null 2>&1
 for d in gate gate2; do for _ in $(seq 60); do [ "$(P -d $d -c "SELECT count(*) FROM pgbx.history WHERE kind='backup' AND state='done'" 2>/dev/null)" -ge 1 ] 2>/dev/null && break; sleep 1; done; done
-gset busy_active_backends 2; gset busy_tps 400; gset max_defer 100; gset defer_backoff 1
+# busy only from this test's own pgbench (sessions, tps), never from the host's load average: on a shared CI box
+# other work keeps the 1-minute load high and the gate would rightly stay busy
+gset busy_active_backends 2; gset busy_tps 400; gset busy_loadavg 0; gset max_defer 100; gset defer_backoff 1
 start_load() { $DC exec -T -d db pgbench -U postgres -c 6 -j 2 -T 900 gate >/dev/null 2>&1; }
 stop_load() { P -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = 'pgbench'" >/dev/null; }
 start_load
@@ -119,7 +121,7 @@ out=$(J load --db gate)
 check "pgbx load: per-database counts" "$(echo "$out" | jq -r '.databases[]|select(.database=="gate")|"\(.load_gate) \(.deferred_7d>=2) \(.forced_7d>=1)"')" "on true true"
 check "doctor(): load_gate row" "$(P -c "SELECT ok||'|'||(detail LIKE '%on in gate%') FROM pgbx.doctor() WHERE name='load_gate'")" "true|true"
 P -d gate -c "SELECT pgbx.configure(load_gate => 'default')" >/dev/null
-greset busy_active_backends busy_tps max_defer defer_backoff
+greset busy_active_backends busy_tps busy_loadavg max_defer defer_backoff
 P -c "DROP DATABASE IF EXISTS gate WITH (FORCE)" -c "DROP DATABASE IF EXISTS gate2 WITH (FORCE)" >/dev/null
 echo "== load_e2e: $pass passed, $fail failed"
 [ $fail -eq 0 ]
