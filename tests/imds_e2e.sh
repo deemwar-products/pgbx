@@ -32,7 +32,11 @@ rnd() { LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c "$1"; }
 RK="root$(rnd 8)"; RS=$(rnd 32); UA="rolea$(rnd 6)"; UAS=$(rnd 32); UB="roleb$(rnd 6)"; UBS=$(rnd 32)
 printf '%s %s\n' "$RK" "$RS" > "$WORK/root"; printf '%s %s\n%s %s\n' "$UA" "$UAS" "$UB" "$UBS" > "$WORK/users"
 cp "$HERE/fake_imds.py" "$WORK/"; chmod -R a+rwX "$WORK"
-MC() { docker exec "$S3" mc "$@" >/dev/null 2>&1; }
+# MinIO stopped publishing images (minio/minio is gone from Docker Hub, quay.io needs a login, dl.min.io answers 410):
+# Chainguard's free builds, the server and mc in separate images. Override with PGBX_MINIO_IMAGE / PGBX_MC_IMAGE.
+MINIO_IMAGE=${PGBX_MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}; MC_IMAGE=${PGBX_MC_IMAGE:-cgr.dev/chainguard/minio-client:latest}
+mc_() { docker run --rm --network "$NET" -e MC_HOST_local="http://$RK:$RS@$S3:9000" "$MC_IMAGE" "$@"; }
+MC() { mc_ "$@" >/dev/null 2>&1; }
 wait_job() { # db id
   for _ in $(seq 240); do s=$(P -d "$1" -c "SELECT state FROM pgbx.history WHERE id=$2"); case "$s" in done|failed|cancelled) echo "$s"; return;; esac; sleep 1; done; echo timeout; }
 doctor() { P -c "SELECT ok || ' | ' || detail || ' | ' || coalesce(fix, '') FROM pgbx.doctor() WHERE name = 's3 credentials'"; }
@@ -43,11 +47,11 @@ OUT="$WORK/outputs.txt"; : > "$OUT"   # every output a secret must never appear 
 
 echo "== imds_e2e image $IMAGE (server folder $SERVER, rotation every ${ROT}s, old keys disabled ${GRACE}s later)"
 docker network create "$NET" >/dev/null
-docker run -d --rm --name "$S3" --network "$NET" -e MINIO_ROOT_USER="$RK" -e MINIO_ROOT_PASSWORD="$RS" minio/minio server /data >/dev/null
-for _ in $(seq 60); do MC alias set local http://127.0.0.1:9000 "$RK" "$RS" && break; sleep 1; done
+docker run -d --rm --name "$S3" --network "$NET" -e MINIO_ROOT_USER="$RK" -e MINIO_ROOT_PASSWORD="$RS" "$MINIO_IMAGE" server /tmp/data >/dev/null
+for _ in $(seq 60); do MC ls local && break; sleep 1; done
 MC mb "local/$BUCKET"
 for u in "$UA $UAS" "$UB $UBS"; do set -- $u; MC admin user add local "$1" "$2"; MC admin policy attach local readwrite --user "$1"; done
-check "MinIO users for the role" "$(docker exec "$S3" mc admin user list local 2>/dev/null | grep -c readwrite)" 2
+check "MinIO users for the role" "$(mc_ admin user list local 2>/dev/null | grep -c readwrite)" 2
 docker run -d --rm --name "$META" --network "$NET" -v "$WORK:/w" -e S3="http://$S3:9000" -e ROT=$ROT -e GRACE=$GRACE \
   python:3.11-slim python3 /w/fake_imds.py >/dev/null
 for _ in $(seq 60); do grep -q ready "$WORK/requests.log" 2>/dev/null && break; sleep 1; done
