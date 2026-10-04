@@ -15,9 +15,9 @@ ALTER EXTENSION pgbx UPDATE;
 
 3. Update the `pgbx` CLI by re-running the installer: `curl -fsSL https://pgbx.deemwar.com/install.sh | sh` (it also refreshes the agent skill).
 
-## 0.6.0 → 0.6.1 (release pending)
+## 0.6.0 → 0.6.1
 
-Upgrade as soon as it is out if you back up to an **https** S3 endpoint (AWS, R2, Hetzner, Backblaze...): in 0.6.0 every backup job
+Upgrade now if you back up to an **https** S3 endpoint (AWS, R2, Hetzner, Backblaze...): in 0.6.0 every backup job
 to one failed ("Could not automatically determine the process-level CryptoProvider"). Plain-http endpoints were not
 affected. No schema change; install the new files, restart Postgres, and re-run the CLI installer.
 
